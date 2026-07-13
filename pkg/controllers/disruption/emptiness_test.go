@@ -779,7 +779,7 @@ var _ = Describe("Emptiness", func() {
 			for _, nc := range nodeClaims {
 				nc.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 			}
-			c := disruption.MakeConsolidation(fakeClock, cluster, env.Client, prov, cloudProvider, recorder, queue)
+			c := disruption.MakeConsolidation(fakeClock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)
 			emptyConsolidation := disruption.NewEmptiness(c)
 			singleNodeConsolidation := disruption.NewSingleNodeConsolidation(c)
 			multiNodeConsolidation := disruption.NewMultiNodeConsolidation(c)

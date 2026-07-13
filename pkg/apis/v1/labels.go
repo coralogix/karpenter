@@ -47,12 +47,13 @@ const (
 
 // Karpenter specific annotations
 const (
-	DoNotDisruptAnnotationKey                  = apis.Group + "/do-not-disrupt"
-	ProviderCompatibilityAnnotationKey         = apis.CompatibilityGroup + "/provider"
-	NodePoolHashAnnotationKey                  = apis.Group + "/nodepool-hash"
-	NodePoolHashVersionAnnotationKey           = apis.Group + "/nodepool-hash-version"
-	NodeClaimTerminationTimestampAnnotationKey = apis.Group + "/nodeclaim-termination-timestamp"
-	NodeClaimMinValuesRelaxedAnnotationKey     = apis.Group + "/nodeclaim-min-values-relaxed"
+	MaxUnderutilizedConsolidationsPerMinuteAnnotationKey = "karpenter.coralogix.net/max-underutilized-consolidations-per-minute"
+	DoNotDisruptAnnotationKey                            = apis.Group + "/do-not-disrupt"
+	ProviderCompatibilityAnnotationKey                   = apis.CompatibilityGroup + "/provider"
+	NodePoolHashAnnotationKey                            = apis.Group + "/nodepool-hash"
+	NodePoolHashVersionAnnotationKey                     = apis.Group + "/nodepool-hash-version"
+	NodeClaimTerminationTimestampAnnotationKey           = apis.Group + "/nodeclaim-termination-timestamp"
+	NodeClaimMinValuesRelaxedAnnotationKey               = apis.Group + "/nodeclaim-min-values-relaxed"
 )
 
 // Karpenter specific finalizers

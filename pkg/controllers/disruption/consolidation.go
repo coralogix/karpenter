@@ -58,19 +58,21 @@ type consolidation struct {
 	provisioner            *provisioning.Provisioner
 	cloudProvider          cloudprovider.CloudProvider
 	recorder               events.Recorder
+	underutilizedPace      *UnderutilizedConsolidationPace
 	lastConsolidationState time.Time
 }
 
 func MakeConsolidation(clock clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner,
-	cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue) consolidation {
+	cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue, underutilizedPace *UnderutilizedConsolidationPace) consolidation {
 	return consolidation{
-		queue:         queue,
-		clock:         clock,
-		cluster:       cluster,
-		kubeClient:    kubeClient,
-		provisioner:   provisioner,
-		cloudProvider: cloudProvider,
-		recorder:      recorder,
+		queue:             queue,
+		clock:             clock,
+		cluster:           cluster,
+		kubeClient:        kubeClient,
+		provisioner:       provisioner,
+		cloudProvider:     cloudProvider,
+		recorder:          recorder,
+		underutilizedPace: underutilizedPace,
 	}
 }
 

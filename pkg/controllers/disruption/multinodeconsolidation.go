@@ -64,11 +64,16 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 	// and only considering a number of nodes that can be disrupted.
 	disruptableCandidates := make([]*Candidate, 0, len(candidates))
 	constrainedByBudgets := false
+	constrainedByPace := false
 	for _, candidate := range candidates {
 		// If there's disruptions allowed for the candidate's nodepool,
 		// add it to the list of candidates, and decrement the budget.
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			constrainedByBudgets = true
+			continue
+		}
+		if !m.underutilizedPace.CanAdmit(candidate.NodePool) {
+			constrainedByPace = true
 			continue
 		}
 		// Filter out empty candidates. If there was an empty node that wasn't consolidated before this, we should
@@ -95,7 +100,7 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 		// if there are no candidates because of a budget, don't mark
 		// as consolidated, as it's possible it should be consolidatable
 		// the next time we try to disrupt.
-		if !constrainedByBudgets {
+		if !constrainedByBudgets && !constrainedByPace {
 			m.markConsolidated()
 		}
 		return []Command{}, nil
