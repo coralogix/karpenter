@@ -49,145 +49,93 @@ func paceCommand(np *v1.NodePool, count int) *Command {
 	return &Command{Candidates: candidates}
 }
 
-func TestCandidateAllowedUnsetConfiguration(t *testing.T) {
-	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
-	np := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
-	if !pace.candidateAllowed(np, 0) {
-		t.Fatal("expected unset configuration to allow candidates")
+func TestCandidateAllowedBatchCap(t *testing.T) {
+	cases := []struct {
+		name           string
+		rate, maxNodes string
+		selectedCount  int
+		allowed        bool
+	}{
+		{name: "below cap", rate: "100", maxNodes: "2", selectedCount: 1, allowed: true},
+		{name: "at cap", rate: "100", maxNodes: "2", selectedCount: 2, allowed: false},
+		{name: "single-node cap allows first", rate: "1", maxNodes: "1", selectedCount: 0, allowed: true},
+		{name: "single-node cap blocks second", rate: "1", maxNodes: "1", selectedCount: 1, allowed: false},
+		{name: "no cap when unset", rate: "1", maxNodes: "", selectedCount: 99, allowed: true},
 	}
-}
-
-func TestCandidateAllowedInvalidConfigurationFailsOpen(t *testing.T) {
-	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
-	np := paceTestNodePool("0", "1")
-	if !pace.candidateAllowed(np, 0) {
-		t.Fatal("expected invalid configuration to fail open and allow candidates")
-	}
-	pace.Charge(paceCommand(np, 1))
-	if !pace.candidateAllowed(np, 0) {
-		t.Fatal("expected charge with invalid configuration to be a no-op")
-	}
-}
-
-func TestCandidateAllowedRateOnlyConfiguration(t *testing.T) {
-	testClock := clocktesting.NewFakeClock(time.Now())
-	pace := NewUnderutilizedConsolidationPace(testClock)
-	np := paceTestNodePool("1", "")
-	if !pace.candidateAllowed(np, 0) {
-		t.Fatal("expected rate-only configuration to allow candidates")
-	}
-	pace.Charge(paceCommand(np, 1))
-	if pace.candidateAllowed(np, 0) {
-		t.Fatal("expected rate-only configuration to pace after charge")
-	}
-}
-
-func TestCandidateAllowedBatchCapBoundary(t *testing.T) {
-	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
-	np := paceTestNodePool("100", "2")
-	if !pace.candidateAllowed(np, 1) {
-		t.Fatal("expected selectedCount == max-1 to allow another candidate")
-	}
-	if pace.candidateAllowed(np, 2) {
-		t.Fatal("expected selectedCount == max to block candidates")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
+			np := paceTestNodePool(tc.rate, tc.maxNodes)
+			if got := pace.candidateAllowed(np, tc.selectedCount); got != tc.allowed {
+				t.Fatalf("candidateAllowed(selectedCount=%d) = %v, want %v", tc.selectedCount, got, tc.allowed)
+			}
+		})
 	}
 }
 
 func TestCandidateAllowedRateCooldown(t *testing.T) {
-	testClock := clocktesting.NewFakeClock(time.Now())
-	pace := NewUnderutilizedConsolidationPace(testClock)
-	np := paceTestNodePool("1", "100")
-	pace.Charge(&Command{Candidates: []*Candidate{{NodePool: np}}})
-	if pace.candidateAllowed(np, 0) {
-		t.Fatal("expected rate cooldown to block candidates")
+	cases := []struct {
+		name              string
+		rate, maxNodes    string
+		chargeCount       int
+		stillBlockedAfter time.Duration
+		allowedAfter      time.Duration
+	}{
+		{name: "unit rate", rate: "1", maxNodes: "", chargeCount: 1, stillBlockedAfter: 30 * time.Second, allowedAfter: 61 * time.Second},
+		{name: "fractional rate", rate: "0.5", maxNodes: "100", chargeCount: 1, stillBlockedAfter: 1 * time.Minute, allowedAfter: 2 * time.Minute},
+		{name: "weighted by node count", rate: "1", maxNodes: "100", chargeCount: 2, stillBlockedAfter: 1 * time.Minute, allowedAfter: 2 * time.Minute},
 	}
-	testClock.Step(61 * time.Second)
-	if !pace.candidateAllowed(np, 0) {
-		t.Fatal("expected candidates after cooldown elapsed")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			testClock := clocktesting.NewFakeClock(time.Now())
+			pace := NewUnderutilizedConsolidationPace(testClock)
+			np := paceTestNodePool(tc.rate, tc.maxNodes)
+
+			if !pace.candidateAllowed(np, 0) {
+				t.Fatal("expected first admission before any charge")
+			}
+			pace.Charge(paceCommand(np, tc.chargeCount))
+			if pace.candidateAllowed(np, 0) {
+				t.Fatal("expected admission to be blocked immediately after charge")
+			}
+
+			testClock.Step(tc.stillBlockedAfter)
+			if pace.candidateAllowed(np, 0) {
+				t.Fatalf("expected admission to remain blocked after %s", tc.stillBlockedAfter)
+			}
+			testClock.Step(tc.allowedAfter - tc.stillBlockedAfter)
+			if !pace.candidateAllowed(np, 0) {
+				t.Fatalf("expected admission after %s elapsed", tc.allowedAfter)
+			}
+		})
 	}
 }
 
-func TestCandidateAllowedNilPaceDisablesChecks(t *testing.T) {
+func TestCandidateAllowedUnconfigured(t *testing.T) {
+	cases := []struct {
+		name string
+		np   *v1.NodePool
+	}{
+		{name: "unset", np: &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "default"}}},
+		{name: "invalid rate fails open", np: paceTestNodePool("0", "1")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
+			if !pace.candidateAllowed(tc.np, 100) {
+				t.Fatal("expected unconfigured pace to ignore batch cap and allow candidates")
+			}
+			pace.Charge(paceCommand(tc.np, 1))
+			if !pace.candidateAllowed(tc.np, 100) {
+				t.Fatal("expected charge to be a no-op for unconfigured pace")
+			}
+		})
+	}
+}
+
+func TestCandidateAllowedNilPace(t *testing.T) {
 	var pace *UnderutilizedConsolidationPace
-	np := paceTestNodePool("0", "1")
-	if !pace.candidateAllowed(np, 100) {
+	if !pace.candidateAllowed(paceTestNodePool("0", "1"), 100) {
 		t.Fatal("expected nil pace to disable planning-time checks")
-	}
-}
-
-func TestUnderutilizedConsolidationPaceFractional(t *testing.T) {
-	testClock := clocktesting.NewFakeClock(time.Now())
-	pace := NewUnderutilizedConsolidationPace(testClock)
-	np := paceTestNodePool("0.5", "100")
-	cmd := paceCommand(np, 1)
-
-	if !pace.candidateAllowed(np, 0) {
-		t.Fatal("expected first admission")
-	}
-	pace.Charge(cmd)
-	if pace.candidateAllowed(np, 0) {
-		t.Fatal("expected second admission to be blocked")
-	}
-
-	testClock.Step(2 * time.Minute)
-	if !pace.candidateAllowed(np, 0) {
-		t.Fatal("expected admission after interval elapsed")
-	}
-}
-
-func TestUnderutilizedConsolidationPaceWeightedCooldown(t *testing.T) {
-	testClock := clocktesting.NewFakeClock(time.Now())
-	pace := NewUnderutilizedConsolidationPace(testClock)
-	np := paceTestNodePool("1", "100")
-	cmd := paceCommand(np, 2)
-
-	pace.Charge(cmd)
-	if pace.candidateAllowed(np, 0) {
-		t.Fatal("expected admission to be blocked before weighted cooldown elapsed")
-	}
-
-	testClock.Step(1 * time.Minute)
-	if pace.candidateAllowed(np, 0) {
-		t.Fatal("expected admission to remain blocked after one minute for two-node charge")
-	}
-
-	testClock.Step(1 * time.Minute)
-	if !pace.candidateAllowed(np, 0) {
-		t.Fatal("expected admission after two-minute weighted cooldown")
-	}
-}
-
-func TestUnderutilizedConsolidationPaceUnset(t *testing.T) {
-	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
-	np := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
-	cmd := paceCommand(np, 1)
-
-	if !pace.candidateAllowed(np, 0) {
-		t.Fatal("expected first admission with unset pace configuration")
-	}
-	pace.Charge(cmd)
-	if !pace.candidateAllowed(np, 0) {
-		t.Fatal("expected repeated admission with unset pace configuration")
-	}
-}
-
-func TestUnderutilizedConsolidationPaceCommandSizeLimit(t *testing.T) {
-	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
-	np := paceTestNodePool("1", "1")
-
-	if pace.candidateAllowed(np, 1) {
-		t.Fatal("expected selectedCount at per-consolidation cap to block another candidate")
-	}
-	if !pace.candidateAllowed(np, 0) {
-		t.Fatal("expected single candidate within cap to be allowed")
-	}
-}
-
-func TestUnderutilizedConsolidationPaceRateOnlyNoBatchCap(t *testing.T) {
-	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
-	np := paceTestNodePool("1", "")
-
-	if !pace.candidateAllowed(np, 99) {
-		t.Fatal("expected rate-only configuration to impose no per-command batch cap")
 	}
 }
