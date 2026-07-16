@@ -118,7 +118,7 @@ func TestUnderutilizedConsolidationPaceInvalid(t *testing.T) {
 		},
 	}
 
-	if pace.CanAdmit(np) {
+	if _, ok := pace.TryAdmitCommand(paceCommand(np, 1)); ok {
 		t.Fatal("expected invalid pace configuration to block admission")
 	}
 }
@@ -134,7 +134,7 @@ func TestUnderutilizedConsolidationPacePartialConfiguration(t *testing.T) {
 		},
 	}
 
-	if pace.CanAdmit(np) {
+	if _, ok := pace.TryAdmitCommand(paceCommand(np, 1)); ok {
 		t.Fatal("expected partial pace configuration to block admission")
 	}
 }
@@ -186,10 +186,10 @@ func TestUnderutilizedConsolidationPaceCommandSizeLimit(t *testing.T) {
 		},
 	}
 
-	if pace.CanAdmitCommand(paceCommand(np, 2)) {
+	if _, ok := pace.TryAdmitCommand(paceCommand(np, 2)); ok {
 		t.Fatal("expected command exceeding per-consolidation node cap to be rejected")
 	}
-	if !pace.CanAdmitCommand(paceCommand(np, 1)) {
+	if _, ok := pace.TryAdmitCommand(paceCommand(np, 1)); !ok {
 		t.Fatal("expected single-node command within cap to be admitted")
 	}
 }
@@ -475,5 +475,69 @@ var _ = Describe("Underutilized consolidation pace", func() {
 		cmds := queue.GetCommands()
 		Expect(cmds).To(HaveLen(1))
 		Expect(cmds[0].Candidates).To(HaveLen(1))
+	})
+
+	It("should fall back to single-node consolidation for batch-capped candidates", func() {
+		nodePool.Annotations = paceAnnotations("100", "1")
+		currentInstanceType := fake.NewInstanceType(fake.InstanceTypeOptions{
+			Name: "current-on-demand",
+			Offerings: []*cloudprovider.Offering{
+				{
+					Available:    true,
+					Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"}),
+					Price:        0.5,
+				},
+			},
+		})
+		otherInstanceType := fake.NewInstanceType(fake.InstanceTypeOptions{
+			Name: "other-on-demand",
+			Offerings: []*cloudprovider.Offering{
+				{
+					Available:    true,
+					Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"}),
+					Price:        0.4,
+				},
+			},
+		})
+		cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{currentInstanceType, otherInstanceType}
+
+		nodeClaims, nodes := test.NodeClaimsAndNodes(3, v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					v1.NodePoolLabelKey:            nodePool.Name,
+					corev1.LabelInstanceTypeStable: currentInstanceType.Name,
+					v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
+					corev1.LabelTopologyZone:       "test-zone-1a",
+				},
+			},
+			Status: v1.NodeClaimStatus{
+				Allocatable: map[corev1.ResourceName]resource.Quantity{
+					corev1.ResourceCPU:  resource.MustParse("4"),
+					corev1.ResourcePods: resource.MustParse("100"),
+				},
+			},
+		})
+		for i := range nodeClaims {
+			nodeClaims[i].StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+		}
+		ExpectApplied(ctx, env.Client, nodePool)
+		ExpectApplied(ctx, env.Client, lo.Map(nodeClaims, func(o *v1.NodeClaim, _ int) client.Object { return o })...)
+		ExpectApplied(ctx, env.Client, lo.Map(nodes, func(o *corev1.Node, _ int) client.Object { return o })...)
+		pods := test.Pods(4, test.PodOptions{
+			ResourceRequirements: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+			},
+		})
+		ExpectApplied(ctx, env.Client, lo.Map(pods, func(o *corev1.Pod, _ int) client.Object { return o })...)
+		ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
+		ExpectManualBinding(ctx, env.Client, pods[1], nodes[1])
+		ExpectManualBinding(ctx, env.Client, pods[2], nodes[2])
+		ExpectManualBinding(ctx, env.Client, pods[3], nodes[2])
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+		ExpectSingletonReconciled(ctx, disruptionController)
+
+		cmds := queue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		Expect(cmds[0].ConsolidationType()).To(Equal(disruption.SingleNodeConsolidationType))
 	})
 })

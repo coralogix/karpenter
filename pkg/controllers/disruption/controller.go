@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/awslabs/operatorpkg/option"
@@ -213,27 +214,15 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		return false, nil
 	}
 
-	cmds = filterUnderutilizedCommands(cmds, disruption, c.underutilizedPace)
-	if len(cmds) == 0 {
-		return false, nil
-	}
-
-	if err = c.startCommands(ctx, disruption, cmds); err != nil {
+	started, err := c.startCommands(ctx, disruption, cmds)
+	if err != nil {
 		return false, fmt.Errorf("disrupting candidates, %w", err)
 	}
-	return true, nil
+	return started > 0, nil
 }
 
-func filterUnderutilizedCommands(cmds []Command, disruption Method, pace *UnderutilizedConsolidationPace) []Command {
-	if disruption.Reason() != v1.DisruptionReasonUnderutilized {
-		return cmds
-	}
-	return lo.Filter(cmds, func(cmd Command, _ int) bool {
-		return pace.CanAdmitCommand(&cmd)
-	})
-}
-
-func (c *Controller) startCommands(ctx context.Context, disruption Method, cmds []Command) error {
+func (c *Controller) startCommands(ctx context.Context, disruption Method, cmds []Command) (int, error) {
+	var started atomic.Int64
 	errs := make([]error, len(cmds))
 	charges := make([]PaceCharge, len(cmds))
 	paced := disruption.Reason() == v1.DisruptionReasonUnderutilized
@@ -259,9 +248,11 @@ func (c *Controller) startCommands(ctx context.Context, disruption Method, cmds 
 				c.underutilizedPace.Release(charges[i])
 			}
 			errs[i] = fmt.Errorf("disrupting candidates, %w", err)
+			return
 		}
+		started.Add(1)
 	})
-	return multierr.Combine(errs...)
+	return int(started.Load()), multierr.Combine(errs...)
 }
 
 func (c *Controller) recordRun(s string) {

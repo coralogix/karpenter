@@ -153,33 +153,25 @@ func (p *UnderutilizedConsolidationPace) chargeCommandLocked(cmd *Command) PaceC
 	return charge
 }
 
-// CanAdmit reports whether underutilized consolidation may disrupt at least one node for the NodePool now.
-func (p *UnderutilizedConsolidationPace) CanAdmit(np *v1.NodePool) bool {
-	if p == nil || np == nil {
+// candidateAllowed reports whether another candidate from np may be selected during planning.
+// selectedCount is the number of candidates already selected for this NodePool.
+func (p *UnderutilizedConsolidationPace) candidateAllowed(np *v1.NodePool, selectedCount int) bool {
+	if p == nil {
 		return true
+	}
+	cfg := underutilizedPaceConfigFor(np)
+	if cfg.invalid {
+		return false
+	}
+	if !cfg.configured {
+		return true
+	}
+	if selectedCount >= cfg.maxNodesPerCommand {
+		return false
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.canAdmitLocked(np)
-}
-
-// MaxNodesPerConsolidation returns the configured per-command node cap for the NodePool.
-func (p *UnderutilizedConsolidationPace) MaxNodesPerConsolidation(np *v1.NodePool) (int, bool) {
-	cfg := underutilizedPaceConfigFor(np)
-	if !cfg.configured || cfg.invalid {
-		return 0, false
-	}
-	return cfg.maxNodesPerCommand, true
-}
-
-// CanAdmitCommand reports whether the command may start now for all participating NodePools.
-func (p *UnderutilizedConsolidationPace) CanAdmitCommand(cmd *Command) bool {
-	if p == nil {
-		return true
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.canAdmitCommandLocked(cmd)
 }
 
 // TryAdmitCommand atomically charges all participating NodePools for the command's candidate nodes.

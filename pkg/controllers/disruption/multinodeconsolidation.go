@@ -73,12 +73,7 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 			constrainedByBudgets = true
 			continue
 		}
-		if maxNodes, ok := m.underutilizedPace.MaxNodesPerConsolidation(candidate.NodePool); ok {
-			if poolBatchCounts[candidate.NodePool.Name] >= maxNodes {
-				continue
-			}
-		}
-		if !m.underutilizedPace.CanAdmit(candidate.NodePool) {
+		if !m.underutilizedPace.candidateAllowed(candidate.NodePool, poolBatchCounts[candidate.NodePool.Name]) {
 			constrainedByPace = true
 			continue
 		}

@@ -85,7 +85,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 			constrainedByBudgets = true
 			continue
 		}
-		if !s.underutilizedPace.CanAdmit(candidate.NodePool) {
+		if !s.underutilizedPace.candidateAllowed(candidate.NodePool, 0) {
 			constrainedByPace = true
 			continue
 		}
