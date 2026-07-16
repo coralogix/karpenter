@@ -71,7 +71,8 @@ type Controller struct {
 const pollingPeriod = 10 * time.Second
 
 type ControllerOptions struct {
-	methods []Method
+	methods           []Method
+	underutilizedPace *UnderutilizedConsolidationPace
 }
 
 func WithMethods(methods ...Method) option.Function[ControllerOptions] {
@@ -80,11 +81,28 @@ func WithMethods(methods ...Method) option.Function[ControllerOptions] {
 	}
 }
 
+// WithUnderutilizedPace injects the pace instance used for underutilized consolidation. This lets
+// callers (e.g. tests supplying custom methods via WithMethods) share a single pace between the
+// controller, which charges started commands, and the consolidation methods, which consult it during
+// planning. When unset, the controller creates its own pace and wires it into the default methods.
+func WithUnderutilizedPace(pace *UnderutilizedConsolidationPace) option.Function[ControllerOptions] {
+	return func(o *ControllerOptions) {
+		o.underutilizedPace = pace
+	}
+}
+
 func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
 	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *Queue, opts ...option.Function[ControllerOptions]) *Controller {
 
-	underutilizedPace := NewUnderutilizedConsolidationPace(clk)
-	o := option.Resolve(append([]option.Function[ControllerOptions]{WithMethods(NewMethods(clk, cluster, kubeClient, provisioner, cp, recorder, queue, underutilizedPace)...)}, opts...)...)
+	o := option.Resolve(opts...)
+	underutilizedPace := o.underutilizedPace
+	if underutilizedPace == nil {
+		underutilizedPace = NewUnderutilizedConsolidationPace(clk)
+	}
+	methods := o.methods
+	if methods == nil {
+		methods = NewMethods(clk, cluster, kubeClient, provisioner, cp, recorder, queue, underutilizedPace)
+	}
 	return &Controller{
 		queue:             queue,
 		clock:             clk,
@@ -95,7 +113,7 @@ func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provi
 		cloudProvider:     cp,
 		underutilizedPace: underutilizedPace,
 		lastRun:           map[string]time.Time{},
-		methods:           o.methods,
+		methods:           methods,
 	}
 }
 
