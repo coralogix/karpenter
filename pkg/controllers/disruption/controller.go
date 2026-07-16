@@ -83,7 +83,7 @@ func WithMethods(methods ...Method) option.Function[ControllerOptions] {
 func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
 	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *Queue, opts ...option.Function[ControllerOptions]) *Controller {
 
-	underutilizedPace := NewUnderutilizedConsolidationPace(clk, recorder)
+	underutilizedPace := NewUnderutilizedConsolidationPace(clk)
 	o := option.Resolve(append([]option.Function[ControllerOptions]{WithMethods(NewMethods(clk, cluster, kubeClient, provisioner, cp, recorder, queue, underutilizedPace)...)}, opts...)...)
 	return &Controller{
 		queue:             queue,
@@ -224,7 +224,6 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 func (c *Controller) startCommands(ctx context.Context, disruption Method, cmds []Command) (int, error) {
 	var started atomic.Int64
 	errs := make([]error, len(cmds))
-	charges := make([]PaceCharge, len(cmds))
 	paced := disruption.Reason() == v1.DisruptionReasonUnderutilized
 	workqueue.ParallelizeUntil(ctx, len(cmds), len(cmds), func(i int) {
 		cmd := cmds[i]
@@ -234,23 +233,12 @@ func (c *Controller) startCommands(ctx context.Context, disruption Method, cmds 
 		cmd.ID = uuid.New()
 		cmd.Method = disruption
 
-		if paced {
-			// Planning may have filtered candidates via candidateAllowed, but admission
-			// re-checks eligibility and charges atomically under the pace lock.
-			var admitted bool
-			charges[i], admitted = c.underutilizedPace.TryAdmitCommand(&cmd)
-			if !admitted {
-				return
-			}
-		}
-
-		// Attempt to disrupt
 		if err := c.queue.StartCommand(ctx, &cmd); err != nil {
-			if paced {
-				c.underutilizedPace.Release(charges[i])
-			}
 			errs[i] = fmt.Errorf("disrupting candidates, %w", err)
 			return
+		}
+		if paced {
+			c.underutilizedPace.Charge(&cmd)
 		}
 		started.Add(1)
 	})

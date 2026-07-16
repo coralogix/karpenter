@@ -17,7 +17,6 @@ limitations under the License.
 package disruption_test
 
 import (
-	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -26,7 +25,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -39,159 +37,13 @@ import (
 )
 
 func paceAnnotations(rate string, maxNodes string) map[string]string {
-	return map[string]string{
+	annotations := map[string]string{
 		v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey: rate,
-		v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey:    maxNodes,
 	}
-}
-
-func paceCommand(np *v1.NodePool, count int) *disruption.Command {
-	candidates := make([]*disruption.Candidate, count)
-	for i := range candidates {
-		candidates[i] = &disruption.Candidate{NodePool: np}
+	if maxNodes != "" {
+		annotations[v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey] = maxNodes
 	}
-	return &disruption.Command{Candidates: candidates}
-}
-
-func TestUnderutilizedConsolidationPaceFractional(t *testing.T) {
-	testClock := clocktesting.NewFakeClock(time.Now())
-	pace := disruption.NewUnderutilizedConsolidationPace(testClock, nil)
-	np := &v1.NodePool{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        "default",
-			Annotations: paceAnnotations("0.5", "100"),
-		},
-	}
-	cmd := paceCommand(np, 1)
-
-	if _, ok := pace.TryAdmitCommand(cmd); !ok {
-		t.Fatal("expected first admission")
-	}
-	if _, ok := pace.TryAdmitCommand(cmd); ok {
-		t.Fatal("expected second admission to be blocked")
-	}
-
-	testClock.Step(2 * time.Minute)
-	if _, ok := pace.TryAdmitCommand(cmd); !ok {
-		t.Fatal("expected admission after interval elapsed")
-	}
-}
-
-func TestUnderutilizedConsolidationPaceWeightedCooldown(t *testing.T) {
-	testClock := clocktesting.NewFakeClock(time.Now())
-	pace := disruption.NewUnderutilizedConsolidationPace(testClock, nil)
-	np := &v1.NodePool{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        "default",
-			Annotations: paceAnnotations("1", "100"),
-		},
-	}
-	cmd := paceCommand(np, 2)
-
-	if _, ok := pace.TryAdmitCommand(cmd); !ok {
-		t.Fatal("expected first admission")
-	}
-	if _, ok := pace.TryAdmitCommand(paceCommand(np, 1)); ok {
-		t.Fatal("expected admission to be blocked before weighted cooldown elapsed")
-	}
-
-	testClock.Step(1 * time.Minute)
-	if _, ok := pace.TryAdmitCommand(paceCommand(np, 1)); ok {
-		t.Fatal("expected admission to remain blocked after one minute for two-node charge")
-	}
-
-	testClock.Step(1 * time.Minute)
-	if _, ok := pace.TryAdmitCommand(paceCommand(np, 1)); !ok {
-		t.Fatal("expected admission after two-minute weighted cooldown")
-	}
-}
-
-func TestUnderutilizedConsolidationPaceInvalid(t *testing.T) {
-	pace := disruption.NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()), nil)
-	np := &v1.NodePool{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "default",
-			Annotations: map[string]string{
-				v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey: "0",
-				v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey:    "1",
-			},
-		},
-	}
-
-	if _, ok := pace.TryAdmitCommand(paceCommand(np, 1)); ok {
-		t.Fatal("expected invalid pace configuration to block admission")
-	}
-}
-
-func TestUnderutilizedConsolidationPacePartialConfiguration(t *testing.T) {
-	pace := disruption.NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()), nil)
-	np := &v1.NodePool{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "default",
-			Annotations: map[string]string{
-				v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey: "1",
-			},
-		},
-	}
-
-	if _, ok := pace.TryAdmitCommand(paceCommand(np, 1)); ok {
-		t.Fatal("expected partial pace configuration to block admission")
-	}
-}
-
-func TestUnderutilizedConsolidationPaceUnset(t *testing.T) {
-	pace := disruption.NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()), nil)
-	np := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
-	cmd := paceCommand(np, 1)
-
-	if _, ok := pace.TryAdmitCommand(cmd); !ok {
-		t.Fatal("expected first admission with unset pace configuration")
-	}
-	if _, ok := pace.TryAdmitCommand(cmd); !ok {
-		t.Fatal("expected repeated admission with unset pace configuration")
-	}
-}
-
-func TestUnderutilizedConsolidationPaceRelease(t *testing.T) {
-	testClock := clocktesting.NewFakeClock(time.Now())
-	pace := disruption.NewUnderutilizedConsolidationPace(testClock, nil)
-	np := &v1.NodePool{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        "default",
-			Annotations: paceAnnotations("1", "100"),
-		},
-	}
-	cmd := paceCommand(np, 1)
-
-	charge, ok := pace.TryAdmitCommand(cmd)
-	if !ok {
-		t.Fatal("expected first admission")
-	}
-	if _, ok := pace.TryAdmitCommand(cmd); ok {
-		t.Fatal("expected second admission to be blocked")
-	}
-
-	pace.Release(charge)
-	if _, ok := pace.TryAdmitCommand(cmd); !ok {
-		t.Fatal("expected admission after release")
-	}
-}
-
-func TestUnderutilizedConsolidationPaceCommandSizeLimit(t *testing.T) {
-	pace := disruption.NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()), nil)
-	np := &v1.NodePool{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        "default",
-			Annotations: paceAnnotations("1", "1"),
-		},
-	}
-
-	if _, ok := pace.TryAdmitCommand(paceCommand(np, 2)); ok {
-		t.Fatal("expected command exceeding per-consolidation node cap to be rejected")
-	}
-	if _, ok := pace.TryAdmitCommand(paceCommand(np, 1)); !ok {
-		t.Fatal("expected single-node command within cap to be admitted")
-	}
+	return annotations
 }
 
 var _ = Describe("Underutilized consolidation pace", func() {

@@ -137,17 +137,6 @@ func NodePoolBlocked(nodePool *v1.NodePool) events.Event {
 	}
 }
 
-func UnderutilizedPaceMisconfigured(np *v1.NodePool) events.Event {
-	return events.Event{
-		InvolvedObject: np,
-		Type:           corev1.EventTypeNormal,
-		Reason:         events.DisruptionBlocked,
-		Message:        "Invalid underutilized consolidation pace annotations; underutilized consolidation is paused for this NodePool",
-		DedupeValues:   []string{string(np.UID), "underutilized-pace-misconfigured"},
-		DedupeTimeout:  15 * time.Minute,
-	}
-}
-
 // ConsolidationCandidate is an event that informs the user that a consolidation candidate has been generated
 func ConsolidationCandidate(node *corev1.Node, nodeClaim *v1.NodeClaim, command string, savings float64) []events.Event {
 	message := fmt.Sprintf("Consolidation candidate: %s (savings: $%.2f)", command, savings)

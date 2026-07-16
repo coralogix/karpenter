@@ -10,7 +10,7 @@ By default, Karpenter limits underutilized consolidation concurrency through dis
 
 ### Configuration
 
-Set both annotations on a `NodePool`:
+Set the rate annotation on a `NodePool`. Optionally set a per-command batch cap:
 
 ```yaml
 apiVersion: karpenter.sh/v1
@@ -28,14 +28,15 @@ spec:
 
 | Annotation | Meaning |
 |------------|---------|
-| `max-underutilized-node-disruptions-per-minute` | Maximum disrupted candidate nodes per minute for the NodePool |
-| `max-underutilized-nodes-per-consolidation` | Maximum candidate nodes in one underutilized consolidation command |
+| `max-underutilized-node-disruptions-per-minute` | Maximum disrupted candidate nodes per minute for the NodePool (required to enable pacing) |
+| `max-underutilized-nodes-per-consolidation` | Optional maximum candidate nodes in one underutilized consolidation command |
 
 | Configuration | Meaning |
 |---------------|---------|
-| Both omitted | No rate limit beyond disruption budgets (upstream behavior) |
-| Both present and valid | Node-weighted pacing and per-command batch cap apply |
-| Only one present, zero, negative, or invalid | Fail closed for underutilized consolidation on that NodePool |
+| Rate omitted | No rate limit beyond disruption budgets (upstream behavior) |
+| Valid rate present | Node-weighted pacing applies |
+| Valid rate + optional batch cap | Pacing and per-command batch cap apply |
+| Invalid, zero, or negative values | Fail open: pacing is ignored for that NodePool |
 
 Fractional rates are supported for `max-underutilized-node-disruptions-per-minute`.
 
@@ -53,10 +54,9 @@ Example values:
 - Does not affect emptiness, drift, expiration, or disruption budgets.
 - Each successfully started consolidation command charges one unit per disrupted candidate node per participating NodePool. Delete and replace commands both charge existing candidate nodes, not net node reduction.
 - A command with `N` candidate nodes at rate `R` advances that NodePool's next eligible time by `N / R` minutes.
-- `max-underutilized-nodes-per-consolidation` caps how many candidate nodes from a NodePool may appear in one multi-node command. Excess candidates are excluded and may be handled by later consolidation passes, including single-node fallback.
-- Pacing is enforced in memory and resets on controller restart or leader failover. After restart, a NodePool may immediately disrupt up to `max-underutilized-nodes-per-consolidation` candidate nodes in the first command.
+- `max-underutilized-nodes-per-consolidation` caps how many candidate nodes from a NodePool may appear in one multi-node command. Excess candidates are excluded and may be handled by later consolidation passes, including single-node fallback. When omitted, there is no per-command cap beyond disruption budgets.
+- Pacing is enforced in memory and resets on controller restart or leader failover. After restart, a NodePool may immediately disrupt candidates in the first command, subject to the optional per-command cap.
 - When paced, consolidation is deferred without marking the cluster consolidated, similar to budget exhaustion.
-- If queue startup fails after admission, the pace charge is rolled back.
 
 ### Rollback to upstream
 

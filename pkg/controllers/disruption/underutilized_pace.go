@@ -24,40 +24,24 @@ import (
 	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
-	"sigs.k8s.io/karpenter/pkg/events"
 )
 
 type underutilizedPaceConfig struct {
 	rate               float64
-	maxNodesPerCommand int
+	maxNodesPerCommand int // 0 = no per-command cap
 	configured         bool
-	invalid            bool
 }
 
 // UnderutilizedConsolidationPace tracks per-NodePool eligibility for underutilized consolidation.
 type UnderutilizedConsolidationPace struct {
 	clock        clock.Clock
-	recorder     events.Recorder
 	mu           sync.Mutex
 	nextEligible map[string]time.Time
 }
 
-// PaceCharge captures per-NodePool state before a successful admission so it can be rolled back.
-type PaceCharge struct {
-	entries map[string]paceChargeEntry
-}
-
-type paceChargeEntry struct {
-	hadPrevious  bool
-	previous     time.Time
-	chargedUntil time.Time
-}
-
-func NewUnderutilizedConsolidationPace(clk clock.Clock, recorder events.Recorder) *UnderutilizedConsolidationPace {
+func NewUnderutilizedConsolidationPace(clk clock.Clock) *UnderutilizedConsolidationPace {
 	return &UnderutilizedConsolidationPace{
 		clock:        clk,
-		recorder:     recorder,
 		nextEligible: map[string]time.Time{},
 	}
 }
@@ -67,52 +51,27 @@ func underutilizedPaceConfigFor(np *v1.NodePool) underutilizedPaceConfig {
 		return underutilizedPaceConfig{}
 	}
 	rateRaw, rateOK := np.Annotations[v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey]
-	maxRaw, maxOK := np.Annotations[v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey]
-	if !rateOK && !maxOK {
+	if !rateOK {
 		return underutilizedPaceConfig{}
-	}
-	if rateOK != maxOK {
-		return underutilizedPaceConfig{configured: true, invalid: true}
 	}
 	rate, err := strconv.ParseFloat(rateRaw, 64)
 	if err != nil || rate <= 0 {
-		return underutilizedPaceConfig{configured: true, invalid: true}
+		return underutilizedPaceConfig{}
 	}
-	maxNodes, err := strconv.Atoi(maxRaw)
-	if err != nil || maxNodes <= 0 {
-		return underutilizedPaceConfig{configured: true, invalid: true}
+	cfg := underutilizedPaceConfig{
+		rate:       rate,
+		configured: true,
 	}
-	return underutilizedPaceConfig{
-		rate:               rate,
-		maxNodesPerCommand: maxNodes,
-		configured:         true,
-	}
-}
-
-func (p *UnderutilizedConsolidationPace) publishMisconfigured(np *v1.NodePool) {
-	if p == nil || p.recorder == nil || np == nil {
-		return
-	}
-	p.recorder.Publish(disruptionevents.UnderutilizedPaceMisconfigured(np))
-}
-
-func (p *UnderutilizedConsolidationPace) publishMisconfiguredForCommand(cmd *Command) {
-	if cmd == nil {
-		return
-	}
-	_, pools := candidateCountsAndPools(cmd)
-	for _, np := range pools {
-		if underutilizedPaceConfigFor(np).invalid {
-			p.publishMisconfigured(np)
+	if maxRaw, maxOK := np.Annotations[v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey]; maxOK {
+		if maxNodes, err := strconv.Atoi(maxRaw); err == nil && maxNodes > 0 {
+			cfg.maxNodesPerCommand = maxNodes
 		}
 	}
+	return cfg
 }
 
 func (p *UnderutilizedConsolidationPace) canAdmitLocked(np *v1.NodePool) bool {
 	cfg := underutilizedPaceConfigFor(np)
-	if cfg.invalid {
-		return false
-	}
 	if !cfg.configured {
 		return true
 	}
@@ -123,47 +82,17 @@ func (p *UnderutilizedConsolidationPace) canAdmitLocked(np *v1.NodePool) bool {
 	return !p.clock.Now().Before(next)
 }
 
-func (p *UnderutilizedConsolidationPace) canAdmitCommandLocked(cmd *Command) bool {
+func (p *UnderutilizedConsolidationPace) chargeCommandLocked(cmd *Command) {
 	if cmd == nil {
-		return true
-	}
-	counts, pools := candidateCountsAndPools(cmd)
-	for name, count := range counts {
-		np := pools[name]
-		cfg := underutilizedPaceConfigFor(np)
-		if cfg.invalid {
-			return false
-		}
-		if !cfg.configured {
-			continue
-		}
-		if count > cfg.maxNodesPerCommand {
-			return false
-		}
-		if !p.canAdmitLocked(np) {
-			return false
-		}
-	}
-	return true
-}
-
-func (p *UnderutilizedConsolidationPace) chargeCommandLocked(cmd *Command) PaceCharge {
-	charge := PaceCharge{entries: map[string]paceChargeEntry{}}
-	if cmd == nil {
-		return charge
+		return
 	}
 	now := p.clock.Now()
 	counts, pools := candidateCountsAndPools(cmd)
 	for name, count := range counts {
 		np := pools[name]
 		cfg := underutilizedPaceConfigFor(np)
-		if !cfg.configured || cfg.invalid {
+		if !cfg.configured {
 			continue
-		}
-		entry := paceChargeEntry{}
-		if previous, ok := p.nextEligible[name]; ok {
-			entry.hadPrevious = true
-			entry.previous = previous
 		}
 
 		base := now
@@ -171,32 +100,21 @@ func (p *UnderutilizedConsolidationPace) chargeCommandLocked(cmd *Command) PaceC
 			base = next
 		}
 		cooldown := time.Duration(float64(count) * float64(time.Minute) / cfg.rate)
-		chargedUntil := base.Add(cooldown)
-		p.nextEligible[name] = chargedUntil
-		entry.chargedUntil = chargedUntil
-		charge.entries[name] = entry
+		p.nextEligible[name] = base.Add(cooldown)
 	}
-	return charge
 }
 
 // candidateAllowed reports whether another candidate from np may be selected during planning.
 // selectedCount is the number of candidates already selected for this NodePool.
-//
-// This is a best-effort planning filter only. TryAdmitCommand is the authoritative
-// atomic check-and-charge under a single lock at command admission time.
 func (p *UnderutilizedConsolidationPace) candidateAllowed(np *v1.NodePool, selectedCount int) bool {
 	if p == nil {
 		return true
 	}
 	cfg := underutilizedPaceConfigFor(np)
-	if cfg.invalid {
-		p.publishMisconfigured(np)
-		return false
-	}
 	if !cfg.configured {
 		return true
 	}
-	if selectedCount >= cfg.maxNodesPerCommand {
+	if cfg.maxNodesPerCommand > 0 && selectedCount >= cfg.maxNodesPerCommand {
 		return false
 	}
 	p.mu.Lock()
@@ -204,41 +122,14 @@ func (p *UnderutilizedConsolidationPace) candidateAllowed(np *v1.NodePool, selec
 	return p.canAdmitLocked(np)
 }
 
-// TryAdmitCommand atomically charges all participating NodePools for the command's candidate nodes.
-//
-// Planning may have already filtered candidates via candidateAllowed, but admission
-// re-checks eligibility under the lock before charging.
-func (p *UnderutilizedConsolidationPace) TryAdmitCommand(cmd *Command) (PaceCharge, bool) {
+// Charge records a successfully started consolidation command against participating NodePools.
+func (p *UnderutilizedConsolidationPace) Charge(cmd *Command) {
 	if p == nil {
-		return PaceCharge{}, true
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if !p.canAdmitCommandLocked(cmd) {
-		p.publishMisconfiguredForCommand(cmd)
-		return PaceCharge{}, false
-	}
-	return p.chargeCommandLocked(cmd), true
-}
-
-// Release rolls back a prior TryAdmitCommand charge.
-func (p *UnderutilizedConsolidationPace) Release(charge PaceCharge) {
-	if p == nil || charge.entries == nil {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for name, entry := range charge.entries {
-		next, ok := p.nextEligible[name]
-		if !ok || !next.Equal(entry.chargedUntil) {
-			continue
-		}
-		if entry.hadPrevious {
-			p.nextEligible[name] = entry.previous
-			continue
-		}
-		delete(p.nextEligible, name)
-	}
+	p.chargeCommandLocked(cmd)
 }
 
 func candidateCountsAndPools(cmd *Command) (map[string]int, map[string]*v1.NodePool) {

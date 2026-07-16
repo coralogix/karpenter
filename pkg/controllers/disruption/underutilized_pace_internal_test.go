@@ -17,101 +17,73 @@ limitations under the License.
 package disruption
 
 import (
-	"context"
 	"testing"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clocktesting "k8s.io/utils/clock/testing"
-	controllerruntimefake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
-	"sigs.k8s.io/karpenter/pkg/events"
-	"sigs.k8s.io/karpenter/pkg/test"
 )
 
 func paceTestNodePool(rate, maxNodes string) *v1.NodePool {
+	annotations := map[string]string{
+		v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey: rate,
+	}
+	if maxNodes != "" {
+		annotations[v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey] = maxNodes
+	}
 	return &v1.NodePool{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "default",
-			UID:  "test-nodepool-uid",
-			Annotations: map[string]string{
-				v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey: rate,
-				v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey:    maxNodes,
-			},
+			Name:        "default",
+			Annotations: annotations,
 		},
 	}
 }
 
-func expectPaceMisconfiguredEvent(t *testing.T, recorder *test.EventRecorder, np *v1.NodePool) {
-	t.Helper()
-	if recorder.Calls(events.DisruptionBlocked) != 1 {
-		t.Fatalf("expected 1 DisruptionBlocked event, got %d", recorder.Calls(events.DisruptionBlocked))
+func paceCommand(np *v1.NodePool, count int) *Command {
+	candidates := make([]*Candidate, count)
+	for i := range candidates {
+		candidates[i] = &Candidate{NodePool: np}
 	}
-	evts := recorder.Events()
-	if len(evts) != 1 {
-		t.Fatalf("expected 1 recorded event, got %d", len(evts))
-	}
-	evt := evts[0]
-	if evt.InvolvedObject != np {
-		t.Fatal("expected event involved object to be the NodePool")
-	}
-	if evt.Type != corev1.EventTypeNormal {
-		t.Fatalf("expected event type %q, got %q", corev1.EventTypeNormal, evt.Type)
-	}
-	if evt.Reason != events.DisruptionBlocked {
-		t.Fatalf("expected event reason %q, got %q", events.DisruptionBlocked, evt.Reason)
-	}
-	if evt.Message != "Invalid underutilized consolidation pace annotations; underutilized consolidation is paused for this NodePool" {
-		t.Fatalf("unexpected event message: %q", evt.Message)
-	}
-	if len(evt.DedupeValues) != 2 || evt.DedupeValues[0] != string(np.UID) || evt.DedupeValues[1] != "underutilized-pace-misconfigured" {
-		t.Fatalf("unexpected dedupe values: %v", evt.DedupeValues)
-	}
+	return &Command{Candidates: candidates}
 }
 
 func TestCandidateAllowedUnsetConfiguration(t *testing.T) {
-	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()), nil)
+	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
 	np := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
 	if !pace.candidateAllowed(np, 0) {
 		t.Fatal("expected unset configuration to allow candidates")
 	}
 }
 
-func TestCandidateAllowedInvalidConfiguration(t *testing.T) {
-	recorder := test.NewEventRecorder()
-	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()), recorder)
+func TestCandidateAllowedInvalidConfigurationFailsOpen(t *testing.T) {
+	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
 	np := paceTestNodePool("0", "1")
-	if pace.candidateAllowed(np, 0) {
-		t.Fatal("expected invalid configuration to block candidates")
+	if !pace.candidateAllowed(np, 0) {
+		t.Fatal("expected invalid configuration to fail open and allow candidates")
 	}
-	expectPaceMisconfiguredEvent(t, recorder, np)
+	pace.Charge(paceCommand(np, 1))
+	if !pace.candidateAllowed(np, 0) {
+		t.Fatal("expected charge with invalid configuration to be a no-op")
+	}
 }
 
-func TestCandidateAllowedPartialConfiguration(t *testing.T) {
-	recorder := test.NewEventRecorder()
-	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()), recorder)
-	np := &v1.NodePool{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "default",
-			UID:  "test-nodepool-uid",
-			Annotations: map[string]string{
-				v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey: "1",
-			},
-		},
+func TestCandidateAllowedRateOnlyConfiguration(t *testing.T) {
+	testClock := clocktesting.NewFakeClock(time.Now())
+	pace := NewUnderutilizedConsolidationPace(testClock)
+	np := paceTestNodePool("1", "")
+	if !pace.candidateAllowed(np, 0) {
+		t.Fatal("expected rate-only configuration to allow candidates")
 	}
+	pace.Charge(paceCommand(np, 1))
 	if pace.candidateAllowed(np, 0) {
-		t.Fatal("expected partial configuration to block candidates")
+		t.Fatal("expected rate-only configuration to pace after charge")
 	}
-	expectPaceMisconfiguredEvent(t, recorder, np)
 }
 
 func TestCandidateAllowedBatchCapBoundary(t *testing.T) {
-	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()), nil)
+	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
 	np := paceTestNodePool("100", "2")
 	if !pace.candidateAllowed(np, 1) {
 		t.Fatal("expected selectedCount == max-1 to allow another candidate")
@@ -123,12 +95,9 @@ func TestCandidateAllowedBatchCapBoundary(t *testing.T) {
 
 func TestCandidateAllowedRateCooldown(t *testing.T) {
 	testClock := clocktesting.NewFakeClock(time.Now())
-	pace := NewUnderutilizedConsolidationPace(testClock, nil)
+	pace := NewUnderutilizedConsolidationPace(testClock)
 	np := paceTestNodePool("1", "100")
-	cmd := &Command{Candidates: []*Candidate{{NodePool: np}}}
-	if _, ok := pace.TryAdmitCommand(cmd); !ok {
-		t.Fatal("expected first admission")
-	}
+	pace.Charge(&Command{Candidates: []*Candidate{{NodePool: np}}})
 	if pace.candidateAllowed(np, 0) {
 		t.Fatal("expected rate cooldown to block candidates")
 	}
@@ -146,67 +115,79 @@ func TestCandidateAllowedNilPaceDisablesChecks(t *testing.T) {
 	}
 }
 
-func TestTryAdmitCommandInvalidConfigurationEmitsEvent(t *testing.T) {
-	recorder := test.NewEventRecorder()
-	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()), recorder)
-	np := paceTestNodePool("0", "1")
-	cmd := &Command{Candidates: []*Candidate{{NodePool: np}}}
-	if _, ok := pace.TryAdmitCommand(cmd); ok {
-		t.Fatal("expected invalid configuration to block admission")
-	}
-	expectPaceMisconfiguredEvent(t, recorder, np)
-}
-
-func TestReleasePreservesLaterCharge(t *testing.T) {
+func TestUnderutilizedConsolidationPaceFractional(t *testing.T) {
 	testClock := clocktesting.NewFakeClock(time.Now())
-	pace := NewUnderutilizedConsolidationPace(testClock, nil)
-	np := paceTestNodePool("1", "100")
-	cmdA := &Command{Candidates: []*Candidate{{NodePool: np}}}
-	chargeA, ok := pace.TryAdmitCommand(cmdA)
-	if !ok {
-		t.Fatal("expected first admission")
-	}
-	testClock.Step(61 * time.Second)
-	cmdB := &Command{Candidates: []*Candidate{{NodePool: np}}}
-	if _, ok := pace.TryAdmitCommand(cmdB); !ok {
-		t.Fatal("expected second admission after first cooldown elapsed")
-	}
-	pace.Release(chargeA)
-	if pace.candidateAllowed(np, 0) {
-		t.Fatal("expected later charge to remain active after releasing earlier charge")
-	}
-	testClock.Step(61 * time.Second)
+	pace := NewUnderutilizedConsolidationPace(testClock)
+	np := paceTestNodePool("0.5", "100")
+	cmd := paceCommand(np, 1)
+
 	if !pace.candidateAllowed(np, 0) {
-		t.Fatal("expected admission after second charge cooldown elapsed")
+		t.Fatal("expected first admission")
+	}
+	pace.Charge(cmd)
+	if pace.candidateAllowed(np, 0) {
+		t.Fatal("expected second admission to be blocked")
+	}
+
+	testClock.Step(2 * time.Minute)
+	if !pace.candidateAllowed(np, 0) {
+		t.Fatal("expected admission after interval elapsed")
 	}
 }
 
-func TestStartCommandsNoStartedWhenPaceRejects(t *testing.T) {
-	ctx := context.Background()
+func TestUnderutilizedConsolidationPaceWeightedCooldown(t *testing.T) {
 	testClock := clocktesting.NewFakeClock(time.Now())
-	cloudProvider := fake.NewCloudProvider()
-	kubeClient := controllerruntimefake.NewClientBuilder().Build()
-	cluster := state.NewCluster(testClock, kubeClient, cloudProvider)
-	recorder := test.NewEventRecorder()
-	prov := provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, testClock)
-	queue := NewQueue(kubeClient, recorder, cluster, testClock, prov)
-	controller := NewController(testClock, kubeClient, prov, cloudProvider, recorder, cluster, queue)
-
+	pace := NewUnderutilizedConsolidationPace(testClock)
 	np := paceTestNodePool("1", "100")
-	cmd := Command{Candidates: []*Candidate{{NodePool: np}}}
-	if _, ok := controller.underutilizedPace.TryAdmitCommand(&cmd); !ok {
-		t.Fatal("expected first admission")
+	cmd := paceCommand(np, 2)
+
+	pace.Charge(cmd)
+	if pace.candidateAllowed(np, 0) {
+		t.Fatal("expected admission to be blocked before weighted cooldown elapsed")
 	}
 
-	method := NewSingleNodeConsolidation(MakeConsolidation(testClock, cluster, kubeClient, prov, cloudProvider, recorder, queue, controller.underutilizedPace))
-	started, err := controller.startCommands(ctx, method, []Command{cmd})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	testClock.Step(1 * time.Minute)
+	if pace.candidateAllowed(np, 0) {
+		t.Fatal("expected admission to remain blocked after one minute for two-node charge")
 	}
-	if started != 0 {
-		t.Fatalf("expected 0 started commands when pace rejects, got %d", started)
+
+	testClock.Step(1 * time.Minute)
+	if !pace.candidateAllowed(np, 0) {
+		t.Fatal("expected admission after two-minute weighted cooldown")
 	}
-	if len(queue.GetCommands()) != 0 {
-		t.Fatalf("expected no commands in queue, got %d", len(queue.GetCommands()))
+}
+
+func TestUnderutilizedConsolidationPaceUnset(t *testing.T) {
+	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
+	np := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+	cmd := paceCommand(np, 1)
+
+	if !pace.candidateAllowed(np, 0) {
+		t.Fatal("expected first admission with unset pace configuration")
+	}
+	pace.Charge(cmd)
+	if !pace.candidateAllowed(np, 0) {
+		t.Fatal("expected repeated admission with unset pace configuration")
+	}
+}
+
+func TestUnderutilizedConsolidationPaceCommandSizeLimit(t *testing.T) {
+	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
+	np := paceTestNodePool("1", "1")
+
+	if pace.candidateAllowed(np, 1) {
+		t.Fatal("expected selectedCount at per-consolidation cap to block another candidate")
+	}
+	if !pace.candidateAllowed(np, 0) {
+		t.Fatal("expected single candidate within cap to be allowed")
+	}
+}
+
+func TestUnderutilizedConsolidationPaceRateOnlyNoBatchCap(t *testing.T) {
+	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
+	np := paceTestNodePool("1", "")
+
+	if !pace.candidateAllowed(np, 99) {
+		t.Fatal("expected rate-only configuration to impose no per-command batch cap")
 	}
 }
