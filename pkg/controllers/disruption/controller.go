@@ -83,7 +83,7 @@ func WithMethods(methods ...Method) option.Function[ControllerOptions] {
 func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
 	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *Queue, opts ...option.Function[ControllerOptions]) *Controller {
 
-	underutilizedPace := NewUnderutilizedConsolidationPace(clk)
+	underutilizedPace := NewUnderutilizedConsolidationPace(clk, recorder)
 	o := option.Resolve(append([]option.Function[ControllerOptions]{WithMethods(NewMethods(clk, cluster, kubeClient, provisioner, cp, recorder, queue, underutilizedPace)...)}, opts...)...)
 	return &Controller{
 		queue:             queue,
@@ -235,6 +235,8 @@ func (c *Controller) startCommands(ctx context.Context, disruption Method, cmds 
 		cmd.Method = disruption
 
 		if paced {
+			// Planning may have filtered candidates via candidateAllowed, but admission
+			// re-checks eligibility and charges atomically under the pace lock.
 			var admitted bool
 			charges[i], admitted = c.underutilizedPace.TryAdmitCommand(&cmd)
 			if !admitted {

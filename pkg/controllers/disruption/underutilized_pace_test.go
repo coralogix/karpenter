@@ -55,7 +55,7 @@ func paceCommand(np *v1.NodePool, count int) *disruption.Command {
 
 func TestUnderutilizedConsolidationPaceFractional(t *testing.T) {
 	testClock := clocktesting.NewFakeClock(time.Now())
-	pace := disruption.NewUnderutilizedConsolidationPace(testClock)
+	pace := disruption.NewUnderutilizedConsolidationPace(testClock, nil)
 	np := &v1.NodePool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        "default",
@@ -79,7 +79,7 @@ func TestUnderutilizedConsolidationPaceFractional(t *testing.T) {
 
 func TestUnderutilizedConsolidationPaceWeightedCooldown(t *testing.T) {
 	testClock := clocktesting.NewFakeClock(time.Now())
-	pace := disruption.NewUnderutilizedConsolidationPace(testClock)
+	pace := disruption.NewUnderutilizedConsolidationPace(testClock, nil)
 	np := &v1.NodePool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        "default",
@@ -107,7 +107,7 @@ func TestUnderutilizedConsolidationPaceWeightedCooldown(t *testing.T) {
 }
 
 func TestUnderutilizedConsolidationPaceInvalid(t *testing.T) {
-	pace := disruption.NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
+	pace := disruption.NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()), nil)
 	np := &v1.NodePool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "default",
@@ -124,7 +124,7 @@ func TestUnderutilizedConsolidationPaceInvalid(t *testing.T) {
 }
 
 func TestUnderutilizedConsolidationPacePartialConfiguration(t *testing.T) {
-	pace := disruption.NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
+	pace := disruption.NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()), nil)
 	np := &v1.NodePool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "default",
@@ -140,7 +140,7 @@ func TestUnderutilizedConsolidationPacePartialConfiguration(t *testing.T) {
 }
 
 func TestUnderutilizedConsolidationPaceUnset(t *testing.T) {
-	pace := disruption.NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
+	pace := disruption.NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()), nil)
 	np := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
 	cmd := paceCommand(np, 1)
 
@@ -154,7 +154,7 @@ func TestUnderutilizedConsolidationPaceUnset(t *testing.T) {
 
 func TestUnderutilizedConsolidationPaceRelease(t *testing.T) {
 	testClock := clocktesting.NewFakeClock(time.Now())
-	pace := disruption.NewUnderutilizedConsolidationPace(testClock)
+	pace := disruption.NewUnderutilizedConsolidationPace(testClock, nil)
 	np := &v1.NodePool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        "default",
@@ -178,7 +178,7 @@ func TestUnderutilizedConsolidationPaceRelease(t *testing.T) {
 }
 
 func TestUnderutilizedConsolidationPaceCommandSizeLimit(t *testing.T) {
-	pace := disruption.NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
+	pace := disruption.NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()), nil)
 	np := &v1.NodePool{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        "default",
@@ -307,40 +307,18 @@ var _ = Describe("Underutilized consolidation pace", func() {
 
 	It("should pace multi-node consolidation by disrupted node count", func() {
 		nodePool.Annotations = paceAnnotations("1", "100")
-		currentInstanceType := fake.NewInstanceType(fake.InstanceTypeOptions{
-			Name: "current-on-demand",
-			Offerings: []*cloudprovider.Offering{
-				{
-					Available:    true,
-					Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"}),
-					Price:        0.5,
-				},
-			},
-		})
-		otherInstanceType := fake.NewInstanceType(fake.InstanceTypeOptions{
-			Name: "other-on-demand",
-			Offerings: []*cloudprovider.Offering{
-				{
-					Available:    true,
-					Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"}),
-					Price:        0.4,
-				},
-			},
-		})
-		cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{currentInstanceType, otherInstanceType}
-
 		nodeClaims, nodes := test.NodeClaimsAndNodes(3, v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
 					v1.NodePoolLabelKey:            nodePool.Name,
-					corev1.LabelInstanceTypeStable: currentInstanceType.Name,
-					v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
-					corev1.LabelTopologyZone:       "test-zone-1a",
+					corev1.LabelInstanceTypeStable: leastExpensiveInstance.Name,
+					v1.CapacityTypeLabelKey:        leastExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+					corev1.LabelTopologyZone:       leastExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
 				},
 			},
 			Status: v1.NodeClaimStatus{
 				Allocatable: map[corev1.ResourceName]resource.Quantity{
-					corev1.ResourceCPU:  resource.MustParse("4"),
+					corev1.ResourceCPU:  resource.MustParse("32"),
 					corev1.ResourcePods: resource.MustParse("100"),
 				},
 			},
@@ -348,24 +326,34 @@ var _ = Describe("Underutilized consolidation pace", func() {
 		for i := range nodeClaims {
 			nodeClaims[i].StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 		}
-		ExpectApplied(ctx, env.Client, nodePool)
+
+		rs := test.ReplicaSet()
+		ExpectApplied(ctx, env.Client, rs)
+		pods := test.Pods(4, test.PodOptions{
+			ObjectMeta: metav1.ObjectMeta{Labels: labels,
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion:         "apps/v1",
+						Kind:               "ReplicaSet",
+						Name:               rs.Name,
+						UID:                rs.UID,
+						Controller:         lo.ToPtr(true),
+						BlockOwnerDeletion: lo.ToPtr(true),
+					},
+				}},
+		})
+		ExpectApplied(ctx, env.Client, nodePool, rs, pods[0], pods[1], pods[2], pods[3])
 		ExpectApplied(ctx, env.Client, lo.Map(nodeClaims, func(o *v1.NodeClaim, _ int) client.Object { return o })...)
 		ExpectApplied(ctx, env.Client, lo.Map(nodes, func(o *corev1.Node, _ int) client.Object { return o })...)
-		pods := test.Pods(4, test.PodOptions{
-			ResourceRequirements: corev1.ResourceRequirements{
-				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
-			},
-		})
-		ExpectApplied(ctx, env.Client, lo.Map(pods, func(o *corev1.Pod, _ int) client.Object { return o })...)
 		ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
 		ExpectManualBinding(ctx, env.Client, pods[1], nodes[1])
 		ExpectManualBinding(ctx, env.Client, pods[2], nodes[2])
-		ExpectManualBinding(ctx, env.Client, pods[3], nodes[2])
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 		ExpectSingletonReconciled(ctx, disruptionController)
 
 		cmds := queue.GetCommands()
 		Expect(cmds).To(HaveLen(1))
+		Expect(cmds[0].ConsolidationType()).To(Equal(disruption.MultiNodeConsolidationType))
 		Expect(cmds[0].Candidates).To(HaveLen(2))
 
 		*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, fakeClock, prov))
@@ -373,14 +361,14 @@ var _ = Describe("Underutilized consolidation pace", func() {
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
 					v1.NodePoolLabelKey:            nodePool.Name,
-					corev1.LabelInstanceTypeStable: currentInstanceType.Name,
-					v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
-					corev1.LabelTopologyZone:       "test-zone-1a",
+					corev1.LabelInstanceTypeStable: leastExpensiveInstance.Name,
+					v1.CapacityTypeLabelKey:        leastExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+					corev1.LabelTopologyZone:       leastExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
 				},
 			},
 			Status: v1.NodeClaimStatus{
 				Allocatable: map[corev1.ResourceName]resource.Quantity{
-					corev1.ResourceCPU:  resource.MustParse("4"),
+					corev1.ResourceCPU:  resource.MustParse("32"),
 					corev1.ResourcePods: resource.MustParse("100"),
 				},
 			},
@@ -388,18 +376,25 @@ var _ = Describe("Underutilized consolidation pace", func() {
 		for i := range nodeClaims {
 			nodeClaims[i].StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 		}
+		pods = test.Pods(4, test.PodOptions{
+			ObjectMeta: metav1.ObjectMeta{Labels: labels,
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion:         "apps/v1",
+						Kind:               "ReplicaSet",
+						Name:               rs.Name,
+						UID:                rs.UID,
+						Controller:         lo.ToPtr(true),
+						BlockOwnerDeletion: lo.ToPtr(true),
+					},
+				}},
+		})
+		ExpectApplied(ctx, env.Client, pods[0], pods[1], pods[2], pods[3])
 		ExpectApplied(ctx, env.Client, lo.Map(nodeClaims, func(o *v1.NodeClaim, _ int) client.Object { return o })...)
 		ExpectApplied(ctx, env.Client, lo.Map(nodes, func(o *corev1.Node, _ int) client.Object { return o })...)
-		pods = test.Pods(4, test.PodOptions{
-			ResourceRequirements: corev1.ResourceRequirements{
-				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
-			},
-		})
-		ExpectApplied(ctx, env.Client, lo.Map(pods, func(o *corev1.Pod, _ int) client.Object { return o })...)
 		ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
 		ExpectManualBinding(ctx, env.Client, pods[1], nodes[1])
 		ExpectManualBinding(ctx, env.Client, pods[2], nodes[2])
-		ExpectManualBinding(ctx, env.Client, pods[3], nodes[2])
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 
 		cluster.MarkUnconsolidated()

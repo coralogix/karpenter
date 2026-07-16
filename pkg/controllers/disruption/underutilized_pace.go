@@ -24,6 +24,8 @@ import (
 	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	"sigs.k8s.io/karpenter/pkg/events"
 )
 
 type underutilizedPaceConfig struct {
@@ -36,6 +38,7 @@ type underutilizedPaceConfig struct {
 // UnderutilizedConsolidationPace tracks per-NodePool eligibility for underutilized consolidation.
 type UnderutilizedConsolidationPace struct {
 	clock        clock.Clock
+	recorder     events.Recorder
 	mu           sync.Mutex
 	nextEligible map[string]time.Time
 }
@@ -46,13 +49,15 @@ type PaceCharge struct {
 }
 
 type paceChargeEntry struct {
-	hadPrevious bool
-	previous    time.Time
+	hadPrevious  bool
+	previous     time.Time
+	chargedUntil time.Time
 }
 
-func NewUnderutilizedConsolidationPace(clk clock.Clock) *UnderutilizedConsolidationPace {
+func NewUnderutilizedConsolidationPace(clk clock.Clock, recorder events.Recorder) *UnderutilizedConsolidationPace {
 	return &UnderutilizedConsolidationPace{
 		clock:        clk,
+		recorder:     recorder,
 		nextEligible: map[string]time.Time{},
 	}
 }
@@ -81,6 +86,25 @@ func underutilizedPaceConfigFor(np *v1.NodePool) underutilizedPaceConfig {
 		rate:               rate,
 		maxNodesPerCommand: maxNodes,
 		configured:         true,
+	}
+}
+
+func (p *UnderutilizedConsolidationPace) publishMisconfigured(np *v1.NodePool) {
+	if p == nil || p.recorder == nil || np == nil {
+		return
+	}
+	p.recorder.Publish(disruptionevents.UnderutilizedPaceMisconfigured(np))
+}
+
+func (p *UnderutilizedConsolidationPace) publishMisconfiguredForCommand(cmd *Command) {
+	if cmd == nil {
+		return
+	}
+	_, pools := candidateCountsAndPools(cmd)
+	for _, np := range pools {
+		if underutilizedPaceConfigFor(np).invalid {
+			p.publishMisconfigured(np)
+		}
 	}
 }
 
@@ -141,26 +165,32 @@ func (p *UnderutilizedConsolidationPace) chargeCommandLocked(cmd *Command) PaceC
 			entry.hadPrevious = true
 			entry.previous = previous
 		}
-		charge.entries[name] = entry
 
 		base := now
 		if next, ok := p.nextEligible[name]; ok && next.After(base) {
 			base = next
 		}
 		cooldown := time.Duration(float64(count) * float64(time.Minute) / cfg.rate)
-		p.nextEligible[name] = base.Add(cooldown)
+		chargedUntil := base.Add(cooldown)
+		p.nextEligible[name] = chargedUntil
+		entry.chargedUntil = chargedUntil
+		charge.entries[name] = entry
 	}
 	return charge
 }
 
 // candidateAllowed reports whether another candidate from np may be selected during planning.
 // selectedCount is the number of candidates already selected for this NodePool.
+//
+// This is a best-effort planning filter only. TryAdmitCommand is the authoritative
+// atomic check-and-charge under a single lock at command admission time.
 func (p *UnderutilizedConsolidationPace) candidateAllowed(np *v1.NodePool, selectedCount int) bool {
 	if p == nil {
 		return true
 	}
 	cfg := underutilizedPaceConfigFor(np)
 	if cfg.invalid {
+		p.publishMisconfigured(np)
 		return false
 	}
 	if !cfg.configured {
@@ -175,6 +205,9 @@ func (p *UnderutilizedConsolidationPace) candidateAllowed(np *v1.NodePool, selec
 }
 
 // TryAdmitCommand atomically charges all participating NodePools for the command's candidate nodes.
+//
+// Planning may have already filtered candidates via candidateAllowed, but admission
+// re-checks eligibility under the lock before charging.
 func (p *UnderutilizedConsolidationPace) TryAdmitCommand(cmd *Command) (PaceCharge, bool) {
 	if p == nil {
 		return PaceCharge{}, true
@@ -182,6 +215,7 @@ func (p *UnderutilizedConsolidationPace) TryAdmitCommand(cmd *Command) (PaceChar
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.canAdmitCommandLocked(cmd) {
+		p.publishMisconfiguredForCommand(cmd)
 		return PaceCharge{}, false
 	}
 	return p.chargeCommandLocked(cmd), true
@@ -195,6 +229,10 @@ func (p *UnderutilizedConsolidationPace) Release(charge PaceCharge) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for name, entry := range charge.entries {
+		next, ok := p.nextEligible[name]
+		if !ok || !next.Equal(entry.chargedUntil) {
+			continue
+		}
 		if entry.hadPrevious {
 			p.nextEligible[name] = entry.previous
 			continue
