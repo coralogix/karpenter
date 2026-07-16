@@ -213,16 +213,30 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		return false, nil
 	}
 
-	if disruption.Reason() == v1.DisruptionReasonUnderutilized {
-		cmds = lo.Filter(cmds, func(cmd Command, _ int) bool {
-			return c.underutilizedPace.TryAdmit(nodePoolsFromCommand(cmd)...)
-		})
-		if len(cmds) == 0 {
-			return false, nil
-		}
+	cmds = filterUnderutilizedCommands(cmds, disruption, c.underutilizedPace)
+	if len(cmds) == 0 {
+		return false, nil
 	}
 
+	if err = c.startCommands(ctx, disruption, cmds); err != nil {
+		return false, fmt.Errorf("disrupting candidates, %w", err)
+	}
+	return true, nil
+}
+
+func filterUnderutilizedCommands(cmds []Command, disruption Method, pace *UnderutilizedConsolidationPace) []Command {
+	if disruption.Reason() != v1.DisruptionReasonUnderutilized {
+		return cmds
+	}
+	return lo.Filter(cmds, func(cmd Command, _ int) bool {
+		return pace.CanAdmitCommand(&cmd)
+	})
+}
+
+func (c *Controller) startCommands(ctx context.Context, disruption Method, cmds []Command) error {
 	errs := make([]error, len(cmds))
+	charges := make([]PaceCharge, len(cmds))
+	paced := disruption.Reason() == v1.DisruptionReasonUnderutilized
 	workqueue.ParallelizeUntil(ctx, len(cmds), len(cmds), func(i int) {
 		cmd := cmds[i]
 
@@ -231,15 +245,23 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		cmd.ID = uuid.New()
 		cmd.Method = disruption
 
+		if paced {
+			var admitted bool
+			charges[i], admitted = c.underutilizedPace.TryAdmitCommand(&cmd)
+			if !admitted {
+				return
+			}
+		}
+
 		// Attempt to disrupt
 		if err := c.queue.StartCommand(ctx, &cmd); err != nil {
+			if paced {
+				c.underutilizedPace.Release(charges[i])
+			}
 			errs[i] = fmt.Errorf("disrupting candidates, %w", err)
 		}
 	})
-	if err = multierr.Combine(errs...); err != nil {
-		return false, fmt.Errorf("disrupting candidates, %w", err)
-	}
-	return true, nil
+	return multierr.Combine(errs...)
 }
 
 func (c *Controller) recordRun(s string) {

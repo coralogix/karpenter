@@ -38,28 +38,71 @@ import (
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
 
+func paceAnnotations(rate string, maxNodes string) map[string]string {
+	return map[string]string{
+		v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey: rate,
+		v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey:    maxNodes,
+	}
+}
+
+func paceCommand(np *v1.NodePool, count int) *disruption.Command {
+	candidates := make([]*disruption.Candidate, count)
+	for i := range candidates {
+		candidates[i] = &disruption.Candidate{NodePool: np}
+	}
+	return &disruption.Command{Candidates: candidates}
+}
+
 func TestUnderutilizedConsolidationPaceFractional(t *testing.T) {
 	testClock := clocktesting.NewFakeClock(time.Now())
 	pace := disruption.NewUnderutilizedConsolidationPace(testClock)
 	np := &v1.NodePool{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "default",
-			Annotations: map[string]string{
-				v1.MaxUnderutilizedConsolidationsPerMinuteAnnotationKey: "0.5",
-			},
+			Name:        "default",
+			Annotations: paceAnnotations("0.5", "100"),
 		},
 	}
+	cmd := paceCommand(np, 1)
 
-	if !pace.TryAdmit(np) {
+	if _, ok := pace.TryAdmitCommand(cmd); !ok {
 		t.Fatal("expected first admission")
 	}
-	if pace.TryAdmit(np) {
+	if _, ok := pace.TryAdmitCommand(cmd); ok {
 		t.Fatal("expected second admission to be blocked")
 	}
 
 	testClock.Step(2 * time.Minute)
-	if !pace.TryAdmit(np) {
+	if _, ok := pace.TryAdmitCommand(cmd); !ok {
 		t.Fatal("expected admission after interval elapsed")
+	}
+}
+
+func TestUnderutilizedConsolidationPaceWeightedCooldown(t *testing.T) {
+	testClock := clocktesting.NewFakeClock(time.Now())
+	pace := disruption.NewUnderutilizedConsolidationPace(testClock)
+	np := &v1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "default",
+			Annotations: paceAnnotations("1", "100"),
+		},
+	}
+	cmd := paceCommand(np, 2)
+
+	if _, ok := pace.TryAdmitCommand(cmd); !ok {
+		t.Fatal("expected first admission")
+	}
+	if _, ok := pace.TryAdmitCommand(paceCommand(np, 1)); ok {
+		t.Fatal("expected admission to be blocked before weighted cooldown elapsed")
+	}
+
+	testClock.Step(1 * time.Minute)
+	if _, ok := pace.TryAdmitCommand(paceCommand(np, 1)); ok {
+		t.Fatal("expected admission to remain blocked after one minute for two-node charge")
+	}
+
+	testClock.Step(1 * time.Minute)
+	if _, ok := pace.TryAdmitCommand(paceCommand(np, 1)); !ok {
+		t.Fatal("expected admission after two-minute weighted cooldown")
 	}
 }
 
@@ -69,7 +112,8 @@ func TestUnderutilizedConsolidationPaceInvalid(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "default",
 			Annotations: map[string]string{
-				v1.MaxUnderutilizedConsolidationsPerMinuteAnnotationKey: "0",
+				v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey: "0",
+				v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey:    "1",
 			},
 		},
 	}
@@ -79,15 +123,74 @@ func TestUnderutilizedConsolidationPaceInvalid(t *testing.T) {
 	}
 }
 
+func TestUnderutilizedConsolidationPacePartialConfiguration(t *testing.T) {
+	pace := disruption.NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
+	np := &v1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "default",
+			Annotations: map[string]string{
+				v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey: "1",
+			},
+		},
+	}
+
+	if pace.CanAdmit(np) {
+		t.Fatal("expected partial pace configuration to block admission")
+	}
+}
+
 func TestUnderutilizedConsolidationPaceUnset(t *testing.T) {
 	pace := disruption.NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
 	np := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+	cmd := paceCommand(np, 1)
 
-	if !pace.TryAdmit(np) {
+	if _, ok := pace.TryAdmitCommand(cmd); !ok {
 		t.Fatal("expected first admission with unset pace configuration")
 	}
-	if !pace.TryAdmit(np) {
+	if _, ok := pace.TryAdmitCommand(cmd); !ok {
 		t.Fatal("expected repeated admission with unset pace configuration")
+	}
+}
+
+func TestUnderutilizedConsolidationPaceRelease(t *testing.T) {
+	testClock := clocktesting.NewFakeClock(time.Now())
+	pace := disruption.NewUnderutilizedConsolidationPace(testClock)
+	np := &v1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "default",
+			Annotations: paceAnnotations("1", "100"),
+		},
+	}
+	cmd := paceCommand(np, 1)
+
+	charge, ok := pace.TryAdmitCommand(cmd)
+	if !ok {
+		t.Fatal("expected first admission")
+	}
+	if _, ok := pace.TryAdmitCommand(cmd); ok {
+		t.Fatal("expected second admission to be blocked")
+	}
+
+	pace.Release(charge)
+	if _, ok := pace.TryAdmitCommand(cmd); !ok {
+		t.Fatal("expected admission after release")
+	}
+}
+
+func TestUnderutilizedConsolidationPaceCommandSizeLimit(t *testing.T) {
+	pace := disruption.NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
+	np := &v1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "default",
+			Annotations: paceAnnotations("1", "1"),
+		},
+	}
+
+	if pace.CanAdmitCommand(paceCommand(np, 2)) {
+		t.Fatal("expected command exceeding per-consolidation node cap to be rejected")
+	}
+	if !pace.CanAdmitCommand(paceCommand(np, 1)) {
+		t.Fatal("expected single-node command within cap to be admitted")
 	}
 }
 
@@ -110,9 +213,7 @@ var _ = Describe("Underutilized consolidation pace", func() {
 	})
 
 	It("should pace single-node consolidation", func() {
-		nodePool.Annotations = map[string]string{
-			v1.MaxUnderutilizedConsolidationsPerMinuteAnnotationKey: "1",
-		}
+		nodePool.Annotations = paceAnnotations("1", "100")
 		nodeClaims, nodes := test.NodeClaimsAndNodes(2, v1.NodeClaim{
 			ObjectMeta: metav1.ObjectMeta{
 				Labels: map[string]string{
@@ -204,10 +305,8 @@ var _ = Describe("Underutilized consolidation pace", func() {
 		Expect(queue.GetCommands()).To(HaveLen(1))
 	})
 
-	It("should pace multi-node consolidation as a single command", func() {
-		nodePool.Annotations = map[string]string{
-			v1.MaxUnderutilizedConsolidationsPerMinuteAnnotationKey: "1",
-		}
+	It("should pace multi-node consolidation by disrupted node count", func() {
+		nodePool.Annotations = paceAnnotations("1", "100")
 		currentInstanceType := fake.NewInstanceType(fake.InstanceTypeOptions{
 			Name: "current-on-demand",
 			Offerings: []*cloudprovider.Offering{
@@ -304,8 +403,77 @@ var _ = Describe("Underutilized consolidation pace", func() {
 		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 
 		cluster.MarkUnconsolidated()
-		fakeClock.Step(30 * time.Second)
+		fakeClock.Step(90 * time.Second)
 		ExpectSingletonReconciled(ctx, disruptionController)
 		Expect(queue.GetCommands()).To(HaveLen(0))
+
+		cluster.MarkUnconsolidated()
+		fakeClock.Step(31 * time.Second)
+		ExpectSingletonReconciled(ctx, disruptionController)
+		Expect(queue.GetCommands()).To(HaveLen(1))
+	})
+
+	It("should cap multi-node consolidation batch size", func() {
+		nodePool.Annotations = paceAnnotations("100", "1")
+		currentInstanceType := fake.NewInstanceType(fake.InstanceTypeOptions{
+			Name: "current-on-demand",
+			Offerings: []*cloudprovider.Offering{
+				{
+					Available:    true,
+					Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"}),
+					Price:        0.5,
+				},
+			},
+		})
+		otherInstanceType := fake.NewInstanceType(fake.InstanceTypeOptions{
+			Name: "other-on-demand",
+			Offerings: []*cloudprovider.Offering{
+				{
+					Available:    true,
+					Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"}),
+					Price:        0.4,
+				},
+			},
+		})
+		cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{currentInstanceType, otherInstanceType}
+
+		nodeClaims, nodes := test.NodeClaimsAndNodes(3, v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					v1.NodePoolLabelKey:            nodePool.Name,
+					corev1.LabelInstanceTypeStable: currentInstanceType.Name,
+					v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
+					corev1.LabelTopologyZone:       "test-zone-1a",
+				},
+			},
+			Status: v1.NodeClaimStatus{
+				Allocatable: map[corev1.ResourceName]resource.Quantity{
+					corev1.ResourceCPU:  resource.MustParse("4"),
+					corev1.ResourcePods: resource.MustParse("100"),
+				},
+			},
+		})
+		for i := range nodeClaims {
+			nodeClaims[i].StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+		}
+		ExpectApplied(ctx, env.Client, nodePool)
+		ExpectApplied(ctx, env.Client, lo.Map(nodeClaims, func(o *v1.NodeClaim, _ int) client.Object { return o })...)
+		ExpectApplied(ctx, env.Client, lo.Map(nodes, func(o *corev1.Node, _ int) client.Object { return o })...)
+		pods := test.Pods(4, test.PodOptions{
+			ResourceRequirements: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
+			},
+		})
+		ExpectApplied(ctx, env.Client, lo.Map(pods, func(o *corev1.Pod, _ int) client.Object { return o })...)
+		ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
+		ExpectManualBinding(ctx, env.Client, pods[1], nodes[1])
+		ExpectManualBinding(ctx, env.Client, pods[2], nodes[2])
+		ExpectManualBinding(ctx, env.Client, pods[3], nodes[2])
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+		ExpectSingletonReconciled(ctx, disruptionController)
+
+		cmds := queue.GetCommands()
+		Expect(cmds).To(HaveLen(1))
+		Expect(cmds[0].Candidates).To(HaveLen(1))
 	})
 })

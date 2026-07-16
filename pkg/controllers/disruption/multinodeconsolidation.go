@@ -63,6 +63,7 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 	// would have violated the budget anyway, preserving the ordering
 	// and only considering a number of nodes that can be disrupted.
 	disruptableCandidates := make([]*Candidate, 0, len(candidates))
+	poolBatchCounts := map[string]int{}
 	constrainedByBudgets := false
 	constrainedByPace := false
 	for _, candidate := range candidates {
@@ -71,6 +72,11 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			constrainedByBudgets = true
 			continue
+		}
+		if maxNodes, ok := m.underutilizedPace.MaxNodesPerConsolidation(candidate.NodePool); ok {
+			if poolBatchCounts[candidate.NodePool.Name] >= maxNodes {
+				continue
+			}
 		}
 		if !m.underutilizedPace.CanAdmit(candidate.NodePool) {
 			constrainedByPace = true
@@ -84,6 +90,7 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 		}
 		// set constrainedByBudgets to true if any node was a candidate but was constrained by a budget
 		disruptableCandidates = append(disruptableCandidates, candidate)
+		poolBatchCounts[candidate.NodePool.Name]++
 		disruptionBudgetMapping[candidate.NodePool.Name]--
 	}
 
