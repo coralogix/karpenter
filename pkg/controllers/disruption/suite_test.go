@@ -110,8 +110,13 @@ var _ = BeforeEach(func() {
 
 	recorder.Reset() // Reset the events that we captured during the run
 
-	// Ensure that we reset the disruption controller's methods after each test run
-	disruptionController = disruption.NewController(fakeClock, env.Client, prov, cloudProvider, recorder, cluster, queue, disruption.WithMethods(NewMethodsWithNopValidator()...))
+	// Ensure that we reset the disruption controller's methods after each test run. Share a single
+	// pace between the controller (which charges started commands) and the consolidation methods
+	// (which consult it during planning) so underutilized pacing is exercised end-to-end.
+	underutilizedPace := disruption.NewUnderutilizedConsolidationPace(fakeClock)
+	disruptionController = disruption.NewController(fakeClock, env.Client, prov, cloudProvider, recorder, cluster, queue,
+		disruption.WithMethods(NewMethodsWithNopValidator(underutilizedPace)...),
+		disruption.WithUnderutilizedPace(underutilizedPace))
 	fakeClock.SetTime(time.Now())
 	cluster.Reset()
 	*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, fakeClock, prov))

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/awslabs/operatorpkg/option"
@@ -53,23 +54,25 @@ import (
 )
 
 type Controller struct {
-	queue         *Queue
-	kubeClient    client.Client
-	cluster       *state.Cluster
-	provisioner   *provisioning.Provisioner
-	recorder      events.Recorder
-	clock         clock.Clock
-	cloudProvider cloudprovider.CloudProvider
-	methods       []Method
-	mu            sync.Mutex
-	lastRun       map[string]time.Time
+	queue             *Queue
+	kubeClient        client.Client
+	cluster           *state.Cluster
+	provisioner       *provisioning.Provisioner
+	recorder          events.Recorder
+	clock             clock.Clock
+	cloudProvider     cloudprovider.CloudProvider
+	methods           []Method
+	underutilizedPace *UnderutilizedConsolidationPace
+	mu                sync.Mutex
+	lastRun           map[string]time.Time
 }
 
 // pollingPeriod that we inspect cluster to look for opportunities to disrupt
 const pollingPeriod = 10 * time.Second
 
 type ControllerOptions struct {
-	methods []Method
+	methods           []Method
+	underutilizedPace *UnderutilizedConsolidationPace
 }
 
 func WithMethods(methods ...Method) option.Function[ControllerOptions] {
@@ -78,25 +81,44 @@ func WithMethods(methods ...Method) option.Function[ControllerOptions] {
 	}
 }
 
-func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
-	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *Queue, opts ...option.Function[ControllerOptions]) *Controller {
-
-	o := option.Resolve(append([]option.Function[ControllerOptions]{WithMethods(NewMethods(clk, cluster, kubeClient, provisioner, cp, recorder, queue)...)}, opts...)...)
-	return &Controller{
-		queue:         queue,
-		clock:         clk,
-		kubeClient:    kubeClient,
-		cluster:       cluster,
-		provisioner:   provisioner,
-		recorder:      recorder,
-		cloudProvider: cp,
-		lastRun:       map[string]time.Time{},
-		methods:       o.methods,
+// WithUnderutilizedPace injects the pace instance used for underutilized consolidation. This lets
+// callers (e.g. tests supplying custom methods via WithMethods) share a single pace between the
+// controller, which charges started commands, and the consolidation methods, which consult it during
+// planning. When unset, the controller creates its own pace and wires it into the default methods.
+func WithUnderutilizedPace(pace *UnderutilizedConsolidationPace) option.Function[ControllerOptions] {
+	return func(o *ControllerOptions) {
+		o.underutilizedPace = pace
 	}
 }
 
-func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue) []Method {
-	c := MakeConsolidation(clk, cluster, kubeClient, provisioner, cp, recorder, queue)
+func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
+	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *Queue, opts ...option.Function[ControllerOptions]) *Controller {
+
+	o := option.Resolve(opts...)
+	underutilizedPace := o.underutilizedPace
+	if underutilizedPace == nil {
+		underutilizedPace = NewUnderutilizedConsolidationPace(clk)
+	}
+	methods := o.methods
+	if methods == nil {
+		methods = NewMethods(clk, cluster, kubeClient, provisioner, cp, recorder, queue, underutilizedPace)
+	}
+	return &Controller{
+		queue:             queue,
+		clock:             clk,
+		kubeClient:        kubeClient,
+		cluster:           cluster,
+		provisioner:       provisioner,
+		recorder:          recorder,
+		cloudProvider:     cp,
+		underutilizedPace: underutilizedPace,
+		lastRun:           map[string]time.Time{},
+		methods:           methods,
+	}
+}
+
+func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue, underutilizedPace *UnderutilizedConsolidationPace) []Method {
+	c := MakeConsolidation(clk, cluster, kubeClient, provisioner, cp, recorder, queue, underutilizedPace)
 	return []Method{
 		// Delete any empty NodeClaims as there is zero cost in terms of disruption.
 		NewEmptiness(c),
@@ -210,7 +232,17 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		return false, nil
 	}
 
+	started, err := c.startCommands(ctx, disruption, cmds)
+	if err != nil {
+		return false, fmt.Errorf("disrupting candidates, %w", err)
+	}
+	return started > 0, nil
+}
+
+func (c *Controller) startCommands(ctx context.Context, disruption Method, cmds []Command) (int, error) {
+	var started atomic.Int64
 	errs := make([]error, len(cmds))
+	paced := disruption.Reason() == v1.DisruptionReasonUnderutilized
 	workqueue.ParallelizeUntil(ctx, len(cmds), len(cmds), func(i int) {
 		cmd := cmds[i]
 
@@ -219,15 +251,16 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		cmd.ID = uuid.New()
 		cmd.Method = disruption
 
-		// Attempt to disrupt
 		if err := c.queue.StartCommand(ctx, &cmd); err != nil {
 			errs[i] = fmt.Errorf("disrupting candidates, %w", err)
+			return
 		}
+		if paced {
+			c.underutilizedPace.Charge(&cmd)
+		}
+		started.Add(1)
 	})
-	if err = multierr.Combine(errs...); err != nil {
-		return false, fmt.Errorf("disrupting candidates, %w", err)
-	}
-	return true, nil
+	return int(started.Load()), multierr.Combine(errs...)
 }
 
 func (c *Controller) recordRun(s string) {
