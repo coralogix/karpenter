@@ -6,6 +6,10 @@
 [![Coverage Status](https://coveralls.io/repos/github/aws/karpenter-core/badge.svg?branch=main)](https://coveralls.io/github/aws/karpenter-core?branch=main)
 [![contributions welcome](https://img.shields.io/badge/contributions-welcome-brightgreen.svg?style=flat)](https://github.com/aws/karpenter-core/issues)
 
+## Coralogix Fork of Karpenter
+
+This repository includes Coralogix-specific extensions to upstream Karpenter. See [coralogix-fork.md](coralogix-fork.md) for documentation.
+
 # Karpenter
 
 Karpenter improves the efficiency and cost of running workloads on Kubernetes clusters by:

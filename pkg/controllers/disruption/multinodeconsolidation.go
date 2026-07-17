@@ -63,7 +63,9 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 	// would have violated the budget anyway, preserving the ordering
 	// and only considering a number of nodes that can be disrupted.
 	disruptableCandidates := make([]*Candidate, 0, len(candidates))
+	poolBatchCounts := map[string]int{}
 	constrainedByBudgets := false
+	constrainedByPace := false
 	for _, candidate := range candidates {
 		// If there's disruptions allowed for the candidate's nodepool,
 		// add it to the list of candidates, and decrement the budget.
@@ -71,8 +73,17 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 			constrainedByBudgets = true
 			continue
 		}
+		if !m.underutilizedPace.candidateAllowed(candidate.NodePool, poolBatchCounts[candidate.NodePool.Name]) {
+			constrainedByPace = true
+			continue
+		}
+		// Empty nodes are handled by the empty disruption method so their budgets remain correct.
+		if len(candidate.reschedulablePods) == 0 {
+			continue
+		}
 		// set constrainedByBudgets to true if any node was a candidate but was constrained by a budget
 		disruptableCandidates = append(disruptableCandidates, candidate)
+		poolBatchCounts[candidate.NodePool.Name]++
 		disruptionBudgetMapping[candidate.NodePool.Name]--
 	}
 
@@ -89,7 +100,7 @@ func (m *MultiNodeConsolidation) ComputeCommands(ctx context.Context, disruption
 		// if there are no candidates because of a budget, don't mark
 		// as consolidated, as it's possible it should be consolidatable
 		// the next time we try to disrupt.
-		if !constrainedByBudgets {
+		if !constrainedByBudgets && !constrainedByPace {
 			m.markConsolidated()
 		}
 		return []Command{}, nil

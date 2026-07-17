@@ -57,6 +57,7 @@ type consolidation struct {
 	provisioner            *provisioning.Provisioner
 	cloudProvider          cloudprovider.CloudProvider
 	recorder               events.Recorder
+	underutilizedPace      *UnderutilizedConsolidationPace
 	lastConsolidationState time.Time
 	// evaluator is initialized non-nil at construction. SetNodePoolTotals
 	// replaces it with a balancedEvaluator carrying the new totals.
@@ -73,16 +74,21 @@ func (c *consolidation) SetNodePoolTotals(totals map[string]NodePoolTotals) {
 }
 
 func MakeConsolidation(clock clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner,
-	cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue) consolidation {
+	cloudProvider cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue, paces ...*UnderutilizedConsolidationPace) consolidation {
+	var underutilizedPace *UnderutilizedConsolidationPace
+	if len(paces) > 0 {
+		underutilizedPace = paces[0]
+	}
 	return consolidation{
-		queue:         queue,
-		clock:         clock,
-		cluster:       cluster,
-		kubeClient:    kubeClient,
-		provisioner:   provisioner,
-		cloudProvider: cloudProvider,
-		recorder:      recorder,
-		evaluator:     noopEvaluator{},
+		queue:             queue,
+		clock:             clock,
+		cluster:           cluster,
+		kubeClient:        kubeClient,
+		provisioner:       provisioner,
+		cloudProvider:     cloudProvider,
+		recorder:          recorder,
+		underutilizedPace: underutilizedPace,
+		evaluator:         noopEvaluator{},
 	}
 }
 

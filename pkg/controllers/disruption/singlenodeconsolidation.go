@@ -61,6 +61,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 	// Set a timeout
 	timeout := s.clock.Now().Add(SingleNodeConsolidationTimeoutDuration)
 	constrainedByBudgets := false
+	constrainedByPace := false
 
 	unseenNodePools := sets.New(lo.Map(candidates, func(c *Candidate, _ int) string { return c.NodePool.Name })...)
 
@@ -81,6 +82,14 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 		// counter since single node consolidation commands can only have one candidate.
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			constrainedByBudgets = true
+			continue
+		}
+		if !s.underutilizedPace.candidateAllowed(candidate.NodePool, 0) {
+			constrainedByPace = true
+			continue
+		}
+		// Empty nodes are handled by the empty disruption method so their budgets remain correct.
+		if len(candidate.reschedulablePods) == 0 {
 			continue
 		}
 		// Skip candidates whose best-case score (delete ratio) cannot pass the
@@ -113,7 +122,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 		return []Command{cmd}, nil
 	}
 
-	if !constrainedByBudgets {
+	if !constrainedByBudgets && !constrainedByPace {
 		// if there are no candidates because of a budget, don't mark
 		// as consolidated, as it's possible it should be consolidatable
 		// the next time we try to disrupt.
