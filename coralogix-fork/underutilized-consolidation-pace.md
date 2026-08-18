@@ -1,14 +1,8 @@
-# Coralogix Fork
-
-This document describes Coralogix-specific extensions in this Karpenter fork. These features are implemented without changes to NodePool CRDs or specs, so they can be rolled back to upstream Karpenter without modifying manifests.
-
-Warning: At the moment this doc is mostly LLM generated (quality may vary)
-
-## Underutilized consolidation pace
+# Underutilized consolidation pace
 
 By default, Karpenter limits underutilized consolidation concurrency through disruption budgets (`spec.disruption.budgets`), not through a per-minute disruption rate. This fork adds an optional per-NodePool pace limit for underutilized consolidation only.
 
-### Configuration
+## Configuration
 
 Set the rate annotation on a `NodePool`. Optionally set a per-command batch cap:
 
@@ -48,7 +42,7 @@ Example values:
 | `0.5` | On average, one disrupted node every two minutes |
 | `2` | On average, two disrupted nodes per minute |
 
-### Behavior
+## Behavior
 
 - Applies only to underutilized consolidation (single-node and multi-node).
 - Does not affect emptiness, drift, expiration, or disruption budgets.
@@ -58,7 +52,7 @@ Example values:
 - Pacing is enforced in memory and resets on controller restart or leader failover. After restart, a NodePool may immediately disrupt candidates in the first command, subject to the optional per-command cap.
 - When paced, consolidation is deferred without marking the cluster consolidated, similar to budget exhaustion.
 
-### Rollback to upstream
+## Rollback to upstream
 
 Rolling back the controller to upstream Karpenter is safe:
 

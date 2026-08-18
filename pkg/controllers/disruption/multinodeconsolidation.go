@@ -40,6 +40,14 @@ type MultiNodeConsolidation struct {
 	validator Validator
 }
 
+// ShouldDisrupt is a predicate used to filter candidates
+func (m *MultiNodeConsolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
+	if NodePoolUsesScoreBasedConsolidation(cn.NodePool) {
+		return false
+	}
+	return m.consolidation.ShouldDisrupt(ctx, cn)
+}
+
 func NewMultiNodeConsolidation(c consolidation, opts ...option.Function[MethodOptions]) *MultiNodeConsolidation {
 	o := option.Resolve(append([]option.Function[MethodOptions]{WithValidator(NewMultiConsolidationValidator(c))}, opts...)...)
 	return &MultiNodeConsolidation{

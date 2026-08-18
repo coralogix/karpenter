@@ -59,6 +59,7 @@ const (
 	DRADriversAnnotationKey                               = apis.Group + "/requested-dra-drivers"
 	MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey = "karpenter.coralogix.net/max-underutilized-node-disruptions-per-minute"
 	MaxUnderutilizedNodesPerConsolidationAnnotationKey    = "karpenter.coralogix.net/max-underutilized-nodes-per-consolidation"
+	ScoreBasedConsolidationAnnotationKey                  = "karpenter.coralogix.net/score-based-consolidation"
 )
 
 // Karpenter specific finalizers
