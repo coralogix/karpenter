@@ -19,18 +19,18 @@ package disruption
 import (
 	"context"
 	"fmt"
-	"strings"
+	"sort"
+	"time"
 
-	"github.com/samber/lo"
+	"github.com/awslabs/operatorpkg/option"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
-const (
-	ScoreBasedConsolidationType           = "score-based"
-	maxLoggedScoreBasedConsolidationNodes = 10
-)
+var ScoreBasedConsolidationTimeoutDuration = 3 * time.Minute
+
+const ScoreBasedConsolidationType = "score-based"
 
 // NodePoolUsesScoreBasedConsolidation reports whether the NodePool opts into score-based consolidation.
 func NodePoolUsesScoreBasedConsolidation(np *v1.NodePool) bool {
@@ -44,10 +44,15 @@ func NodePoolUsesScoreBasedConsolidation(np *v1.NodePool) bool {
 // ScoreBasedConsolidation is a disruption method for NodePools that opt in via annotation.
 type ScoreBasedConsolidation struct {
 	consolidation
+	validator Validator
 }
 
-func NewScoreBasedConsolidation(c consolidation) *ScoreBasedConsolidation {
-	return &ScoreBasedConsolidation{consolidation: c}
+func NewScoreBasedConsolidation(c consolidation, opts ...option.Function[MethodOptions]) *ScoreBasedConsolidation {
+	o := option.Resolve(append([]option.Function[MethodOptions]{WithValidator(NewSingleConsolidationValidator(c))}, opts...)...)
+	return &ScoreBasedConsolidation{
+		consolidation: c,
+		validator:     o.validator,
+	}
 }
 
 func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
@@ -57,24 +62,60 @@ func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candida
 	return s.consolidation.ShouldDisrupt(ctx, cn)
 }
 
-func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, _ map[string]int, candidates ...*Candidate) ([]Command, error) {
-	if len(candidates) == 0 {
+// ComputeCommands generates a disruption command given candidates.
+//
+//nolint:gocyclo
+func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+	if s.IsConsolidated() {
 		return []Command{}, nil
 	}
+	candidates = s.SortCandidates(candidates)
 
-	nodeNames := lo.Map(candidates, func(c *Candidate, _ int) string { return c.Name() })
-	logged := nodeNames
-	remaining := 0
-	if len(logged) > maxLoggedScoreBasedConsolidationNodes {
-		remaining = len(logged) - maxLoggedScoreBasedConsolidationNodes
-		logged = logged[:maxLoggedScoreBasedConsolidationNodes]
+	timeout := s.clock.Now().Add(ScoreBasedConsolidationTimeoutDuration)
+	constrainedByBudgets := false
+	constrainedByPace := false
+
+	for i, candidate := range candidates {
+		if s.clock.Now().After(timeout) {
+			ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: s.ConsolidationType()})
+			log.FromContext(ctx).V(1).Info(fmt.Sprintf("abandoning score-based consolidation due to timeout after evaluating %d candidates", i))
+			return []Command{}, nil
+		}
+
+		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
+			constrainedByBudgets = true
+			continue
+		}
+		if !s.underutilizedPace.candidateAllowed(candidate.NodePool, 0) {
+			constrainedByPace = true
+			continue
+		}
+
+		cmd, err := s.computeConsolidation(ctx, candidate)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
+			continue
+		}
+		if cmd.Decision() == NoOpDecision {
+			continue
+		}
+		if cmd.EstimatedSavings() <= 0 {
+			continue
+		}
+		if _, err = s.validator.Validate(ctx, cmd, consolidationTTL); err != nil {
+			if IsValidationError(err) {
+				reason := getValidationFailureReason(err)
+				cmd.EmitRejectedEvents(s.recorder, reason)
+				return []Command{}, nil
+			}
+			return []Command{}, fmt.Errorf("validating score-based consolidation, %w", err)
+		}
+		return []Command{cmd}, nil
 	}
 
-	msg := fmt.Sprintf("score-based consolidation candidates: %s", strings.Join(logged, ", "))
-	if remaining > 0 {
-		msg = fmt.Sprintf("%s and %d more", msg, remaining)
+	if !constrainedByBudgets && !constrainedByPace {
+		s.markConsolidated()
 	}
-	log.FromContext(ctx).V(1).Info(msg, "candidate-count", len(candidates))
 
 	return []Command{}, nil
 }
@@ -89,4 +130,12 @@ func (s *ScoreBasedConsolidation) Class() string {
 
 func (s *ScoreBasedConsolidation) ConsolidationType() string {
 	return ScoreBasedConsolidationType
+}
+
+// SortCandidates orders candidates by nodePriority (highest first).
+func (s *ScoreBasedConsolidation) SortCandidates(candidates []*Candidate) []*Candidate {
+	sort.Slice(candidates, func(i, j int) bool {
+		return nodePriorityScore(candidates[i]) > nodePriorityScore(candidates[j])
+	})
+	return candidates
 }
