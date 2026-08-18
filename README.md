@@ -8,7 +8,7 @@
 
 ## Coralogix Fork of Karpenter
 
-This repository includes Coralogix-specific extensions to upstream Karpenter. See [coralogix-fork.md](coralogix-fork.md) for documentation.
+This repository includes Coralogix-specific extensions to upstream Karpenter. See [coralogix-fork/readme.md](coralogix-fork/readme.md) for documentation.
 
 # Karpenter
 

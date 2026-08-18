@@ -40,6 +40,9 @@ func NewEmptiness(c consolidation, opts ...option.Function[MethodOptions]) *Empt
 
 // ShouldDisrupt is a predicate used to filter candidates
 func (e *Emptiness) ShouldDisrupt(_ context.Context, c *Candidate) bool {
+	if NodePoolUsesScoreBasedConsolidation(c.NodePool) {
+		return false
+	}
 	if c.OwnedByStaticNodePool() {
 		return false
 	}

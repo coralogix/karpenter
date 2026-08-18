@@ -49,6 +49,7 @@ const (
 const (
 	MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey = "karpenter.coralogix.net/max-underutilized-node-disruptions-per-minute"
 	MaxUnderutilizedNodesPerConsolidationAnnotationKey    = "karpenter.coralogix.net/max-underutilized-nodes-per-consolidation"
+	ScoreBasedConsolidationAnnotationKey                  = "karpenter.coralogix.net/score-based-consolidation"
 	DoNotDisruptAnnotationKey                             = apis.Group + "/do-not-disrupt"
 	ProviderCompatibilityAnnotationKey                    = apis.CompatibilityGroup + "/provider"
 	NodePoolHashAnnotationKey                             = apis.Group + "/nodepool-hash"

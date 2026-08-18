@@ -42,6 +42,14 @@ type SingleNodeConsolidation struct {
 	validator                 Validator
 }
 
+// ShouldDisrupt is a predicate used to filter candidates
+func (s *SingleNodeConsolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
+	if NodePoolUsesScoreBasedConsolidation(cn.NodePool) {
+		return false
+	}
+	return s.consolidation.ShouldDisrupt(ctx, cn)
+}
+
 func NewSingleNodeConsolidation(c consolidation, opts ...option.Function[MethodOptions]) *SingleNodeConsolidation {
 	o := option.Resolve(append([]option.Function[MethodOptions]{WithValidator(NewSingleConsolidationValidator(c))}, opts...)...)
 	return &SingleNodeConsolidation{
