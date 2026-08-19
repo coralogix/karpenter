@@ -1,6 +1,6 @@
 # Score-based consolidation
 
-This fork adds an alternate consolidation disruption method for NodePools that opt in via annotation. The method is currently a placeholder: it identifies eligible candidates and logs them, but does not disrupt nodes.
+This fork adds an alternate consolidation disruption method for NodePools that opt in via annotation. It works like single-node consolidation except instead of sorting nodes by DisruptionCost it sorts them by `nodePriorityScore`, a search-guidance heuristic that ranks expensive, underused nodes higher (price divided by non-daemon pod CPU/memory requests).
 
 ## Configuration
 
@@ -28,8 +28,9 @@ spec:
 - NodePools with the annotation are handled by the score-based consolidation method, which runs last in the disruption controller's method list.
 - Annotated NodePools are excluded from emptiness, single-node consolidation, and multi-node consolidation.
 - Drift and static drift are unchanged; annotated NodePools continue to use the standard drift methods.
-- The method reports `Underutilized` as its disruption reason for budget accounting, but the current placeholder implementation always returns no commands, so no nodes are disrupted.
-- At verbosity level 1, the controller logs up to 10 matching candidate node names per evaluation cycle, plus a count of any additional candidates.
+- The method reports `Underutilized` as its disruption reason for budget accounting. Empty-node removals on annotated pools also consume the `Underutilized` budget, not the `Empty` budget.
+- Candidates are sorted by `nodePriorityScore` descending (`price / workloadSize`, or `price` when the node is empty), then evaluated in order. `workloadSize` is `cpu_cores + 0.125 × memory_gib` from non-daemon pod requests. The first valid command with positive estimated savings wins (same per-pass timeout as single-node consolidation).
+- Optional underutilized pace annotations (`max-underutilized-node-disruptions-per-minute`, `max-underutilized-nodes-per-consolidation`) apply to score-based consolidation as well as single- and multi-node consolidation.
 
 ## Rollback to upstream
 

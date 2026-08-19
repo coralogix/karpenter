@@ -44,7 +44,7 @@ Example values:
 
 ## Behavior
 
-- Applies only to underutilized consolidation (single-node and multi-node).
+- Applies to underutilized consolidation (single-node, multi-node, and score-based consolidation).
 - Does not affect emptiness, drift, expiration, or disruption budgets.
 - Each successfully started consolidation command charges one unit per disrupted candidate node per participating NodePool. Delete and replace commands both charge existing candidate nodes, not net node reduction.
 - A command with `N` candidate nodes at rate `R` advances that NodePool's next eligible time by `N / R` minutes.
