@@ -21,6 +21,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -71,7 +72,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 		}
 
 		c := disruption.MakeConsolidation(fakeClock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)
-		scoreBased = disruption.NewScoreBasedConsolidation(c, disruption.WithValidator(NopValidator{}))
+		scoreBased = disruption.NewScoreBasedConsolidation(c)
 	})
 
 	AfterEach(func() {
@@ -134,14 +135,85 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Expect(err).To(BeNil())
 
 			budgetMapping := map[string]int{scoreBasedNodePool.Name: 1}
-			cmds, err := scoreBased.ComputeCommands(ctx, budgetMapping, candidate)
+			var cmds []disruption.Command
+			ExpectParallelized(
+				func() {
+					cmds, err = scoreBased.ComputeCommands(ctx, budgetMapping, candidate)
+				},
+				func() {
+					Eventually(fakeClock.HasWaiters, time.Second*10).Should(BeTrue())
+					fakeClock.Step(15 * time.Second)
+				},
+			)
 			Expect(err).To(BeNil())
 			Expect(cmds).To(HaveLen(1))
 			Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
 			Expect(cmds[0].Candidates[0].Name()).To(Equal(node.Name))
 		})
 	})
+
+	Context("Validation", func() {
+		DescribeTable("should correctly report invalidated commands for score-based consolidation", func(validatorOpt TestConsolidationValidatorOption) {
+			labels := map[string]string{"app": "test"}
+			rs := test.ReplicaSet()
+			ExpectApplied(ctx, env.Client, rs)
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+
+			pod := test.Pod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels,
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion:         "apps/v1",
+							Kind:               "ReplicaSet",
+							Name:               rs.Name,
+							UID:                rs.UID,
+							Controller:         lo.ToPtr(true),
+							BlockOwnerDeletion: lo.ToPtr(true),
+						},
+					}}})
+			nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey:            scoreBasedNodePool.Name,
+						corev1.LabelInstanceTypeStable: mostExpensiveInstance.Name,
+						v1.CapacityTypeLabelKey:        mostExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+						corev1.LabelTopologyZone:       mostExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+					},
+				},
+				Status: v1.NodeClaimStatus{
+					Allocatable: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("32")},
+				},
+			})
+			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+			ExpectApplied(ctx, env.Client, rs, pod, node, nodeClaim, scoreBasedNodePool)
+			ExpectManualBinding(ctx, env.Client, pod, node)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+			c := disruption.MakeConsolidation(fakeClock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)
+			scoreBasedConsolidation := disruption.NewScoreBasedConsolidation(c, disruption.WithValidator(NewTestScoreBasedConsolidationValidator(scoreBasedNodePool, validatorOpt)))
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, fakeClock, env.Client, cloudProvider, recorder, scoreBasedConsolidation.Reason())
+			Expect(err).To(Succeed())
+
+			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, scoreBasedConsolidation.ShouldDisrupt, scoreBasedConsolidation.Class(), queue)
+			Expect(err).To(Succeed())
+
+			cmds, err := scoreBasedConsolidation.ComputeCommands(ctx, budgets, candidates...)
+			Expect(err).To(Succeed())
+			Expect(cmds).To(Equal([]disruption.Command{}))
+
+			Expect(scoreBasedConsolidation.IsConsolidated()).To(BeFalse())
+			ExpectMetricCounterValue(disruption.FailedValidationsTotal, 1, map[string]string{disruption.ConsolidationTypeLabel: scoreBasedConsolidation.ConsolidationType()})
+		},
+			Entry("when a candidate is blocked by budgets", WithUnderutilizedBlockingBudget()),
+			Entry("when candidates are filtered out due to pod churn", WithUnderutilizedChurn()),
+			Entry("when candidates are filtered out due to candidate being nominated", WithUnderutilizedNodeNomination()),
+		)
+	})
 })
+
+func NewTestScoreBasedConsolidationValidator(nodePool *v1.NodePool, opts ...TestConsolidationValidatorOption) disruption.Validator {
+	return newTestConsolidationValidator(nodePool, disruption.NewScoreBasedConsolidationValidator(disruption.MakeConsolidation(fakeClock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)), opts...)
+}
 
 func createScoreBasedCandidatesForPool(np *v1.NodePool, instanceType *cloudprovider.InstanceType) ([]*disruption.Candidate, error) {
 	offering := instanceType.Offerings[0]

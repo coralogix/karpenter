@@ -58,53 +58,7 @@ func TestScoreBasedConsolidationCandidateFiltering(t *testing.T) {
 	multiNode := NewMultiNodeConsolidation(c)
 	scoreBased := NewScoreBasedConsolidation(c)
 
-	makeCandidate := func(scoreBasedConsolidation bool) *Candidate {
-		annotations := map[string]string{}
-		if scoreBasedConsolidation {
-			annotations[v1.ScoreBasedConsolidationAnnotationKey] = ""
-		}
-		nodeClaim := &v1.NodeClaim{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "nodeclaim-1",
-				Labels: map[string]string{
-					corev1.LabelInstanceTypeStable: "m5.large",
-					v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
-					corev1.LabelTopologyZone:       "us-east-1a",
-				},
-			},
-		}
-		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
-
-		node := state.NewNode()
-		node.Node = &corev1.Node{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "node-1",
-				Labels: map[string]string{
-					corev1.LabelInstanceTypeStable: "m5.large",
-					v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
-					corev1.LabelTopologyZone:       "us-east-1a",
-				},
-			},
-		}
-		node.NodeClaim = nodeClaim
-
-		return &Candidate{
-			StateNode: node,
-			NodePool: &v1.NodePool{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:        "default",
-					Annotations: annotations,
-				},
-				Spec: v1.NodePoolSpec{
-					Disruption: v1.Disruption{
-						ConsolidateAfter:    v1.MustParseNillableDuration("0s"),
-						ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
-					},
-				},
-			},
-			instanceType: &cloudprovider.InstanceType{Name: "m5.large"},
-		}
-	}
+	makeCandidate := scoreBasedTestCandidate
 
 	t.Run("annotated pool", func(t *testing.T) {
 		candidate := makeCandidate(true)
@@ -134,4 +88,82 @@ func TestScoreBasedConsolidationCandidateFiltering(t *testing.T) {
 			t.Fatal("expected multi-node consolidation to accept unannotated pool")
 		}
 	})
+}
+
+func TestScoreBasedConsolidationValidatorFilter(t *testing.T) {
+	ctx := context.Background()
+	c := MakeConsolidation(nil, nil, nil, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
+	candidate := scoreBasedTestCandidate(true)
+
+	scoreBased := &ScoreBasedConsolidation{consolidation: c}
+	singleNode := &SingleNodeConsolidation{consolidation: c}
+	scoreValidator := NewScoreBasedConsolidationValidator(c)
+	defaultValidator := NewScoreBasedConsolidation(c).validator.(*ConsolidationValidator)
+
+	if singleNode.ShouldDisrupt(ctx, candidate) {
+		t.Fatal("single-node ShouldDisrupt must reject score-based pools")
+	}
+	if !scoreBased.ShouldDisrupt(ctx, candidate) {
+		t.Fatal("score-based ShouldDisrupt must accept score-based pools")
+	}
+	if scoreValidator.validationType != ScoreBasedConsolidationType {
+		t.Fatalf("score validator type = %q, want %q", scoreValidator.validationType, ScoreBasedConsolidationType)
+	}
+	if defaultValidator.validationType != ScoreBasedConsolidationType {
+		t.Fatalf("default score-based validator type = %q, want %q", defaultValidator.validationType, ScoreBasedConsolidationType)
+	}
+	if !scoreValidator.filter(ctx, candidate) {
+		t.Fatal("score-based validator filter must accept score-based pools")
+	}
+	if defaultValidator.filter(ctx, candidate) != scoreBased.ShouldDisrupt(ctx, candidate) {
+		t.Fatal("score-based consolidation must wire ScoreBasedConsolidation.ShouldDisrupt into its validator")
+	}
+}
+
+func scoreBasedTestCandidate(scoreBasedConsolidation bool) *Candidate {
+	annotations := map[string]string{}
+	if scoreBasedConsolidation {
+		annotations[v1.ScoreBasedConsolidationAnnotationKey] = ""
+	}
+	nodeClaim := &v1.NodeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "nodeclaim-1",
+			Labels: map[string]string{
+				corev1.LabelInstanceTypeStable: "m5.large",
+				v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
+				corev1.LabelTopologyZone:       "us-east-1a",
+			},
+		},
+	}
+	nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+
+	node := state.NewNode()
+	node.Node = &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-1",
+			Labels: map[string]string{
+				corev1.LabelInstanceTypeStable: "m5.large",
+				v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
+				corev1.LabelTopologyZone:       "us-east-1a",
+			},
+		},
+	}
+	node.NodeClaim = nodeClaim
+
+	return &Candidate{
+		StateNode: node,
+		NodePool: &v1.NodePool{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "default",
+				Annotations: annotations,
+			},
+			Spec: v1.NodePoolSpec{
+				Disruption: v1.Disruption{
+					ConsolidateAfter:    v1.MustParseNillableDuration("0s"),
+					ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
+				},
+			},
+		},
+		instanceType: &cloudprovider.InstanceType{Name: "m5.large"},
+	}
 }

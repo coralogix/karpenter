@@ -48,10 +48,28 @@ type ScoreBasedConsolidation struct {
 }
 
 func NewScoreBasedConsolidation(c consolidation, opts ...option.Function[MethodOptions]) *ScoreBasedConsolidation {
-	o := option.Resolve(append([]option.Function[MethodOptions]{WithValidator(NewSingleConsolidationValidator(c))}, opts...)...)
+	o := option.Resolve(append([]option.Function[MethodOptions]{WithValidator(NewScoreBasedConsolidationValidator(c))}, opts...)...)
 	return &ScoreBasedConsolidation{
 		consolidation: c,
 		validator:     o.validator,
+	}
+}
+
+func NewScoreBasedConsolidationValidator(c consolidation) *ConsolidationValidator {
+	s := &ScoreBasedConsolidation{consolidation: c}
+	return &ConsolidationValidator{
+		validation: validation{
+			clock:         c.clock,
+			cluster:       c.cluster,
+			kubeClient:    c.kubeClient,
+			provisioner:   c.provisioner,
+			cloudProvider: c.cloudProvider,
+			recorder:      c.recorder,
+			queue:         c.queue,
+			reason:        v1.DisruptionReasonUnderutilized,
+		},
+		filter:         s.ShouldDisrupt,
+		validationType: s.ConsolidationType(),
 	}
 }
 
