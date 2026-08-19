@@ -48,12 +48,14 @@ func NewMethodsWithNopValidator(underutilizedPace *disruption.UnderutilizedConso
 	emptiness := disruption.NewEmptiness(c, disruption.WithValidator(NopValidator{}))
 	multiNodeConsolidation := disruption.NewMultiNodeConsolidation(c, disruption.WithValidator(NopValidator{}))
 	singleNodeConsolidation := disruption.NewSingleNodeConsolidation(c, disruption.WithValidator(NopValidator{}))
+	scoreBasedConsolidation := disruption.NewScoreBasedConsolidation(c, disruption.WithValidator(NopValidator{}))
 	return []disruption.Method{
 		emptiness,
 		disruption.NewStaticDrift(cluster, prov, cloudProvider),
 		disruption.NewDrift(env.Client, cluster, prov, recorder),
 		multiNodeConsolidation,
 		singleNodeConsolidation,
+		scoreBasedConsolidation,
 	}
 }
 
