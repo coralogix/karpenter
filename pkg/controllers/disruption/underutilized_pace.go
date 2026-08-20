@@ -136,7 +136,7 @@ func candidateCountsAndPools(cmd *Command) (map[string]int, map[string]*v1.NodeP
 	counts := map[string]int{}
 	pools := map[string]*v1.NodePool{}
 	for _, candidate := range cmd.Candidates {
-		if candidate == nil || candidate.NodePool == nil {
+		if candidate == nil || candidate.NodePool == nil || len(candidate.reschedulablePods) == 0 {
 			continue
 		}
 		counts[candidate.NodePool.Name]++

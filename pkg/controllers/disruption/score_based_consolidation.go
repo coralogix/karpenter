@@ -104,7 +104,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 			constrainedByBudgets = true
 			continue
 		}
-		if !s.underutilizedPace.candidateAllowed(candidate.NodePool, 0) {
+		if len(candidate.reschedulablePods) > 0 && !s.underutilizedPace.candidateAllowed(candidate.NodePool, 0) {
 			constrainedByPace = true
 			continue
 		}

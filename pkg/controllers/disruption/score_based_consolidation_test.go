@@ -150,6 +150,72 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
 			Expect(cmds[0].Candidates[0].Name()).To(Equal(node.Name))
 		})
+
+		It("should not pace empty annotated pool nodes", func() {
+			scoreBasedNodePool.Annotations[v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey] = "1"
+			ExpectApplied(ctx, env.Client, scoreBasedNodePool)
+
+			underutilizedPace := disruption.NewUnderutilizedConsolidationPace(fakeClock)
+			c := disruption.MakeConsolidation(fakeClock, cluster, env.Client, prov, cloudProvider, recorder, queue, underutilizedPace)
+			scoreBasedWithPace := disruption.NewScoreBasedConsolidation(c)
+
+			nonEmptyCandidates, err := createScoreBasedCandidatesForPool(scoreBasedNodePool, mostExpensiveInstance)
+			Expect(err).To(BeNil())
+			underutilizedPace.Charge(&disruption.Command{Candidates: nonEmptyCandidates})
+
+			nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						v1.NodePoolLabelKey:            scoreBasedNodePool.Name,
+						corev1.LabelInstanceTypeStable: leastExpensiveInstance.Name,
+						v1.CapacityTypeLabelKey:        leastExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+						corev1.LabelTopologyZone:       leastExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+					},
+				},
+				Status: v1.NodeClaimStatus{
+					Allocatable: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("32")},
+				},
+			})
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+			ExpectApplied(ctx, env.Client, nodeClaim)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
+			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
+
+			limits, err := pdb.NewLimits(ctx, env.Client)
+			Expect(err).To(BeNil())
+			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim)
+			candidate, err := disruption.NewCandidate(
+				ctx,
+				env.Client,
+				recorder,
+				fakeClock,
+				stateNode,
+				limits,
+				nodePoolMap,
+				nodePoolInstanceTypeMap,
+				queue,
+				disruption.GracefulDisruptionClass,
+			)
+			Expect(err).To(BeNil())
+
+			budgetMapping := map[string]int{scoreBasedNodePool.Name: 1}
+			var cmds []disruption.Command
+			ExpectParallelized(
+				func() {
+					cmds, err = scoreBasedWithPace.ComputeCommands(ctx, budgetMapping, candidate)
+				},
+				func() {
+					Eventually(fakeClock.HasWaiters, time.Second*10).Should(BeTrue())
+					fakeClock.Step(15 * time.Second)
+				},
+			)
+			Expect(err).To(BeNil())
+			Expect(cmds).To(HaveLen(1))
+			Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
+			Expect(cmds[0].Candidates[0].Name()).To(Equal(node.Name))
+		})
 	})
 
 	Context("Validation", func() {
