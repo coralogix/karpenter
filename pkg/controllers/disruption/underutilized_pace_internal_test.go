@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clocktesting "k8s.io/utils/clock/testing"
 
@@ -45,6 +46,17 @@ func paceCommand(np *v1.NodePool, count int) *Command {
 	candidates := make([]*Candidate, count)
 	for i := range candidates {
 		candidates[i] = &Candidate{NodePool: np}
+	}
+	return &Command{Candidates: candidates}
+}
+
+func paceCommandWithPods(np *v1.NodePool, count int) *Command {
+	candidates := make([]*Candidate, count)
+	for i := range candidates {
+		candidates[i] = &Candidate{
+			NodePool:          np,
+			reschedulablePods: []*corev1.Pod{{}},
+		}
 	}
 	return &Command{Candidates: candidates}
 }
@@ -94,7 +106,7 @@ func TestCandidateAllowedRateCooldown(t *testing.T) {
 			if !pace.candidateAllowed(np, 0) {
 				t.Fatal("expected first admission before any charge")
 			}
-			pace.Charge(paceCommand(np, tc.chargeCount))
+			pace.Charge(paceCommandWithPods(np, tc.chargeCount))
 			if pace.candidateAllowed(np, 0) {
 				t.Fatal("expected admission to be blocked immediately after charge")
 			}
@@ -137,5 +149,37 @@ func TestCandidateAllowedNilPace(t *testing.T) {
 	var pace *UnderutilizedConsolidationPace
 	if !pace.candidateAllowed(paceTestNodePool("0", "1"), 100) {
 		t.Fatal("expected nil pace to disable planning-time checks")
+	}
+}
+
+func TestChargeSkipsEmptyCandidates(t *testing.T) {
+	testClock := clocktesting.NewFakeClock(time.Now())
+	pace := NewUnderutilizedConsolidationPace(testClock)
+	np := paceTestNodePool("1", "")
+
+	pace.Charge(paceCommand(np, 1))
+	if !pace.candidateAllowed(np, 0) {
+		t.Fatal("expected empty-only charge to be a no-op")
+	}
+
+	pace.Charge(paceCommandWithPods(np, 1))
+	if pace.candidateAllowed(np, 0) {
+		t.Fatal("expected admission to be blocked after charging non-empty candidate")
+	}
+	testClock.Step(61 * time.Second)
+	if !pace.candidateAllowed(np, 0) {
+		t.Fatal("expected admission after cooldown from non-empty charge")
+	}
+
+	pace.Charge(&Command{Candidates: []*Candidate{
+		{NodePool: np},
+		{NodePool: np, reschedulablePods: []*corev1.Pod{{}}},
+	}})
+	if pace.candidateAllowed(np, 0) {
+		t.Fatal("expected mixed command to charge only the non-empty candidate")
+	}
+	testClock.Step(61 * time.Second)
+	if !pace.candidateAllowed(np, 0) {
+		t.Fatal("expected admission after cooldown from mixed charge")
 	}
 }
