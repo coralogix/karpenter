@@ -6,6 +6,7 @@ require (
 	github.com/Pallinder/go-randomdata v1.2.0
 	github.com/avast/retry-go v3.0.0+incompatible
 	github.com/awslabs/operatorpkg v0.0.0-20251222193911-34e9a1898737
+	github.com/destel/rill v0.8.1
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/go-logr/logr v1.4.3
 	github.com/go-logr/zapr v1.3.0

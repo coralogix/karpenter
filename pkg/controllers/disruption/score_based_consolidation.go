@@ -19,18 +19,34 @@ package disruption
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/awslabs/operatorpkg/option"
+	"github.com/destel/rill"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
-var ScoreBasedConsolidationTimeoutDuration = 3 * time.Minute
+var ScoreBasedConsolidationTimeoutDuration = 20 * time.Second
+
+var scoreBasedMoveSetParallelism = runtime.GOMAXPROCS(0)
 
 const ScoreBasedConsolidationType = "score-based"
+
+type moveSet struct {
+	Nodes []*Candidate
+}
+
+type moveSetEvaluation struct {
+	Command Command
+	Score   float64
+}
+
+type consolidationComputer func(ctx context.Context, candidates ...*Candidate) (Command, error)
 
 // NodePoolUsesScoreBasedConsolidation reports whether the NodePool opts into score-based consolidation.
 func NodePoolUsesScoreBasedConsolidation(np *v1.NodePool) bool {
@@ -89,17 +105,12 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	}
 	candidates = s.SortCandidates(candidates)
 
-	timeout := s.clock.Now().Add(ScoreBasedConsolidationTimeoutDuration)
+	deadline := s.clock.Now().Add(ScoreBasedConsolidationTimeoutDuration)
 	constrainedByBudgets := false
 	constrainedByPace := false
 
-	for i, candidate := range candidates {
-		if s.clock.Now().After(timeout) {
-			ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: s.ConsolidationType()})
-			log.FromContext(ctx).V(1).Info(fmt.Sprintf("abandoning score-based consolidation due to timeout after evaluating %d candidates", i))
-			return []Command{}, nil
-		}
-
+	var moveSets []moveSet
+	for _, candidate := range candidates {
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			constrainedByBudgets = true
 			continue
@@ -108,34 +119,116 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 			constrainedByPace = true
 			continue
 		}
+		moveSets = append(moveSets, moveSet{Nodes: []*Candidate{candidate}})
+	}
 
-		cmd, err := s.computeConsolidation(ctx, candidate)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
-			continue
+	eval, evaluated, err := evaluateMoveSetsPar(ctx, moveSets, deadline, s.computeConsolidation, ScoreBasedConsolidationType)
+	if err != nil {
+		return []Command{}, err
+	}
+	if eval == nil {
+		timedOut := evaluated < len(moveSets)
+		if timedOut {
+			log.FromContext(ctx).V(1).Info(fmt.Sprintf("abandoning score-based consolidation due to timeout after evaluating %d candidates", evaluated))
 		}
-		if cmd.Decision() == NoOpDecision {
-			continue
+		if !timedOut && !constrainedByBudgets && !constrainedByPace {
+			s.markConsolidated()
 		}
-		if cmd.EstimatedSavings() <= 0 {
-			continue
+		return []Command{}, nil
+	}
+
+	if _, err = s.validator.Validate(ctx, eval.Command, consolidationTTL); err != nil {
+		if IsValidationError(err) {
+			reason := getValidationFailureReason(err)
+			eval.Command.EmitRejectedEvents(s.recorder, reason)
+			return []Command{}, nil
 		}
-		if _, err = s.validator.Validate(ctx, cmd, consolidationTTL); err != nil {
-			if IsValidationError(err) {
-				reason := getValidationFailureReason(err)
-				cmd.EmitRejectedEvents(s.recorder, reason)
-				return []Command{}, nil
+		return []Command{}, fmt.Errorf("validating score-based consolidation, %w", err)
+	}
+	return []Command{eval.Command}, nil
+}
+
+func evaluateMoveSetsPar(
+	ctx context.Context,
+	moveSets []moveSet,
+	deadline time.Time,
+	compute consolidationComputer,
+	consolidationType string,
+) (*moveSetEvaluation, int, error) {
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	var evaluated atomic.Int64
+
+	// Stop feeding move sets once the deadline passes so in-flight work is drained but new work is not started.
+	pending := rill.Generate(func(send func(moveSet), _ func(error)) {
+		for _, moveSet := range moveSets {
+			if ctx.Err() != nil {
+				return
 			}
-			return []Command{}, fmt.Errorf("validating score-based consolidation, %w", err)
+			send(moveSet)
 		}
-		return []Command{cmd}, nil
+	})
+
+	valid := rill.OrderedFilterMap(pending, scoreBasedMoveSetParallelism, func(moveSet moveSet) (*moveSetEvaluation, bool, error) {
+		eval := evaluateMoveSet(ctx, moveSet, compute)
+		if ctx.Err() == nil {
+			evaluated.Add(1)
+			return eval, eval != nil, nil
+		}
+		return nil, false, nil
+	})
+
+	winner, found, err := rill.First(valid)
+	if err != nil {
+		return nil, int(evaluated.Load()), err
+	}
+	if !found {
+		if ctx.Err() != nil {
+			ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: consolidationType})
+		}
+		return nil, int(evaluated.Load()), nil
+	}
+	return winner, int(evaluated.Load()), nil
+}
+
+func evaluateMoveSet(ctx context.Context, moveSet moveSet, compute consolidationComputer) *moveSetEvaluation {
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
 	}
 
-	if !constrainedByBudgets && !constrainedByPace {
-		s.markConsolidated()
+	cmd, err := compute(ctx, moveSet.Nodes...)
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
 	}
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
+		return nil
+	}
+	if cmd.Decision() == NoOpDecision {
+		return nil
+	}
+	if cmd.EstimatedSavings() <= 0 {
+		return nil
+	}
+	return &moveSetEvaluation{
+		Command: cmd,
+		Score:   moveSetPriorityScore(moveSet),
+	}
+}
 
-	return []Command{}, nil
+func moveSetPriorityScore(moveSet moveSet) float64 {
+	var maxScore float64
+	for _, node := range moveSet.Nodes {
+		if score := nodePriorityScore(node); score > maxScore {
+			maxScore = score
+		}
+	}
+	return maxScore
 }
 
 func (s *ScoreBasedConsolidation) Reason() v1.DisruptionReason {
