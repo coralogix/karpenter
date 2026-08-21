@@ -35,6 +35,7 @@ const (
 func init() {
 	ConsolidationTimeoutsTotal.Add(0, map[string]string{ConsolidationTypeLabel: MultiNodeConsolidationType})
 	ConsolidationTimeoutsTotal.Add(0, map[string]string{ConsolidationTypeLabel: SingleNodeConsolidationType})
+	ConsolidationTimeoutsTotal.Add(0, map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
 }
 
 var (

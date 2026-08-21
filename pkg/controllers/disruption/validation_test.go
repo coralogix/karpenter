@@ -53,8 +53,8 @@ func NewMethodsWithNopValidator() []disruption.Method {
 		disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
 		emptiness,
 		multiNodeConsolidation,
-		singleNodeConsolidation,
 		scoreBasedConsolidation,
+		singleNodeConsolidation,
 	}
 }
 

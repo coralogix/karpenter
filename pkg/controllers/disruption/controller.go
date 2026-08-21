@@ -129,10 +129,10 @@ func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Clien
 		NewDrift(kubeClient, cluster, provisioner, recorder, clk),
 		// Attempt to identify multiple NodeClaims that we can consolidate simultaneously to reduce pod churn
 		NewMultiNodeConsolidation(c),
-		// And finally fall back our single NodeClaim consolidation to further reduce cluster cost.
-		NewSingleNodeConsolidation(c),
 		// Score-based consolidation for NodePools that opt in via annotation.
 		NewScoreBasedConsolidation(c),
+		// And finally fall back our single NodeClaim consolidation to further reduce cluster cost.
+		NewSingleNodeConsolidation(c),
 	}
 }
 

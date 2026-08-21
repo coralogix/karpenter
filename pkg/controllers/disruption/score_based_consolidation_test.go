@@ -38,8 +38,8 @@ import (
 var _ = Describe("ScoreBasedConsolidation", func() {
 	var scoreBased *disruption.ScoreBasedConsolidation
 	var scoreBasedNodePool *v1.NodePool
-	var nodePoolMap map[string]*v1.NodePool
-	var nodePoolInstanceTypeMap map[string]map[string]*cloudprovider.InstanceType
+	var scoreBasedNodePoolMap map[string]*v1.NodePool
+	var scoreBasedInstanceTypeMap map[string]map[string]*cloudprovider.InstanceType
 
 	BeforeEach(func() {
 		scoreBasedNodePool = test.NodePool(v1.NodePool{
@@ -61,10 +61,10 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 		})
 		ExpectApplied(ctx, env.Client, scoreBasedNodePool)
 
-		nodePoolMap = map[string]*v1.NodePool{
+		scoreBasedNodePoolMap = map[string]*v1.NodePool{
 			scoreBasedNodePool.Name: scoreBasedNodePool,
 		}
-		nodePoolInstanceTypeMap = map[string]map[string]*cloudprovider.InstanceType{
+		scoreBasedInstanceTypeMap = map[string]map[string]*cloudprovider.InstanceType{
 			scoreBasedNodePool.Name: {
 				leastExpensiveInstance.Name: leastExpensiveInstance,
 				mostExpensiveInstance.Name:  mostExpensiveInstance,
@@ -76,7 +76,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 	})
 
 	AfterEach(func() {
-		disruption.ScoreBasedConsolidationTimeoutDuration = 3 * time.Minute
+		disruption.ScoreBasedConsolidationTimeoutDuration = 20 * time.Second
 		fakeClock.SetTime(time.Now())
 		ExpectCleanedUp(ctx, env.Client)
 	})
@@ -127,8 +127,8 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 				fakeClock,
 				stateNode,
 				limits,
-				nodePoolMap,
-				nodePoolInstanceTypeMap,
+				scoreBasedNodePoolMap,
+				scoreBasedInstanceTypeMap,
 				queue,
 				disruption.GracefulDisruptionClass,
 			)
@@ -193,8 +193,8 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 				fakeClock,
 				stateNode,
 				limits,
-				nodePoolMap,
-				nodePoolInstanceTypeMap,
+				scoreBasedNodePoolMap,
+				scoreBasedInstanceTypeMap,
 				queue,
 				disruption.GracefulDisruptionClass,
 			)
@@ -219,6 +219,10 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 	})
 
 	Context("Validation", func() {
+		BeforeEach(func() {
+			disruption.FailedValidationsTotal.Reset()
+		})
+
 		DescribeTable("should correctly report invalidated commands for score-based consolidation", func(validatorOpt TestConsolidationValidatorOption) {
 			labels := map[string]string{"app": "test"}
 			rs := test.ReplicaSet()
@@ -317,8 +321,8 @@ func createScoreBasedCandidatesForPool(np *v1.NodePool, instanceType *cloudprovi
 		fakeClock,
 		stateNode,
 		limits,
-		nodePoolMap,
-		nodePoolInstanceTypeMap,
+		map[string]*v1.NodePool{np.Name: np},
+		map[string]map[string]*cloudprovider.InstanceType{np.Name: {instanceType.Name: instanceType}},
 		queue,
 		disruption.GracefulDisruptionClass,
 	)
