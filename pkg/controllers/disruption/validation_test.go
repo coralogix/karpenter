@@ -54,8 +54,8 @@ func NewMethodsWithNopValidator(underutilizedPace *disruption.UnderutilizedConso
 		disruption.NewStaticDrift(cluster, prov, cloudProvider),
 		disruption.NewDrift(env.Client, cluster, prov, recorder),
 		multiNodeConsolidation,
-		singleNodeConsolidation,
 		scoreBasedConsolidation,
+		singleNodeConsolidation,
 	}
 }
 
