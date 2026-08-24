@@ -25,12 +25,42 @@ import (
 )
 
 const (
-	ControllerLabel    = "controller"
-	schedulingIDLabel  = "scheduling_id"
-	schedulerSubsystem = "scheduler"
+	ControllerLabel                  = "controller"
+	schedulingIDLabel                = "scheduling_id"
+	schedulerSubsystem               = "scheduler"
+	newSchedulerPhaseLabel           = "phase"
+	PhaseListNodePools               = "list_node_pools"
+	PhaseGetInstanceTypes            = "get_instance_types"
+	PhaseVolumeTopology              = "volume_topology"
+	PhaseNewTopology                 = "new_topology"
+	PhaseListDaemonSets              = "list_daemonsets"
+	PhaseFilterInstanceTypes         = "filter_instance_types"
+	PhaseDaemonOverhead              = "daemon_overhead"
+	PhaseDaemonHostPorts             = "daemon_host_ports"
+	PhaseReservationManager          = "reservation_manager"
+	PhaseCalculateExistingNodeClaims = "calculate_existing_node_claims"
+	PhaseBuildDomainGroups           = "build_domain_groups"
+	PhaseUpdateInverseAffinities     = "update_inverse_affinities"
+	PhaseTopologyUpdate              = "topology_update"
+	PhaseCountDomains                = "count_domains"
 )
 
+func MeasureNewSchedulerPhase(phase string) func() {
+	return metrics.Measure(NewSchedulerPhaseDurationSeconds, map[string]string{newSchedulerPhaseLabel: phase})
+}
+
 var (
+	NewSchedulerPhaseDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: schedulerSubsystem,
+			Name:      "new_scheduler_phase_duration_seconds",
+			Help:      "Duration of phases within NewScheduler in seconds. Labeled by phase.",
+			Buckets:   metrics.DurationBuckets(),
+		},
+		[]string{newSchedulerPhaseLabel},
+	)
 	DurationSeconds = opmetrics.NewPrometheusHistogram(
 		crmetrics.Registry,
 		prometheus.HistogramOpts{
