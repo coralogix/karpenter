@@ -75,12 +75,16 @@ func NewTopology(
 	pods []*corev1.Pod,
 	opts ...Options,
 ) (*Topology, error) {
+	stop := MeasureNewSchedulerPhase(PhaseBuildDomainGroups)
+	domainGroups := buildDomainGroups(nodePools, instanceTypes)
+	stop()
+
 	t := &Topology{
 		kubeClient:            kubeClient,
 		preferencePolicy:      option.Resolve(opts...).preferencePolicy,
 		cluster:               cluster,
 		stateNodes:            stateNodes,
-		domainGroups:          buildDomainGroups(nodePools, instanceTypes),
+		domainGroups:          domainGroups,
 		topologyGroups:        map[uint64]*TopologyGroup{},
 		inverseTopologyGroups: map[uint64]*TopologyGroup{},
 		excludedPods:          sets.New[string](),
@@ -92,10 +96,15 @@ func NewTopology(
 		t.excludedPods.Insert(string(p.UID))
 	}
 
+	stop = MeasureNewSchedulerPhase(PhaseUpdateInverseAffinities)
 	errs := t.updateInverseAffinities(ctx)
+	stop()
+
+	stop = MeasureNewSchedulerPhase(PhaseTopologyUpdate)
 	for i := range pods {
 		errs = multierr.Append(errs, t.Update(ctx, pods[i]))
 	}
+	stop()
 	if errs != nil {
 		return nil, errs
 	}
@@ -326,6 +335,7 @@ func (t *Topology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Po
 //
 //nolint:gocyclo
 func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
+	defer MeasureNewSchedulerPhase(PhaseCountDomains)()
 	podList := &corev1.PodList{}
 
 	// collect the pods from all the specified namespaces (don't see a way to query multiple namespaces
