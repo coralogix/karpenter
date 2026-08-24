@@ -22,7 +22,11 @@ import (
 	"runtime"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -91,6 +95,40 @@ func TestBuildCatalog(t *testing.T) {
 	}
 	if len(catalog.NodePoolInstanceTypes["bench-pool"]) == 0 {
 		t.Fatal("expected node pool instance type mapping")
+	}
+}
+
+func TestReadCacheReusesListResults(t *testing.T) {
+	ctx := context.Background()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "pod-a", Namespace: "default"},
+		Spec:       corev1.PodSpec{NodeName: "node-a"},
+	}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}
+	kubeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(pod, node).
+		WithInterceptorFuncs(newReadCache(scheme.Scheme).interceptorFuncs()).
+		Build()
+
+	first := &corev1.PodList{}
+	second := &corev1.PodList{}
+	if err := kubeClient.List(ctx, first); err != nil {
+		t.Fatalf("first List() error = %v", err)
+	}
+	if err := kubeClient.List(ctx, second); err != nil {
+		t.Fatalf("second List() error = %v", err)
+	}
+	if len(first.Items) != 1 || len(second.Items) != 1 {
+		t.Fatalf("items = %d and %d, want 1 each", len(first.Items), len(second.Items))
+	}
+
+	gotNode := &corev1.Node{}
+	if err := kubeClient.Get(ctx, client.ObjectKey{Name: "node-a"}, gotNode); err != nil {
+		t.Fatalf("first Get() error = %v", err)
+	}
+	if err := kubeClient.Get(ctx, client.ObjectKey{Name: "node-a"}, &corev1.Node{}); err != nil {
+		t.Fatalf("second Get() error = %v", err)
 	}
 }
 
