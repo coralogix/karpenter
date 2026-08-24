@@ -47,12 +47,20 @@ import (
 
 var errCandidateDeleting = fmt.Errorf("candidate is deleting")
 
+func measureSimulateSchedulingPhase(phase string) func() {
+	return metrics.Measure(SimulateSchedulingPhaseDurationSeconds, map[string]string{simulateSchedulingPhaseLabel: phase})
+}
+
 //nolint:gocyclo
 func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner,
 	candidates ...*Candidate,
 ) (scheduling.Results, error) {
+	defer metrics.Measure(SimulateSchedulingDurationSeconds, map[string]string{})()
+
 	candidateNames := sets.NewString(lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
+	stop := measureSimulateSchedulingPhase(phaseDeepCopyNodes)
 	nodes := cluster.DeepCopyNodes()
+	stop()
 	deletingNodes := nodes.Deleting()
 	stateNodes := lo.Filter(nodes.Active(), func(n *state.StateNode, _ int) bool {
 		return !candidateNames.Has(n.Name())
@@ -68,7 +76,9 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	}
 
 	// start by getting all pending pods
+	stop = measureSimulateSchedulingPhase(phaseGetPendingPods)
 	pods, err := provisioner.GetPendingPods(ctx)
+	stop()
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("determining pending pods, %w", err)
 	}
@@ -99,12 +109,14 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		opts = append(opts, scheduling.IgnorePreferences)
 	}
 	opts = append(opts, scheduling.MinValuesPolicy(options.FromContext(ctx).MinValuesPolicy))
+	stop = measureSimulateSchedulingPhase(phaseNewScheduler)
 	scheduler, err := provisioner.NewScheduler(
 		log.IntoContext(ctx, operatorlogging.NopLogger),
 		pods,
 		stateNodes,
 		opts...,
 	)
+	stop()
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("creating scheduler, %w", err)
 	}
@@ -113,7 +125,9 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		return client.ObjectKeyFromObject(p), nil
 	})
 
+	stop = measureSimulateSchedulingPhase(phaseSolve)
 	results, err := scheduler.Solve(log.IntoContext(ctx, operatorlogging.NopLogger), pods)
+	stop()
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("scheduling pods, %w", err)
 	}

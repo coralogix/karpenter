@@ -29,6 +29,12 @@ const (
 	decisionLabel                = "decision"
 	ConsolidationTypeLabel       = "consolidation_type"
 	CandidatesIneligible         = "candidates_ineligible"
+	simulateSchedulingPhaseLabel = "phase"
+
+	phaseDeepCopyNodes  = "deep_copy_nodes"
+	phaseGetPendingPods = "get_pending_pods"
+	phaseNewScheduler   = "new_scheduler"
+	phaseSolve          = "solve"
 )
 
 func init() {
@@ -48,6 +54,28 @@ var (
 			Buckets:   metrics.DurationBuckets(),
 		},
 		[]string{metrics.ReasonLabel, ConsolidationTypeLabel},
+	)
+	SimulateSchedulingPhaseDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "simulate_scheduling_phase_duration_seconds",
+			Help:      "Duration of phases within SimulateScheduling in seconds. Labeled by phase.",
+			Buckets:   metrics.DurationBuckets(),
+		},
+		[]string{simulateSchedulingPhaseLabel},
+	)
+	SimulateSchedulingDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "simulate_scheduling_duration_seconds",
+			Help:      "Duration of SimulateScheduling in seconds.",
+			Buckets:   metrics.DurationBuckets(),
+		},
+		[]string{},
 	)
 	DecisionsPerformedTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
