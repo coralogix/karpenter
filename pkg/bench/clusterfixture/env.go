@@ -80,7 +80,7 @@ func (f *Fixture) BuildEnv(ctx context.Context, opts Options) (*Env, error) {
 			}
 			return []string{pod.Spec.NodeName}
 		}).
-		WithInterceptorFuncs(newReadCache(scheme.Scheme).interceptorFuncs()).
+		WithInterceptorFuncs(newReadCache(scheme.Scheme, f).interceptorFuncs()).
 		Build()
 
 	fakeClock := clock.NewFakeClock(time.Now())

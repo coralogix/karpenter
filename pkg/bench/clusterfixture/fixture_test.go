@@ -105,10 +105,14 @@ func TestReadCacheReusesListResults(t *testing.T) {
 		Spec:       corev1.PodSpec{NodeName: "node-a"},
 	}
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}
+	fixture := &Fixture{
+		Pods:  []*corev1.Pod{pod},
+		Nodes: []*corev1.Node{node},
+	}
 	kubeClient := fakeclient.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithObjects(pod, node).
-		WithInterceptorFuncs(newReadCache(scheme.Scheme).interceptorFuncs()).
+		WithInterceptorFuncs(newReadCache(scheme.Scheme, fixture).interceptorFuncs()).
 		Build()
 
 	first := &corev1.PodList{}

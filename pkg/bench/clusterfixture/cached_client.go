@@ -18,6 +18,7 @@ package clusterfixture
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
@@ -31,12 +32,16 @@ import (
 
 type readCache struct {
 	scheme *runtime.Scheme
+	index  *objectIndex
 	get    sync.Map
 	list   sync.Map
 }
 
-func newReadCache(scheme *runtime.Scheme) *readCache {
-	return &readCache{scheme: scheme}
+func newReadCache(scheme *runtime.Scheme, f *Fixture) *readCache {
+	return &readCache{
+		scheme: scheme,
+		index:  newObjectIndex(f),
+	}
 }
 
 func (c *readCache) interceptorFuncs() interceptor.Funcs {
@@ -47,6 +52,14 @@ func (c *readCache) interceptorFuncs() interceptor.Funcs {
 }
 
 func (c *readCache) getObject(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if c.index != nil {
+		if err := c.index.get(key, obj); err == nil {
+			return nil
+		} else if !errors.Is(err, errNotIndexed) {
+			return err
+		}
+	}
+
 	cacheKey, err := c.getCacheKey(obj, key)
 	if err != nil {
 		return cl.Get(ctx, key, obj, opts...)
@@ -62,6 +75,17 @@ func (c *readCache) getObject(ctx context.Context, cl client.WithWatch, key clie
 }
 
 func (c *readCache) listObjects(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+	listOpts := client.ListOptions{}
+	listOpts.ApplyOptions(opts)
+
+	if c.index != nil {
+		if err := c.index.list(list, listOpts); err == nil {
+			return nil
+		} else if !errors.Is(err, errNotIndexed) {
+			return err
+		}
+	}
+
 	cacheKey, err := c.listCacheKey(list, opts...)
 	if err != nil {
 		return cl.List(ctx, list, opts...)
