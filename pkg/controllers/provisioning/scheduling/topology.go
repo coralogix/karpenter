@@ -61,9 +61,10 @@ type Topology struct {
 	domainGroups map[string]TopologyDomainGroup
 	// excludedPods are the pod UIDs of pods that are excluded from counting.  This is used so we can simulate
 	// moving pods to prevent them from being double counted.
-	excludedPods sets.Set[string]
-	cluster      *state.Cluster
-	stateNodes   []*state.StateNode
+	excludedPods          sets.Set[string]
+	cluster               *state.Cluster
+	stateNodes            []*state.StateNode
+	nodeLabelRequirements map[string]scheduling.Requirements
 }
 
 type NodePoolInputs struct {
@@ -109,6 +110,8 @@ func NewTopology(
 	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseUpdateInverseAffinities)
 	errs := t.updateInverseAffinities(phaseCtx)
 	stop()
+
+	t.nodeLabelRequirements = t.stateNodeLabelRequirements()
 
 	phaseCtx, stop = MeasureNewSchedulerPhase(ctx, PhaseTopologyUpdate)
 	for i := range pods {
@@ -210,6 +213,17 @@ func (t *Topology) Update(ctx context.Context, p *corev1.Pod) error {
 		tg.AddOwner(p.UID)
 	}
 	return nil
+}
+
+func (t *Topology) stateNodeLabelRequirements() map[string]scheduling.Requirements {
+	nodeLabelRequirements := make(map[string]scheduling.Requirements, len(t.stateNodes))
+	for _, n := range t.stateNodes {
+		if n.Node == nil {
+			continue
+		}
+		nodeLabelRequirements[n.Node.Name] = scheduling.NewLabelRequirements(n.Node.Labels)
+	}
+	return nodeLabelRequirements
 }
 
 // Record records the topology changes given that pod p schedule on a node with the given requirements
@@ -372,7 +386,7 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 			continue
 		}
 		// ignore the node if it doesn't match the topology group
-		if !tg.nodeFilter.Matches(n.Node.Spec.Taints, scheduling.NewLabelRequirements(n.Node.Labels)) {
+		if !tg.nodeFilter.Matches(n.Node.Spec.Taints, t.nodeLabelRequirements[n.Node.Name]) {
 			continue
 		}
 		domain, exists := n.Labels()[tg.Key]

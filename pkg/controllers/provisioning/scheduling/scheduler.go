@@ -710,11 +710,12 @@ func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes 
 // getCompatibleDaemonPods filters daemon pods that can schedule to the given node
 func (s *Scheduler) getCompatibleDaemonPods(ctx context.Context, node *state.StateNode, taints []corev1.Taint, daemonSetPods []*corev1.Pod) []*corev1.Pod {
 	var daemons []*corev1.Pod
+	nodeLabelRequirements := scheduling.NewLabelRequirements(node.Labels())
 	for _, p := range daemonSetPods {
 		if s.shouldSkipDaemonPod(ctx, p) {
 			continue
 		}
-		if s.isDaemonPodCompatibleWithNode(p, taints, node.Labels()) {
+		if s.isDaemonPodCompatibleWithNode(p, taints, nodeLabelRequirements) {
 			daemons = append(daemons, p)
 		}
 	}
@@ -727,11 +728,11 @@ func (s *Scheduler) shouldSkipDaemonPod(ctx context.Context, p *corev1.Pod) bool
 }
 
 // isDaemonPodCompatibleWithNode checks if a daemon pod is compatible with the node
-func (s *Scheduler) isDaemonPodCompatibleWithNode(p *corev1.Pod, taints []corev1.Taint, nodeLabels map[string]string) bool {
+func (s *Scheduler) isDaemonPodCompatibleWithNode(p *corev1.Pod, taints []corev1.Taint, nodeLabelRequirements scheduling.Requirements) bool {
 	if err := scheduling.Taints(taints).ToleratesPod(p); err != nil {
 		return false
 	}
-	if err := scheduling.NewLabelRequirements(nodeLabels).Compatible(scheduling.NewStrictPodRequirements(p)); err != nil {
+	if err := nodeLabelRequirements.Compatible(scheduling.NewStrictPodRequirements(p)); err != nil {
 		return false
 	}
 	return true
