@@ -1,0 +1,5 @@
+{
+  "cluster": "mini",
+  "nodeCount": 2,
+  "podCount": 2
+}
