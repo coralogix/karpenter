@@ -105,6 +105,11 @@ func (f *Fixture) BuildEnv(ctx context.Context, opts Options) (*Env, error) {
 	return env, nil
 }
 
+// Fixture returns the loaded cluster fixture backing this environment.
+func (e *Env) Fixture() *Fixture {
+	return e.fixture
+}
+
 // Reset restores cluster state after scheduling mutations.
 func (e *Env) Reset(ctx context.Context) error {
 	for n := range e.Cluster.Nodes() {
