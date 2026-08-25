@@ -437,6 +437,10 @@ func (in *StateNode) Nominated(clk clock.Clock) bool {
 	return in.nominatedUntil.After(clk.Now())
 }
 
+func (in *StateNode) ClearNomination() {
+	in.nominatedUntil = metav1.Time{}
+}
+
 func (in *StateNode) Managed() bool {
 	return in.NodeClaim != nil
 }
