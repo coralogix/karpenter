@@ -8,6 +8,7 @@ Warning: At the moment this documentation is mostly LLM generated (quality may v
 
 - [Underutilized consolidation pace](underutilized-consolidation-pace.md) — optional per-NodePool rate limit for underutilized consolidation
 - [Score-based consolidation](score-based-consolidation.md) — alternate consolidation path for opted-in NodePools
+- OpenTelemetry tracing (`pkg/cxtracing`) — spans aligned with fork scheduling/disruption phase metrics; export via standard `OTEL_*` env vars (configured in [eng-karpenter](https://github.com/coralogix/eng-karpenter))
 
 ## Rollback to upstream
 

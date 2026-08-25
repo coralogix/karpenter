@@ -39,6 +39,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -60,9 +61,9 @@ type Topology struct {
 	domainGroups map[string]TopologyDomainGroup
 	// excludedPods are the pod UIDs of pods that are excluded from counting.  This is used so we can simulate
 	// moving pods to prevent them from being double counted.
-	excludedPods sets.Set[string]
-	cluster      *state.Cluster
-	stateNodes   []*state.StateNode
+	excludedPods          sets.Set[string]
+	cluster               *state.Cluster
+	stateNodes            []*state.StateNode
 }
 
 func NewTopology(
@@ -75,7 +76,7 @@ func NewTopology(
 	pods []*corev1.Pod,
 	opts ...Options,
 ) (*Topology, error) {
-	stop := MeasureNewSchedulerPhase(PhaseBuildDomainGroups)
+	_, stop := MeasureNewSchedulerPhase(ctx, PhaseBuildDomainGroups)
 	domainGroups := buildDomainGroups(nodePools, instanceTypes)
 	stop()
 
@@ -96,13 +97,13 @@ func NewTopology(
 		t.excludedPods.Insert(string(p.UID))
 	}
 
-	stop = MeasureNewSchedulerPhase(PhaseUpdateInverseAffinities)
-	errs := t.updateInverseAffinities(ctx)
+	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseUpdateInverseAffinities)
+	errs := t.updateInverseAffinities(phaseCtx)
 	stop()
 
-	stop = MeasureNewSchedulerPhase(PhaseTopologyUpdate)
+	phaseCtx, stop = MeasureNewSchedulerPhase(ctx, PhaseTopologyUpdate)
 	for i := range pods {
-		errs = multierr.Append(errs, t.Update(ctx, pods[i]))
+		errs = multierr.Append(errs, t.Update(phaseCtx, pods[i]))
 	}
 	stop()
 	if errs != nil {
@@ -335,14 +336,18 @@ func (t *Topology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Po
 //
 //nolint:gocyclo
 func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
-	defer MeasureNewSchedulerPhase(PhaseCountDomains)()
+	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseCountDomains)
+	defer stop()
 	podList := &corev1.PodList{}
 
 	// collect the pods from all the specified namespaces (don't see a way to query multiple namespaces
 	// simultaneously)
 	var pods []corev1.Pod
 	for _, ns := range tg.namespaces.UnsortedList() {
-		if err := t.kubeClient.List(ctx, podList, TopologyListOptions(ns, tg.rawSelector)); err != nil {
+		listCtx, kubeStop := cxtracing.KubeList(phaseCtx, "Pod", ns)
+		err := t.kubeClient.List(listCtx, podList, TopologyListOptions(ns, tg.rawSelector))
+		kubeStop(err)
+		if err != nil {
 			return fmt.Errorf("listing pods, %w", err)
 		}
 		pods = append(pods, podList.Items...)
@@ -394,7 +399,10 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 			nodeRequirements = previousNodeRequirements
 		} else {
 			node = &corev1.Node{}
-			if err := t.kubeClient.Get(ctx, types.NamespacedName{Name: p.Spec.NodeName}, node); err != nil {
+			getCtx, kubeStop := cxtracing.KubeGet(phaseCtx, "Node", "", p.Spec.NodeName)
+			err := t.kubeClient.Get(getCtx, types.NamespacedName{Name: p.Spec.NodeName}, node)
+			kubeStop(err)
+			if err != nil {
 				// Pods that cannot be evicted can be leaked in the API Server after
 				// a Node is removed. Since pod bindings are immutable, these pods
 				// cannot be recovered, and will be deleted by the pod lifecycle
@@ -522,7 +530,11 @@ func (t *Topology) buildNamespaceList(ctx context.Context, namespace string, nam
 	if err != nil {
 		return nil, fmt.Errorf("parsing selector, %w", err)
 	}
-	if err := t.kubeClient.List(ctx, &namespaceList, &client.ListOptions{LabelSelector: labelSelector}); err != nil {
+	var kubeStop func(error)
+	listCtx, kubeStop := cxtracing.KubeList(ctx, "Namespace", "")
+	err = t.kubeClient.List(listCtx, &namespaceList, &client.ListOptions{LabelSelector: labelSelector})
+	kubeStop(err)
+	if err != nil {
 		return nil, fmt.Errorf("listing namespaces, %w", err)
 	}
 	selected := sets.New[string]()

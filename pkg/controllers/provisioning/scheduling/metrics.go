@@ -17,10 +17,14 @@ limitations under the License.
 package scheduling
 
 import (
+	"context"
+
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 )
 
@@ -45,8 +49,11 @@ const (
 	PhaseCountDomains                = "count_domains"
 )
 
-func MeasureNewSchedulerPhase(phase string) func() {
-	return metrics.Measure(NewSchedulerPhaseDurationSeconds, map[string]string{newSchedulerPhaseLabel: phase})
+// MeasureNewSchedulerPhase records a phase metric and span. Use the returned context only for
+// work inside the phase; pass the original ctx when starting sibling phases.
+func MeasureNewSchedulerPhase(ctx context.Context, phase string) (context.Context, func()) {
+	metricStop := metrics.Measure(NewSchedulerPhaseDurationSeconds, map[string]string{newSchedulerPhaseLabel: phase})
+	return cxtracing.Measure(ctx, metricStop, "karpenter.scheduler.new."+phase, attribute.String("phase", phase))
 }
 
 var (

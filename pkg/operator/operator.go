@@ -57,6 +57,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/nodeoverlay"
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
@@ -101,6 +102,7 @@ type Operator struct {
 	EventRecorder       events.Recorder
 	Clock               clock.Clock
 	InstanceTypeStore   *nodeoverlay.InstanceTypeStore
+	tracingShutdown     func(context.Context) error
 }
 
 type Options struct {
@@ -135,6 +137,9 @@ func NewOperator(o ...option.Function[Options]) (context.Context, *Operator) {
 	logger := serrors.NewLogger(zapr.NewLogger(logging.NewLogger(ctx, "controller")))
 	log.SetLogger(logger)
 	klog.SetLogger(logger)
+
+	tracingShutdown, initErr := cxtracing.Init(ctx)
+	lo.Must0(initErr, "failed to setup tracing")
 
 	// Client Config
 	config := ctrl.GetConfigOrDie()
@@ -235,6 +240,7 @@ func NewOperator(o ...option.Function[Options]) (context.Context, *Operator) {
 		EventRecorder:       events.NewRecorder(mgr.GetEventRecorderFor(AppName)),
 		Clock:               clock.RealClock{},
 		InstanceTypeStore:   instanceTypeStore,
+		tracingShutdown:     tracingShutdown,
 	}
 }
 
@@ -246,6 +252,13 @@ func (o *Operator) WithControllers(ctx context.Context, controllers ...controlle
 }
 
 func (o *Operator) Start(ctx context.Context) {
+	if o.tracingShutdown != nil {
+		defer func() {
+			if err := o.tracingShutdown(context.Background()); err != nil {
+				log.FromContext(ctx).Error(err, "failed to shutdown tracing")
+			}
+		}()
+	}
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
