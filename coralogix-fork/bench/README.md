@@ -1,10 +1,12 @@
-# evaluateMoveSet cluster-fixture benchmark
-
-Benchmark score-based consolidation against a real cluster snapshot.
+# Benchmarks
 
 Run from the **repo root**.
 
-## 1. Dump a cluster fixture
+## evaluateMoveSet cluster-fixture benchmark
+
+Benchmark score-based consolidation against a real cluster snapshot.
+
+### 1. Dump a cluster fixture
 
 ```bash
 ./coralogix-fork/bench/dump-cluster-fixture.sh cx498
@@ -24,7 +26,7 @@ If `instance-types.json` is missing, the loader falls back to a tiny node-derive
 export CLUSTER_FIXTURE_DIR=pkg/bench/clusterfixture/testdata/mini
 ```
 
-## 2. Run the benchmark
+### 2. Run the benchmark
 
 ```bash
 CLUSTER_FIXTURE_DIR=testdata/clusterfixtures/cx498 \
@@ -35,7 +37,7 @@ go test -tags=test_performance -run='^$' \
 
 Skipped when `CLUSTER_FIXTURE_DIR` is missing (CI-safe).
 
-## 3. Flamegraph
+### 3. Flamegraph
 
 ```bash
 PROFILE=profiles/evaluate_move_set_cx498-$(date +%Y%m%d-%H%M%S).cpu.pprof
@@ -53,6 +55,39 @@ go tool pprof -http=:"$PPROF_PORT" "$PROFILE"
 
 Open **Flame Graph** at http://localhost:8080 (or the port you set via `PPROF_PORT`).
 
-## What it measures
+### What it measures
 
 Each iteration picks a **random eligible node** (seed `42`) from the candidate list built once via `GetCandidates`, then calls `evaluateMoveSet` — matching `searchForMoveSets` in production.
+
+## NewLabelRequirements microbenchmark
+
+Microbenchmark of `scheduling.NewLabelRequirements` using embedded node labels (no cluster fixture).
+
+### Run the benchmark
+
+```bash
+go test -tags=test_performance -run='^$' \
+  -bench=BenchmarkNewLabelRequirements -benchtime=30s -count=1 \
+  ./pkg/controllers/provisioning/scheduling
+```
+
+### Flamegraph
+
+```bash
+PROFILE=profiles/new_label_requirements-$(date +%Y%m%d-%H%M%S).cpu.pprof
+mkdir -p profiles
+
+go test -tags=test_performance -run='^$' \
+  -bench=BenchmarkNewLabelRequirements -benchtime=30s -count=1 \
+  -cpuprofile="$PROFILE" \
+  ./pkg/controllers/provisioning/scheduling
+
+PPROF_PORT=${PPROF_PORT:-8080}
+go tool pprof -http=:"$PPROF_PORT" "$PROFILE"
+```
+
+Open **Flame Graph** at http://localhost:8080 (or the port you set via `PPROF_PORT`).
+
+### What it measures
+
+Each iteration calls `scheduling.NewLabelRequirements` with a fixed representative node label map — matching the per-daemon-pod call in `isDaemonPodCompatibleWithNode`.
