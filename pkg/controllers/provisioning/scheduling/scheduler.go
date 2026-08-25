@@ -141,7 +141,7 @@ func NewScheduler(
 	}
 	// Pre-filter instance types eligible for NodePools to reduce work done during scheduling loops for pods
 	// if no templates remain, we still want to build the scheduler so that Karpenter can ack pods which can schedule to existing and in-flight capacity
-	stop := MeasureNewSchedulerPhase(PhaseFilterInstanceTypes)
+	_, stop := MeasureNewSchedulerPhase(ctx, PhaseFilterInstanceTypes)
 	templates := lo.FilterMap(nodePools, func(np *v1.NodePool, _ int) (*NodeClaimTemplate, bool) {
 		var err error
 		nct := NewNodeClaimTemplate(np)
@@ -160,15 +160,15 @@ func NewScheduler(
 	})
 	stop()
 
-	stop = MeasureNewSchedulerPhase(PhaseDaemonOverhead)
-	daemonOverhead := getDaemonOverhead(ctx, templates, daemonSetPods)
+	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseDaemonOverhead)
+	daemonOverhead := getDaemonOverhead(phaseCtx, templates, daemonSetPods)
 	stop()
 
-	stop = MeasureNewSchedulerPhase(PhaseDaemonHostPorts)
-	daemonHostPortUsage := getDaemonHostPortUsage(ctx, templates, daemonSetPods)
+	phaseCtx, stop = MeasureNewSchedulerPhase(ctx, PhaseDaemonHostPorts)
+	daemonHostPortUsage := getDaemonHostPortUsage(phaseCtx, templates, daemonSetPods)
 	stop()
 
-	stop = MeasureNewSchedulerPhase(PhaseReservationManager)
+	_, stop = MeasureNewSchedulerPhase(ctx, PhaseReservationManager)
 	reservationManager := NewReservationManager(instanceTypes)
 	stop()
 
@@ -194,8 +194,8 @@ func NewScheduler(
 		minValuesPolicy:         minValuesPolicy,
 		numConcurrentReconciles: lo.Ternary(option.Resolve(opts...).numConcurrentReconciles > 0, option.Resolve(opts...).numConcurrentReconciles, 1),
 	}
-	stop = MeasureNewSchedulerPhase(PhaseCalculateExistingNodeClaims)
-	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods)
+	phaseCtx, stop = MeasureNewSchedulerPhase(ctx, PhaseCalculateExistingNodeClaims)
+	s.calculateExistingNodeClaims(phaseCtx, stateNodes, daemonSetPods)
 	stop()
 	return s
 }

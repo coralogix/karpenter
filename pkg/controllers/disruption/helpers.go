@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
@@ -37,6 +38,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	operatorlogging "sigs.k8s.io/karpenter/pkg/operator/logging"
@@ -47,18 +49,20 @@ import (
 
 var errCandidateDeleting = fmt.Errorf("candidate is deleting")
 
-func measureSimulateSchedulingPhase(phase string) func() {
-	return metrics.Measure(SimulateSchedulingPhaseDurationSeconds, map[string]string{simulateSchedulingPhaseLabel: phase})
+func measureSimulateSchedulingPhase(ctx context.Context, phase string) (context.Context, func()) {
+	metricStop := metrics.Measure(SimulateSchedulingPhaseDurationSeconds, map[string]string{simulateSchedulingPhaseLabel: phase})
+	return cxtracing.Measure(ctx, metricStop, "karpenter.disruption.simulate_scheduling."+phase, attribute.String("phase", phase))
 }
 
 //nolint:gocyclo
 func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner,
 	candidates ...*Candidate,
 ) (scheduling.Results, error) {
-	defer metrics.Measure(SimulateSchedulingDurationSeconds, map[string]string{})()
+	ctx, stopRoot := cxtracing.Measure(ctx, metrics.Measure(SimulateSchedulingDurationSeconds, map[string]string{}), "karpenter.disruption.simulate_scheduling")
+	defer stopRoot()
 
 	candidateNames := sets.NewString(lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
-	stop := measureSimulateSchedulingPhase(phaseDeepCopyNodes)
+	_, stop := measureSimulateSchedulingPhase(ctx, phaseDeepCopyNodes)
 	nodes := cluster.DeepCopyNodes()
 	stop()
 	deletingNodes := nodes.Deleting()
@@ -76,8 +80,8 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	}
 
 	// start by getting all pending pods
-	stop = measureSimulateSchedulingPhase(phaseGetPendingPods)
-	pods, err := provisioner.GetPendingPods(ctx)
+	phaseCtx, stop := measureSimulateSchedulingPhase(ctx, phaseGetPendingPods)
+	pods, err := provisioner.GetPendingPods(phaseCtx)
 	stop()
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("determining pending pods, %w", err)
@@ -109,9 +113,9 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		opts = append(opts, scheduling.IgnorePreferences)
 	}
 	opts = append(opts, scheduling.MinValuesPolicy(options.FromContext(ctx).MinValuesPolicy))
-	stop = measureSimulateSchedulingPhase(phaseNewScheduler)
+	phaseCtx, stop = measureSimulateSchedulingPhase(ctx, phaseNewScheduler)
 	scheduler, err := provisioner.NewScheduler(
-		log.IntoContext(ctx, operatorlogging.NopLogger),
+		log.IntoContext(phaseCtx, operatorlogging.NopLogger),
 		pods,
 		stateNodes,
 		opts...,
@@ -125,8 +129,8 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		return client.ObjectKeyFromObject(p), nil
 	})
 
-	stop = measureSimulateSchedulingPhase(phaseSolve)
-	results, err := scheduler.Solve(log.IntoContext(ctx, operatorlogging.NopLogger), pods)
+	phaseCtx, stop = measureSimulateSchedulingPhase(ctx, phaseSolve)
+	results, err := scheduler.Solve(log.IntoContext(phaseCtx, operatorlogging.NopLogger), pods)
 	stop()
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("scheduling pods, %w", err)
