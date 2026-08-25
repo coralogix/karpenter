@@ -42,10 +42,20 @@ POD_COUNT=$(kubectl get pods -A --no-headers 2>/dev/null | wc -l | tr -d ' ')
 PDB_COUNT=$(kubectl get pdb -A --no-headers 2>/dev/null | wc -l | tr -d ' ')
 NODEPOOL_COUNT=$(kubectl get nodepools.karpenter.sh --no-headers 2>/dev/null | wc -l | tr -d ' ')
 
+REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null)}"
+if [ -z "${REGION}" ]; then
+  REGION="$(kubectl get nodes -o jsonpath='{.items[0].metadata.labels.topology\.kubernetes\.io/region}' 2>/dev/null || true)"
+fi
+if [ -z "${REGION}" ]; then
+  echo "error: could not determine AWS region (set AWS_REGION or configure AWS CLI)" >&2
+  exit 1
+fi
+
 cat >"${OUT_DIR}/metadata.json" <<EOF
 {
   "cluster": "${CLUSTER_NAME}",
   "context": "$(kubectl config current-context 2>/dev/null || echo "")",
+  "region": "${REGION}",
   "dumpedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
   "nodeCount": ${NODE_COUNT},
   "podCount": ${POD_COUNT},
@@ -59,7 +69,8 @@ echo "wrote ${OUT_DIR}/metadata.json"
   cd "${REPO_ROOT}"
   go run ./hack/bench/build-instance-catalog.go \
     --fixture "${OUT_DIR}" \
-    --output "${OUT_DIR}/instance-types.json"
+    --output "${OUT_DIR}/instance-types.json" \
+    --region "${REGION}"
 )
 
 echo "Done. Fixture ready at ${OUT_DIR}"

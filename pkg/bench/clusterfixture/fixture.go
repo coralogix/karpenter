@@ -33,6 +33,7 @@ import (
 type Metadata struct {
 	Cluster       string `json:"cluster"`
 	Context       string `json:"context"`
+	Region        string `json:"region"`
 	DumpedAt      string `json:"dumpedAt"`
 	NodeCount     int    `json:"nodeCount"`
 	PodCount      int    `json:"podCount"`

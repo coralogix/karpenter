@@ -128,6 +128,17 @@ func BenchmarkEvaluateMoveSet_ClusterFixture(b *testing.B) {
 	}
 
 	bench := getClusterFixtureBench(b)
+	catalog := bench.env.Fixture().Catalog
+	if !catalog.HasFullInstanceCatalog() && bench.env.NodeCount > 10 {
+		b.Fatalf("fixture %q has no full instance-types.json (only node-derived catalog). "+
+			"Run ./coralogix-fork/bench/dump-cluster-fixture.sh once; the benchmark itself does not call AWS.", dir)
+	}
+	totalITs := 0
+	for _, names := range catalog.NodePoolInstanceTypes {
+		totalITs += len(names)
+	}
+	b.Logf("instance catalog: %d specs, %d pool assignments (offline from fixture files)", len(catalog.InstanceTypeSpecs), totalITs)
+
 	b.ReportMetric(float64(bench.env.NodeCount), "nodes")
 	b.ReportMetric(float64(bench.env.PodCount), "pods")
 	b.ReportMetric(float64(len(bench.candidates)), "candidates")

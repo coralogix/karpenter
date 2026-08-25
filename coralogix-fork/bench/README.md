@@ -12,6 +12,12 @@ Run from the **repo root**.
 
 Writes a gitignored fixture to `testdata/clusterfixtures/cx498/`. Terminating resources are dropped at load time.
 
+**Dump time (needs kubectl + AWS EC2 read once):** `instance-types.json` is generated from the AWS provider’s instance-type resolution (same as production `GetInstanceTypes`, without node overlays). Region is stored in `metadata.json`.
+
+**Benchmark time (fully offline):** `go test` only reads YAML/JSON from the fixture directory and uses the fake cloud provider. It does **not** call AWS or the internet. Do not re-run `build-instance-catalog.go` unless you intend to refresh the catalog from AWS.
+
+If `instance-types.json` is missing, the loader falls back to a tiny node-derived catalog (~30 instance types on cx498) which does not match production.
+
 **Local smoke test** (committed mini fixture, no dump):
 
 ```bash

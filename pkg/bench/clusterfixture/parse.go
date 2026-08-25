@@ -32,6 +32,11 @@ import (
 	_ "sigs.k8s.io/karpenter/pkg/test/v1alpha1"
 )
 
+// DecodeYAMLFile reads a YAML file containing Kubernetes objects.
+func DecodeYAMLFile[T client.Object](path string) ([]T, error) {
+	return decodeYAMLFile[T](path)
+}
+
 func decodeYAMLFile[T client.Object](path string) ([]T, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
