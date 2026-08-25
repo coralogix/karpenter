@@ -227,13 +227,31 @@ func (in *StateNode) ValidateNodeDisruptable(clk clock.Clock) error {
 	return nil
 }
 
+func (in *StateNode) podsForDisruptionCheck(ctx context.Context, kubeClient client.Client) ([]*corev1.Pod, error) {
+	if in.Node == nil {
+		return nil, nil
+	}
+	if len(in.podRequests) > 0 {
+		pods := make([]*corev1.Pod, 0, len(in.podRequests))
+		for key := range in.podRequests {
+			pod := &corev1.Pod{}
+			if err := kubeClient.Get(ctx, key, pod); err != nil {
+				return nil, fmt.Errorf("getting pod %s, %w", key, err)
+			}
+			pods = append(pods, pod)
+		}
+		return pods, nil
+	}
+	return nodeutils.GetPods(ctx, kubeClient, in.Node)
+}
+
 // ValidatePodDisruptable returns an error if the StateNode contains a pod that cannot be disrupted
 // This checks associated PDBs and do-not-disrupt annotations for each pod on the node.
 // ValidatePodDisruptable takes in a recorder to emit events on the nodeclaims when the state node is not a candidate
 //
 //nolint:gocyclo
 func (in *StateNode) ValidatePodsDisruptable(ctx context.Context, kubeClient client.Client, pdbs pdb.Limits) ([]*corev1.Pod, error) {
-	pods, err := in.Pods(ctx, kubeClient)
+	pods, err := in.podsForDisruptionCheck(ctx, kubeClient)
 	if err != nil {
 		return nil, fmt.Errorf("getting pods from node, %w", err)
 	}
