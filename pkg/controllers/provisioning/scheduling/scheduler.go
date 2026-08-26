@@ -116,11 +116,10 @@ var MinValuesPolicy = func(policy karpopts.MinValuesPolicy) func(*options) {
 func NewScheduler(
 	ctx context.Context,
 	kubeClient client.Client,
-	nodePools []*v1.NodePool,
+	inputs *NodePoolInputs,
 	cluster *state.Cluster,
 	stateNodes []*state.StateNode,
 	topology *Topology,
-	instanceTypes map[string][]*cloudprovider.InstanceType,
 	daemonSetPods []*corev1.Pod,
 	recorder events.Recorder,
 	clock clock.Clock,
@@ -132,7 +131,7 @@ func NewScheduler(
 	// if any of the nodePools add a taint with a prefer no schedule effect, we add a toleration for the taint
 	// during preference relaxation
 	toleratePreferNoSchedule := false
-	for _, np := range nodePools {
+	for _, np := range inputs.nodePools {
 		for _, taint := range np.Spec.Template.Spec.Taints {
 			if taint.Effect == corev1.TaintEffectPreferNoSchedule {
 				toleratePreferNoSchedule = true
@@ -142,10 +141,10 @@ func NewScheduler(
 	// Pre-filter instance types eligible for NodePools to reduce work done during scheduling loops for pods
 	// if no templates remain, we still want to build the scheduler so that Karpenter can ack pods which can schedule to existing and in-flight capacity
 	_, stop := MeasureNewSchedulerPhase(ctx, PhaseFilterInstanceTypes)
-	templates := lo.FilterMap(nodePools, func(np *v1.NodePool, _ int) (*NodeClaimTemplate, bool) {
+	templates := lo.FilterMap(inputs.nodePools, func(np *v1.NodePool, _ int) (*NodeClaimTemplate, bool) {
 		var err error
 		nct := NewNodeClaimTemplate(np)
-		nct.InstanceTypeOptions, _, err = filterInstanceTypesByRequirements(instanceTypes[np.Name], nct.Requirements, corev1.ResourceList{}, corev1.ResourceList{}, corev1.ResourceList{}, minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
+		nct.InstanceTypeOptions, _, err = filterInstanceTypesByRequirements(inputs.instanceTypes[np.Name], nct.Requirements, corev1.ResourceList{}, corev1.ResourceList{}, corev1.ResourceList{}, minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
 		if len(nct.InstanceTypeOptions) == 0 {
 			if instanceTypeFilterErr, ok := lo.ErrorsAs[InstanceTypeFilterError](err); ok && instanceTypeFilterErr.minValuesIncompatibleErr != nil {
 				recorder.Publish(NoCompatibleInstanceTypes(np, true))
@@ -169,7 +168,7 @@ func NewScheduler(
 	stop()
 
 	_, stop = MeasureNewSchedulerPhase(ctx, PhaseReservationManager)
-	reservationManager := NewReservationManager(instanceTypes)
+	reservationManager := NewReservationManager(inputs.instanceTypes)
 	stop()
 
 	s := &Scheduler{
@@ -184,7 +183,7 @@ func NewScheduler(
 		volumeReqsByPod:     volumeReqsByPod,          // Volume requirements per pod
 		recorder:            recorder,
 		preferences:         &Preferences{ToleratePreferNoSchedule: toleratePreferNoSchedule},
-		remainingResources: lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
+		remainingResources: lo.SliceToMap(inputs.nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
 			// The limits are copied so that scheduling never mutates the input
 			return np.Name, corev1.ResourceList(np.Spec.Limits).DeepCopy()
 		}),
