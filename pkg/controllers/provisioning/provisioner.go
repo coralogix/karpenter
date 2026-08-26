@@ -289,6 +289,10 @@ func (p *Provisioner) NewScheduler(
 	}
 	stop()
 
+	_, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseBuildDomainGroups)
+	inputs := scheduler.NewNodePoolInputs(nodePools, instanceTypes)
+	stop()
+
 	// Get volume topology requirements WITHOUT modifying pods.
 	// Volume requirements are passed separately and added to nodeRequirements only.
 	// Pods that fail volume topology lookup are excluded from scheduling.
@@ -301,7 +305,7 @@ func (p *Provisioner) NewScheduler(
 
 	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
 	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseNewTopology)
-	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, nodePools, instanceTypes, pods, opts...)
+	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, inputs, pods, opts...)
 	stop()
 	if err != nil {
 		return nil, fmt.Errorf("tracking topology counts, %w", err)
@@ -313,7 +317,7 @@ func (p *Provisioner) NewScheduler(
 		return nil, fmt.Errorf("getting daemon pods, %w", err)
 	}
 	// Pass volumeReqs to scheduler - added to nodeRequirements for NodeClaim zone selection
-	return scheduler.NewScheduler(ctx, p.kubeClient, nodePools, p.cluster, stateNodes, topology, instanceTypes, daemonSetPods, p.recorder, p.clock, volumeReqs, opts...), nil
+	return scheduler.NewScheduler(ctx, p.kubeClient, inputs, p.cluster, stateNodes, topology, daemonSetPods, p.recorder, p.clock, volumeReqs, opts...), nil
 }
 
 func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {

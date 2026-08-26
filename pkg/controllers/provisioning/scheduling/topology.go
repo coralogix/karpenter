@@ -61,9 +61,23 @@ type Topology struct {
 	domainGroups map[string]TopologyDomainGroup
 	// excludedPods are the pod UIDs of pods that are excluded from counting.  This is used so we can simulate
 	// moving pods to prevent them from being double counted.
-	excludedPods          sets.Set[string]
-	cluster               *state.Cluster
-	stateNodes            []*state.StateNode
+	excludedPods sets.Set[string]
+	cluster      *state.Cluster
+	stateNodes   []*state.StateNode
+}
+
+type NodePoolInputs struct {
+	nodePools     []*v1.NodePool
+	instanceTypes map[string][]*cloudprovider.InstanceType
+	domainGroups  map[string]TopologyDomainGroup
+}
+
+func NewNodePoolInputs(nodePools []*v1.NodePool, instanceTypes map[string][]*cloudprovider.InstanceType) *NodePoolInputs {
+	return &NodePoolInputs{
+		nodePools:     nodePools,
+		instanceTypes: instanceTypes,
+		domainGroups:  buildDomainGroups(nodePools, instanceTypes),
+	}
 }
 
 func NewTopology(
@@ -71,21 +85,16 @@ func NewTopology(
 	kubeClient client.Client,
 	cluster *state.Cluster,
 	stateNodes []*state.StateNode,
-	nodePools []*v1.NodePool,
-	instanceTypes map[string][]*cloudprovider.InstanceType,
+	inputs *NodePoolInputs,
 	pods []*corev1.Pod,
 	opts ...Options,
 ) (*Topology, error) {
-	_, stop := MeasureNewSchedulerPhase(ctx, PhaseBuildDomainGroups)
-	domainGroups := buildDomainGroups(nodePools, instanceTypes)
-	stop()
-
 	t := &Topology{
 		kubeClient:            kubeClient,
 		preferencePolicy:      option.Resolve(opts...).preferencePolicy,
 		cluster:               cluster,
 		stateNodes:            stateNodes,
-		domainGroups:          domainGroups,
+		domainGroups:          inputs.domainGroups,
 		topologyGroups:        map[uint64]*TopologyGroup{},
 		inverseTopologyGroups: map[uint64]*TopologyGroup{},
 		excludedPods:          sets.New[string](),
