@@ -54,9 +54,22 @@ func measureSimulateSchedulingPhase(ctx context.Context, phase string) (context.
 	return cxtracing.Measure(ctx, metricStop, "karpenter.disruption.simulate_scheduling."+phase, attribute.String("phase", phase))
 }
 
+func NewSchedulerFactory(ctx context.Context, provisioner *provisioning.Provisioner) (*provisioning.SchedulerFactory, error) {
+	var opts []scheduling.Options
+	if options.FromContext(ctx).PreferencePolicy == options.PreferencePolicyIgnore {
+		opts = append(opts, scheduling.IgnorePreferences)
+	}
+	opts = append(opts, scheduling.MinValuesPolicy(options.FromContext(ctx).MinValuesPolicy))
+	factory, err := provisioner.NewSchedulerFactory(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("creating scheduler factory, %w", err)
+	}
+	return factory, nil
+}
+
 //nolint:gocyclo
 func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner,
-	candidates ...*Candidate,
+	schedulerFactory *provisioning.SchedulerFactory, candidates ...*Candidate,
 ) (scheduling.Results, error) {
 	ctx, stopRoot := cxtracing.Measure(ctx, metrics.Measure(SimulateSchedulingDurationSeconds, map[string]string{}), "karpenter.disruption.simulate_scheduling")
 	defer stopRoot()
@@ -108,17 +121,11 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	}
 	pods = append(pods, deletingNodePods...)
 
-	var opts []scheduling.Options
-	if options.FromContext(ctx).PreferencePolicy == options.PreferencePolicyIgnore {
-		opts = append(opts, scheduling.IgnorePreferences)
-	}
-	opts = append(opts, scheduling.MinValuesPolicy(options.FromContext(ctx).MinValuesPolicy))
 	phaseCtx, stop = measureSimulateSchedulingPhase(ctx, phaseNewScheduler)
-	scheduler, err := provisioner.NewScheduler(
+	scheduler, err := schedulerFactory.NewScheduler(
 		log.IntoContext(phaseCtx, operatorlogging.NopLogger),
 		pods,
 		stateNodes,
-		opts...,
 	)
 	stop()
 	if err != nil {

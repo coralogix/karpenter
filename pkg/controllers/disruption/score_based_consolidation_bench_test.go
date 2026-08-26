@@ -112,10 +112,16 @@ func newClusterFixtureBench(dir string) (*clusterFixtureBench, error) {
 		return nil, fmt.Errorf("no eligible score-based consolidation candidates in fixture %q", dir)
 	}
 
+	schedulerFactory, err := NewSchedulerFactory(ctx, env.Provisioner)
+	if err != nil {
+		return nil, err
+	}
 	return &clusterFixtureBench{
-		ctx:        ctx,
-		env:        env,
-		compute:    consolidation.computeConsolidation,
+		ctx: ctx,
+		env: env,
+		compute: func(ctx context.Context, candidates ...*Candidate) (Command, error) {
+			return consolidation.computeConsolidation(ctx, schedulerFactory, candidates...)
+		},
 		candidates: candidates,
 		rng:        rand.New(rand.NewSource(42)), //nolint:gosec
 	}, nil
