@@ -234,18 +234,75 @@ func (p *Provisioner) consolidationWarnings(ctx context.Context, pods []*corev1.
 
 var ErrNodePoolsNotFound = errors.New("no nodepools found")
 
-//nolint:gocyclo
+// NewSchedulerFactory Calculates the NodePoolInputs once
+// and reuses it across all scheduling simulations within a single disruption iteration.
+type SchedulerFactory struct {
+	provisioner *Provisioner
+	inputs      *scheduler.NodePoolInputs
+	opts        []scheduler.Options
+}
+
+func (p *Provisioner) NewSchedulerFactory(ctx context.Context, opts ...scheduler.Options) (*SchedulerFactory, error) {
+	nodePools, instanceTypes, err := p.listNodePoolsAndInstanceTypes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	_, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseBuildDomainGroups)
+	inputs := scheduler.NewNodePoolInputs(nodePools, instanceTypes)
+	stop()
+	return &SchedulerFactory{provisioner: p, inputs: inputs, opts: opts}, nil
+}
+
+func (f *SchedulerFactory) NewScheduler(ctx context.Context, pods []*corev1.Pod, stateNodes []*state.StateNode) (*scheduler.Scheduler, error) {
+	p := f.provisioner
+
+	// Get volume topology requirements WITHOUT modifying pods.
+	// Volume requirements are passed separately and added to nodeRequirements only.
+	// Pods that fail volume topology lookup are excluded from scheduling.
+	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseVolumeTopology)
+	pods, volumeReqs, err := p.getVolumeTopologyRequirements(phaseCtx, pods)
+	stop()
+	if err != nil {
+		return nil, fmt.Errorf("getting volume topology requirements, %w", err)
+	}
+
+	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
+	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseNewTopology)
+	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, f.inputs, pods, f.opts...)
+	stop()
+	if err != nil {
+		return nil, fmt.Errorf("tracking topology counts, %w", err)
+	}
+	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListDaemonSets)
+	daemonSetPods, err := p.getDaemonSetPods(phaseCtx)
+	stop()
+	if err != nil {
+		return nil, fmt.Errorf("getting daemon pods, %w", err)
+	}
+	// Pass volumeReqs to scheduler - added to nodeRequirements for NodeClaim zone selection
+	return scheduler.NewScheduler(ctx, p.kubeClient, f.inputs, p.cluster, stateNodes, topology, daemonSetPods, p.recorder, p.clock, volumeReqs, f.opts...), nil
+}
+
 func (p *Provisioner) NewScheduler(
 	ctx context.Context,
 	pods []*corev1.Pod,
 	stateNodes []*state.StateNode,
 	opts ...scheduler.Options,
 ) (*scheduler.Scheduler, error) {
+	factory, err := p.NewSchedulerFactory(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return factory.NewScheduler(ctx, pods, stateNodes)
+}
+
+//nolint:gocyclo
+func (p *Provisioner) listNodePoolsAndInstanceTypes(ctx context.Context) ([]*v1.NodePool, map[string][]*cloudprovider.InstanceType, error) {
 	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListNodePools)
 	nodePools, err := nodepoolutils.ListManaged(phaseCtx, p.kubeClient, p.cloudProvider)
 	stop()
 	if err != nil {
-		return nil, fmt.Errorf("listing nodepools, %w", err)
+		return nil, nil, fmt.Errorf("listing nodepools, %w", err)
 	}
 	nodePools = lo.Filter(nodePools, func(np *v1.NodePool, _ int) bool {
 		if nodepoolutils.IsStatic(np) {
@@ -258,7 +315,7 @@ func (p *Provisioner) NewScheduler(
 		return np.DeletionTimestamp.IsZero()
 	})
 	if len(nodePools) == 0 {
-		return nil, ErrNodePoolsNotFound
+		return nil, nil, ErrNodePoolsNotFound
 	}
 
 	// nodeTemplates generated from NodePools are ordered by weight
@@ -276,7 +333,7 @@ func (p *Provisioner) NewScheduler(
 				continue
 			}
 			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("getting instance types, %w", err)
+				return nil, nil, fmt.Errorf("getting instance types, %w", err)
 			}
 			log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Error(err, "skipping, unable to resolve instance types")
 			continue
@@ -288,36 +345,7 @@ func (p *Provisioner) NewScheduler(
 		instanceTypes[np.Name] = its
 	}
 	stop()
-
-	_, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseBuildDomainGroups)
-	inputs := scheduler.NewNodePoolInputs(nodePools, instanceTypes)
-	stop()
-
-	// Get volume topology requirements WITHOUT modifying pods.
-	// Volume requirements are passed separately and added to nodeRequirements only.
-	// Pods that fail volume topology lookup are excluded from scheduling.
-	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseVolumeTopology)
-	pods, volumeReqs, err := p.getVolumeTopologyRequirements(phaseCtx, pods)
-	stop()
-	if err != nil {
-		return nil, fmt.Errorf("getting volume topology requirements, %w", err)
-	}
-
-	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
-	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseNewTopology)
-	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, inputs, pods, opts...)
-	stop()
-	if err != nil {
-		return nil, fmt.Errorf("tracking topology counts, %w", err)
-	}
-	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListDaemonSets)
-	daemonSetPods, err := p.getDaemonSetPods(phaseCtx)
-	stop()
-	if err != nil {
-		return nil, fmt.Errorf("getting daemon pods, %w", err)
-	}
-	// Pass volumeReqs to scheduler - added to nodeRequirements for NodeClaim zone selection
-	return scheduler.NewScheduler(ctx, p.kubeClient, inputs, p.cluster, stateNodes, topology, daemonSetPods, p.recorder, p.clock, volumeReqs, opts...), nil
+	return nodePools, instanceTypes, nil
 }
 
 func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
