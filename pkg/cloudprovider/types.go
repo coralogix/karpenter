@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -218,25 +219,28 @@ func (i *InstanceType) Allocatable() corev1.ResourceList {
 	return i.allocatable
 }
 
+// OrderByPrice returns a new slice ordered so that the cheapest instance types of the available
+// offerings come first. The receiver is left untouched, since callers commonly hold slices that are
+// shared across concurrent scheduling simulations.
 func (its InstanceTypes) OrderByPrice(reqs scheduling.Requirements) InstanceTypes {
-	// Order instance types so that we get the cheapest instance types of the available offerings
-	sort.Slice(its, func(i, j int) bool {
+	ordered := slices.Clone(its)
+	sort.Slice(ordered, func(i, j int) bool {
 		iPrice := math.MaxFloat64
 		jPrice := math.MaxFloat64
 
-		for _, of := range its[i].Offerings {
+		for _, of := range ordered[i].Offerings {
 			if of.Available && reqs.IsCompatible(of.Requirements, scheduling.AllowUndefinedWellKnownLabels) && of.Price < iPrice {
 				iPrice = of.Price
 			}
 		}
-		for _, of := range its[j].Offerings {
+		for _, of := range ordered[j].Offerings {
 			if of.Available && reqs.IsCompatible(of.Requirements, scheduling.AllowUndefinedWellKnownLabels) && of.Price < jPrice {
 				jPrice = of.Price
 			}
 		}
 		return iPrice < jPrice
 	})
-	return its
+	return ordered
 }
 
 // Compatible returns the list of instanceTypes based on the supported capacityType and zones in the requirements
