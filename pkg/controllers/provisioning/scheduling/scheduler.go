@@ -138,26 +138,7 @@ func NewScheduler(
 			}
 		}
 	}
-	// Pre-filter instance types eligible for NodePools to reduce work done during scheduling loops for pods
-	// if no templates remain, we still want to build the scheduler so that Karpenter can ack pods which can schedule to existing and in-flight capacity
-	_, stop := MeasureNewSchedulerPhase(ctx, PhaseFilterInstanceTypes)
-	templates := lo.FilterMap(inputs.nodePools, func(np *v1.NodePool, _ int) (*NodeClaimTemplate, bool) {
-		var err error
-		nct := NewNodeClaimTemplate(np)
-		nct.InstanceTypeOptions, _, err = filterInstanceTypesByRequirements(inputs.instanceTypes[np.Name], nct.Requirements, corev1.ResourceList{}, corev1.ResourceList{}, corev1.ResourceList{}, minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
-		if len(nct.InstanceTypeOptions) == 0 {
-			if instanceTypeFilterErr, ok := lo.ErrorsAs[InstanceTypeFilterError](err); ok && instanceTypeFilterErr.minValuesIncompatibleErr != nil {
-				recorder.Publish(NoCompatibleInstanceTypes(np, true))
-				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, nodepool requirements filtered out all instance types", "minValuesIncompatibleErr", instanceTypeFilterErr.minValuesIncompatibleErr)
-			} else {
-				recorder.Publish(NoCompatibleInstanceTypes(np, false))
-				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, nodepool requirements filtered out all instance types")
-			}
-			return nil, false
-		}
-		return nct, true
-	})
-	stop()
+	templates := inputs.nodeClaimTemplates
 
 	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseDaemonOverhead)
 	daemonOverhead := getDaemonOverhead(phaseCtx, templates, daemonSetPods)
