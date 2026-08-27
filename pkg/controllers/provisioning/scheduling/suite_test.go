@@ -4908,7 +4908,7 @@ var _ = Context("Scheduling", func() {
 
 			// When IgnoreDRARequests = true (default): only appPod counts (1 CPU total)
 			ctx1 := options.ToContext(ctx, test.Options(test.OptionsFields{IgnoreDRARequests: lo.ToPtr(true)}))
-			inputs := scheduling.NewNodePoolInputs([]*v1.NodePool{nodePool},
+			inputs := scheduling.NewNodePoolInputs(ctx1, events.NewRecorder(&record.FakeRecorder{}), []*v1.NodePool{nodePool},
 				map[string][]*cloudprovider.InstanceType{nodePool.Name: cloudProvider.InstanceTypes})
 			topology1, err := scheduling.NewTopology(ctx1, env.Client, cluster, nil, inputs, []*corev1.Pod{appPod})
 			Expect(err).ToNot(HaveOccurred())
