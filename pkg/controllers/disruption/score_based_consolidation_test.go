@@ -267,7 +267,16 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, scoreBasedConsolidation.ShouldDisrupt, scoreBasedConsolidation.Class(), queue)
 			Expect(err).To(Succeed())
 
-			cmds, err := scoreBasedConsolidation.ComputeCommands(ctx, budgets, candidates...)
+			var cmds []disruption.Command
+			ExpectParallelized(
+				func() {
+					cmds, err = scoreBasedConsolidation.ComputeCommands(ctx, budgets, candidates...)
+				},
+				func() {
+					Eventually(fakeClock.HasWaiters, time.Second*10).Should(BeTrue())
+					fakeClock.Step(15 * time.Second)
+				},
+			)
 			Expect(err).To(Succeed())
 			Expect(cmds).To(Equal([]disruption.Command{}))
 
