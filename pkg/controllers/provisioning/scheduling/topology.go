@@ -61,9 +61,10 @@ type Topology struct {
 	domainGroups map[string]TopologyDomainGroup
 	// excludedPods are the pod UIDs of pods that are excluded from counting.  This is used so we can simulate
 	// moving pods to prevent them from being double counted.
-	excludedPods sets.Set[string]
-	cluster      *state.Cluster
-	stateNodes   []*state.StateNode
+	excludedPods          sets.Set[string]
+	cluster               *state.Cluster
+	stateNodes            []*state.StateNode
+	nodeLabelRequirements map[string]scheduling.Requirements
 }
 
 func NewTopology(
@@ -73,6 +74,7 @@ func NewTopology(
 	stateNodes []*state.StateNode,
 	inputs *NodePoolInputs,
 	pods []*corev1.Pod,
+	nodeLabelRequirements map[string]scheduling.Requirements,
 	opts ...Options,
 ) (*Topology, error) {
 	t := &Topology{
@@ -80,6 +82,7 @@ func NewTopology(
 		preferencePolicy:      option.Resolve(opts...).preferencePolicy,
 		cluster:               cluster,
 		stateNodes:            stateNodes,
+		nodeLabelRequirements: nodeLabelRequirements,
 		domainGroups:          inputs.domainGroups,
 		topologyGroups:        map[uint64]*TopologyGroup{},
 		inverseTopologyGroups: map[uint64]*TopologyGroup{},
@@ -358,7 +361,7 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 			continue
 		}
 		// ignore the node if it doesn't match the topology group
-		if !tg.nodeFilter.Matches(n.Node.Spec.Taints, scheduling.NewLabelRequirements(n.Node.Labels)) {
+		if !tg.nodeFilter.Matches(n.Node.Spec.Taints, LabelRequirementsFor(t.nodeLabelRequirements, n.Name(), n.Node.Labels)) {
 			continue
 		}
 		domain, exists := n.Labels()[tg.Key]
@@ -408,7 +411,7 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 				}
 				return serrors.Wrap(fmt.Errorf("getting node, %w", err), "Node", klog.KRef("", p.Spec.NodeName))
 			}
-			nodeRequirements = scheduling.NewLabelRequirements(node.Labels)
+			nodeRequirements = LabelRequirementsFor(t.nodeLabelRequirements, node.Name, node.Labels)
 
 			// assign back to previous node so we can hopefully re-use these in the next iteration
 			previousNode = node

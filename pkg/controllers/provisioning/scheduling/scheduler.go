@@ -143,10 +143,12 @@ func NewScheduler(
 
 	var daemonOverhead map[*NodeClaimTemplate]corev1.ResourceList
 	var daemonHostPortUsage map[*NodeClaimTemplate]*scheduling.HostPortUsage
+	var nodeLabelRequirements map[string]scheduling.Requirements
 	if precompute != nil {
 		daemonSetPods = precompute.DaemonSetPods
 		daemonOverhead = precompute.DaemonOverhead
 		daemonHostPortUsage = cloneDaemonHostPortUsage(precompute.DaemonHostPortUsage)
+		nodeLabelRequirements = precompute.NodeLabelRequirements
 	} else {
 		phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseDaemonOverhead)
 		daemonOverhead = getDaemonOverhead(phaseCtx, templates, daemonSetPods)
@@ -162,17 +164,18 @@ func NewScheduler(
 	stop()
 
 	s := &Scheduler{
-		uuid:                uuid.NewUUID(),
-		kubeClient:          kubeClient,
-		nodeClaimTemplates:  templates,
-		topology:            topology,
-		cluster:             cluster,
-		daemonOverhead:      daemonOverhead,
-		daemonHostPortUsage: daemonHostPortUsage,
-		cachedPodData:       map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
-		volumeReqsByPod:     volumeReqsByPod,          // Volume requirements per pod
-		recorder:            recorder,
-		preferences:         &Preferences{ToleratePreferNoSchedule: toleratePreferNoSchedule},
+		uuid:                  uuid.NewUUID(),
+		kubeClient:            kubeClient,
+		nodeClaimTemplates:    templates,
+		topology:              topology,
+		cluster:               cluster,
+		daemonOverhead:        daemonOverhead,
+		daemonHostPortUsage:   daemonHostPortUsage,
+		cachedPodData:         map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
+		volumeReqsByPod:       volumeReqsByPod,          // Volume requirements per pod
+		nodeLabelRequirements: nodeLabelRequirements,
+		recorder:              recorder,
+		preferences:           &Preferences{ToleratePreferNoSchedule: toleratePreferNoSchedule},
 		remainingResources: lo.SliceToMap(inputs.nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
 			// The limits are copied so that scheduling never mutates the input
 			return np.Name, corev1.ResourceList(np.Spec.Limits).DeepCopy()
@@ -208,6 +211,7 @@ type Scheduler struct {
 	daemonHostPortUsage     map[*NodeClaimTemplate]*scheduling.HostPortUsage
 	cachedPodData           map[types.UID]*PodData                // (Pod Namespace/Name) -> pre-computed data for pods to avoid re-computation and memory usage
 	volumeReqsByPod         map[types.UID]scheduling.Requirements // Volume topology requirements per pod
+	nodeLabelRequirements   map[string]scheduling.Requirements
 	preferences             *Preferences
 	topology                *Topology
 	cluster                 *state.Cluster
@@ -691,7 +695,7 @@ func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes 
 	for _, node := range stateNodes {
 		taints := node.Taints()
 		daemons := s.getCompatibleDaemonPods(ctx, node, taints, daemonSetPods)
-		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, resources.RequestsForPods(daemons...)))
+		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, resources.RequestsForPods(daemons...), s.nodeLabelRequirements[node.Name()]))
 		s.updateRemainingResources(node)
 	}
 	s.sortExistingNodes()

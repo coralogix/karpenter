@@ -21,28 +21,39 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	karpscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
 // SchedulerPrecompute holds scheduler construction inputs that are stable across
 // scheduling simulations within a single disruption iteration.
 type SchedulerPrecompute struct {
-	DaemonSetPods       []*corev1.Pod
-	DaemonOverhead      map[*NodeClaimTemplate]corev1.ResourceList
-	DaemonHostPortUsage map[*NodeClaimTemplate]*karpscheduling.HostPortUsage
+	DaemonSetPods         []*corev1.Pod
+	DaemonOverhead        map[*NodeClaimTemplate]corev1.ResourceList
+	DaemonHostPortUsage   map[*NodeClaimTemplate]*karpscheduling.HostPortUsage
+	NodeLabelRequirements map[string]karpscheduling.Requirements
 }
 
 // NewSchedulerPrecompute builds reusable scheduler inputs.
-func NewSchedulerPrecompute(ctx context.Context, inputs *NodePoolInputs, daemonSetPods []*corev1.Pod) *SchedulerPrecompute {
+func NewSchedulerPrecompute(ctx context.Context, inputs *NodePoolInputs, daemonSetPods []*corev1.Pod, stateNodes []*state.StateNode) *SchedulerPrecompute {
 	if daemonSetPods == nil {
 		daemonSetPods = []*corev1.Pod{}
 	}
 	templates := inputs.nodeClaimTemplates
 	return &SchedulerPrecompute{
-		DaemonSetPods:       daemonSetPods,
-		DaemonOverhead:      getDaemonOverhead(ctx, templates, daemonSetPods),
-		DaemonHostPortUsage: getDaemonHostPortUsage(ctx, templates, daemonSetPods),
+		DaemonSetPods:         daemonSetPods,
+		DaemonOverhead:        getDaemonOverhead(ctx, templates, daemonSetPods),
+		DaemonHostPortUsage:   getDaemonHostPortUsage(ctx, templates, daemonSetPods),
+		NodeLabelRequirements: buildNodeLabelRequirements(stateNodes),
 	}
+}
+
+func buildNodeLabelRequirements(nodes []*state.StateNode) map[string]karpscheduling.Requirements {
+	reqs := make(map[string]karpscheduling.Requirements, len(nodes))
+	for _, node := range nodes {
+		reqs[node.Name()] = karpscheduling.NewLabelRequirements(node.Labels())
+	}
+	return reqs
 }
 
 func cloneDaemonHostPortUsage(baseline map[*NodeClaimTemplate]*karpscheduling.HostPortUsage) map[*NodeClaimTemplate]*karpscheduling.HostPortUsage {
@@ -54,4 +65,11 @@ func cloneDaemonHostPortUsage(baseline map[*NodeClaimTemplate]*karpscheduling.Ho
 		cloned[template] = usage.DeepCopy()
 	}
 	return cloned
+}
+
+func LabelRequirementsFor(cache map[string]karpscheduling.Requirements, nodeName string, labels map[string]string) karpscheduling.Requirements {
+	if reqs, ok := cache[nodeName]; ok {
+		return reqs
+	}
+	return karpscheduling.NewLabelRequirements(labels)
 }

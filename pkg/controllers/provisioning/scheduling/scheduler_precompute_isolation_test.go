@@ -75,12 +75,30 @@ func TestNewSchedulerCreatesDistinctReservationManagers(t *testing.T) {
 	inputs := NewNodePoolInputs(ctx, events.NewRecorder(&record.FakeRecorder{}), []*v1.NodePool{nodePool}, map[string][]*cloudprovider.InstanceType{
 		nodePool.Name: instanceTypes,
 	})
-	precompute := NewSchedulerPrecompute(ctx, inputs, nil)
+	precompute := NewSchedulerPrecompute(ctx, inputs, nil, nil)
 
 	s1 := newTestScheduler(t, ctx, inputs, precompute)
 	s2 := newTestScheduler(t, ctx, inputs, precompute)
 	if s1.reservationManager == s2.reservationManager {
 		t.Fatal("expected distinct reservation managers per scheduler")
+	}
+}
+
+func TestLabelRequirementsFor(t *testing.T) {
+	cached := karpscheduling.NewLabelRequirements(map[string]string{"zone": "a"})
+	cache := map[string]karpscheduling.Requirements{"node-a": cached}
+
+	got := LabelRequirementsFor(cache, "node-a", map[string]string{"zone": "b"})
+	if err := got.Compatible(cached); err != nil {
+		t.Fatal("expected cached label requirements for known node")
+	}
+
+	miss := LabelRequirementsFor(cache, "node-b", map[string]string{"zone": "c"})
+	if err := miss.Compatible(karpscheduling.NewLabelRequirements(map[string]string{"zone": "c"})); err != nil {
+		t.Fatalf("expected fallback label requirements to match labels: %v", err)
+	}
+	if err := miss.Compatible(karpscheduling.NewLabelRequirements(map[string]string{"zone": "d"})); err == nil {
+		t.Fatal("expected fallback label requirements to reject incompatible values")
 	}
 }
 
@@ -90,7 +108,7 @@ func newTestScheduler(t *testing.T, ctx context.Context, inputs *NodePoolInputs,
 	cloudProvider.InstanceTypes = inputs.instanceTypes[inputs.nodePools[0].Name]
 	client := fakecr.NewFakeClient()
 	cluster := state.NewCluster(&clock.RealClock{}, client, cloudProvider)
-	topology, err := NewTopology(ctx, client, cluster, nil, inputs, nil)
+	topology, err := NewTopology(ctx, client, cluster, nil, inputs, nil, precompute.NodeLabelRequirements)
 	if err != nil {
 		t.Fatalf("creating topology: %v", err)
 	}

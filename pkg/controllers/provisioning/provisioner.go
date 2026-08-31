@@ -258,7 +258,7 @@ func (p *Provisioner) NewSchedulerFactory(ctx context.Context, opts ...scheduler
 	}
 
 	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhasePrecomputeScheduler)
-	precompute := scheduler.NewSchedulerPrecompute(phaseCtx, inputs, daemonSetPods)
+	precompute := scheduler.NewSchedulerPrecompute(phaseCtx, inputs, daemonSetPods, p.cluster.DeepCopyNodes().Active())
 	stop()
 
 	return &SchedulerFactory{provisioner: p, inputs: inputs, opts: opts, precompute: precompute}, nil
@@ -279,7 +279,7 @@ func (f *SchedulerFactory) NewScheduler(ctx context.Context, pods []*corev1.Pod,
 
 	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
 	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseNewTopology)
-	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, f.inputs, pods, f.opts...)
+	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, f.inputs, pods, f.precompute.NodeLabelRequirements, f.opts...)
 	stop()
 	if err != nil {
 		return nil, fmt.Errorf("tracking topology counts, %w", err)

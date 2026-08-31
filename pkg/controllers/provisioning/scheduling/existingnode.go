@@ -37,7 +37,7 @@ type ExistingNode struct {
 	requirements       scheduling.Requirements
 }
 
-func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, daemonResources v1.ResourceList) *ExistingNode {
+func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, daemonResources v1.ResourceList, labelReqs scheduling.Requirements) *ExistingNode {
 	// The state node passed in here must be a deep copy from cluster state as we modify it
 	// the remaining daemonResources to schedule are the total daemonResources minus what has already scheduled
 	resources.SubtractFrom(daemonResources, n.DaemonSetRequests())
@@ -51,13 +51,19 @@ func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, 
 		}
 	}
 	available := n.Available()
+	var requirements scheduling.Requirements
+	if labelReqs != nil {
+		requirements = scheduling.NewRequirements(labelReqs.Values()...)
+	} else {
+		requirements = scheduling.NewLabelRequirements(n.Labels())
+	}
 	node := &ExistingNode{
 		StateNode:          n,
 		cachedAvailable:    available,
 		cachedTaints:       taints,
 		topology:           topology,
 		remainingResources: resources.Subtract(available, daemonResources),
-		requirements:       scheduling.NewLabelRequirements(n.Labels()),
+		requirements:       requirements,
 	}
 	node.requirements.Add(scheduling.NewRequirement(v1.LabelHostname, v1.NodeSelectorOpIn, n.HostName()))
 	topology.Register(v1.LabelHostname, n.HostName())
