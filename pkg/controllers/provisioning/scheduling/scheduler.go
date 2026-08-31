@@ -121,6 +121,7 @@ func NewScheduler(
 	stateNodes []*state.StateNode,
 	topology *Topology,
 	daemonSetPods []*corev1.Pod,
+	precompute *SchedulerPrecompute,
 	recorder events.Recorder,
 	clock clock.Clock,
 	volumeReqsByPod map[types.UID]scheduling.Requirements,
@@ -140,15 +141,23 @@ func NewScheduler(
 	}
 	templates := inputs.nodeClaimTemplates
 
-	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseDaemonOverhead)
-	daemonOverhead := getDaemonOverhead(phaseCtx, templates, daemonSetPods)
-	stop()
+	var daemonOverhead map[*NodeClaimTemplate]corev1.ResourceList
+	var daemonHostPortUsage map[*NodeClaimTemplate]*scheduling.HostPortUsage
+	if precompute != nil {
+		daemonSetPods = precompute.DaemonSetPods
+		daemonOverhead = precompute.DaemonOverhead
+		daemonHostPortUsage = cloneDaemonHostPortUsage(precompute.DaemonHostPortUsage)
+	} else {
+		phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseDaemonOverhead)
+		daemonOverhead = getDaemonOverhead(phaseCtx, templates, daemonSetPods)
+		stop()
 
-	phaseCtx, stop = MeasureNewSchedulerPhase(ctx, PhaseDaemonHostPorts)
-	daemonHostPortUsage := getDaemonHostPortUsage(phaseCtx, templates, daemonSetPods)
-	stop()
+		phaseCtx, stop = MeasureNewSchedulerPhase(ctx, PhaseDaemonHostPorts)
+		daemonHostPortUsage = getDaemonHostPortUsage(phaseCtx, templates, daemonSetPods)
+		stop()
+	}
 
-	_, stop = MeasureNewSchedulerPhase(ctx, PhaseReservationManager)
+	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseReservationManager)
 	reservationManager := NewReservationManager(inputs.instanceTypes)
 	stop()
 
@@ -692,7 +701,7 @@ func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes 
 func (s *Scheduler) getCompatibleDaemonPods(ctx context.Context, node *state.StateNode, taints []corev1.Taint, daemonSetPods []*corev1.Pod) []*corev1.Pod {
 	var daemons []*corev1.Pod
 	for _, p := range daemonSetPods {
-		if s.shouldSkipDaemonPod(ctx, p) {
+		if shouldSkipDaemonPod(ctx, p) {
 			continue
 		}
 		if s.isDaemonPodCompatibleWithNode(p, taints, node.Labels()) {
@@ -702,8 +711,7 @@ func (s *Scheduler) getCompatibleDaemonPods(ctx context.Context, node *state.Sta
 	return daemons
 }
 
-// shouldSkipDaemonPod checks if a daemon pod should be skipped due to DRA requirements
-func (s *Scheduler) shouldSkipDaemonPod(ctx context.Context, p *corev1.Pod) bool {
+func shouldSkipDaemonPod(ctx context.Context, p *corev1.Pod) bool {
 	return pod.HasDRARequirements(p) && karpopts.FromContext(ctx).IgnoreDRARequests
 }
 
