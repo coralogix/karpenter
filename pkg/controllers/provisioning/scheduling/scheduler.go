@@ -144,11 +144,13 @@ func NewScheduler(
 	var daemonOverhead map[*NodeClaimTemplate]corev1.ResourceList
 	var daemonHostPortUsage map[*NodeClaimTemplate]*scheduling.HostPortUsage
 	var nodeLabelRequirements map[string]scheduling.Requirements
+	var nodeDaemonResources map[string]corev1.ResourceList
 	if precompute != nil {
 		daemonSetPods = precompute.DaemonSetPods
 		daemonOverhead = precompute.DaemonOverhead
 		daemonHostPortUsage = cloneDaemonHostPortUsage(precompute.DaemonHostPortUsage)
 		nodeLabelRequirements = precompute.NodeLabelRequirements
+		nodeDaemonResources = precompute.NodeDaemonResources
 	} else {
 		phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseDaemonOverhead)
 		daemonOverhead = getDaemonOverhead(phaseCtx, templates, daemonSetPods)
@@ -174,6 +176,8 @@ func NewScheduler(
 		cachedPodData:         map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
 		volumeReqsByPod:       volumeReqsByPod,          // Volume requirements per pod
 		nodeLabelRequirements: nodeLabelRequirements,
+		daemonSetPods:         daemonSetPods,
+		nodeDaemonResources:   nodeDaemonResources,
 		recorder:              recorder,
 		preferences:           &Preferences{ToleratePreferNoSchedule: toleratePreferNoSchedule},
 		remainingResources: lo.SliceToMap(inputs.nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
@@ -188,7 +192,7 @@ func NewScheduler(
 		numConcurrentReconciles: lo.Ternary(option.Resolve(opts...).numConcurrentReconciles > 0, option.Resolve(opts...).numConcurrentReconciles, 1),
 	}
 	phaseCtx, stop = MeasureNewSchedulerPhase(ctx, PhaseCalculateExistingNodeClaims)
-	s.calculateExistingNodeClaims(phaseCtx, stateNodes, daemonSetPods)
+	s.calculateExistingNodeClaims(phaseCtx, stateNodes)
 	stop()
 	return s
 }
@@ -212,6 +216,8 @@ type Scheduler struct {
 	cachedPodData           map[types.UID]*PodData                // (Pod Namespace/Name) -> pre-computed data for pods to avoid re-computation and memory usage
 	volumeReqsByPod         map[types.UID]scheduling.Requirements // Volume topology requirements per pod
 	nodeLabelRequirements   map[string]scheduling.Requirements
+	daemonSetPods           []*corev1.Pod
+	nodeDaemonResources     map[string]corev1.ResourceList
 	preferences             *Preferences
 	topology                *Topology
 	cluster                 *state.Cluster
@@ -690,15 +696,22 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 	return multierr.Combine(errs...)
 }
 
-func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []*state.StateNode, daemonSetPods []*corev1.Pod) {
+func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []*state.StateNode) {
 	// create our existing nodes
 	for _, node := range stateNodes {
 		taints := node.Taints()
-		daemons := s.getCompatibleDaemonPods(ctx, node, taints, daemonSetPods)
-		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, resources.RequestsForPods(daemons...), s.nodeLabelRequirements[node.Name()]))
+		daemonResources := s.daemonResourcesForNode(ctx, node, taints)
+		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, daemonResources, s.nodeLabelRequirements[node.Name()]))
 		s.updateRemainingResources(node)
 	}
 	s.sortExistingNodes()
+}
+
+func (s *Scheduler) daemonResourcesForNode(ctx context.Context, node *state.StateNode, taints []corev1.Taint) corev1.ResourceList {
+	if cached, ok := s.nodeDaemonResources[node.Name()]; ok {
+		return corev1.ResourceList(cached).DeepCopy()
+	}
+	return resources.RequestsForPods(s.getCompatibleDaemonPods(ctx, node, taints, s.daemonSetPods)...)
 }
 
 // getCompatibleDaemonPods filters daemon pods that can schedule to the given node

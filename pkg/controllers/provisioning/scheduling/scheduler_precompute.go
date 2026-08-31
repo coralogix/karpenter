@@ -23,6 +23,7 @@ import (
 
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	karpscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/utils/resources"
 )
 
 // SchedulerPrecompute holds scheduler construction inputs that are stable across
@@ -32,6 +33,12 @@ type SchedulerPrecompute struct {
 	DaemonOverhead        map[*NodeClaimTemplate]corev1.ResourceList
 	DaemonHostPortUsage   map[*NodeClaimTemplate]*karpscheduling.HostPortUsage
 	NodeLabelRequirements map[string]karpscheduling.Requirements
+	NodeDaemonResources   map[string]corev1.ResourceList
+}
+
+type daemonPodPrecompute struct {
+	pod          *corev1.Pod
+	requirements karpscheduling.Requirements
 }
 
 // NewSchedulerPrecompute builds reusable scheduler inputs.
@@ -40,12 +47,21 @@ func NewSchedulerPrecompute(ctx context.Context, inputs *NodePoolInputs, daemonS
 		daemonSetPods = []*corev1.Pod{}
 	}
 	templates := inputs.nodeClaimTemplates
-	return &SchedulerPrecompute{
+	nodeLabelRequirements := buildNodeLabelRequirements(stateNodes)
+	daemonPods := buildDaemonPodPrecomputes(daemonSetPods)
+	precompute := &SchedulerPrecompute{
 		DaemonSetPods:         daemonSetPods,
 		DaemonOverhead:        getDaemonOverhead(ctx, templates, daemonSetPods),
 		DaemonHostPortUsage:   getDaemonHostPortUsage(ctx, templates, daemonSetPods),
-		NodeLabelRequirements: buildNodeLabelRequirements(stateNodes),
+		NodeLabelRequirements: nodeLabelRequirements,
+		NodeDaemonResources:   make(map[string]corev1.ResourceList, len(stateNodes)),
 	}
+	for _, node := range stateNodes {
+		precompute.NodeDaemonResources[node.Name()] = nodeDaemonResources(
+			ctx, node.Taints(), daemonPods, nodeLabelRequirements[node.Name()],
+		)
+	}
+	return precompute
 }
 
 func buildNodeLabelRequirements(nodes []*state.StateNode) map[string]karpscheduling.Requirements {
@@ -54,6 +70,39 @@ func buildNodeLabelRequirements(nodes []*state.StateNode) map[string]karpschedul
 		reqs[node.Name()] = karpscheduling.NewLabelRequirements(node.Labels())
 	}
 	return reqs
+}
+
+func buildDaemonPodPrecomputes(pods []*corev1.Pod) []daemonPodPrecompute {
+	precomputes := make([]daemonPodPrecompute, 0, len(pods))
+	for _, p := range pods {
+		precomputes = append(precomputes, daemonPodPrecompute{
+			pod:          p,
+			requirements: karpscheduling.NewStrictPodRequirements(p),
+		})
+	}
+	return precomputes
+}
+
+func nodeDaemonResources(
+	ctx context.Context,
+	taints []corev1.Taint,
+	daemonPods []daemonPodPrecompute,
+	nodeLabelRequirements karpscheduling.Requirements,
+) corev1.ResourceList {
+	var compatible []*corev1.Pod
+	for _, daemon := range daemonPods {
+		if shouldSkipDaemonPod(ctx, daemon.pod) {
+			continue
+		}
+		if err := karpscheduling.Taints(taints).ToleratesPod(daemon.pod); err != nil {
+			continue
+		}
+		if err := nodeLabelRequirements.Compatible(daemon.requirements); err != nil {
+			continue
+		}
+		compatible = append(compatible, daemon.pod)
+	}
+	return resources.RequestsForPods(compatible...)
 }
 
 func cloneDaemonHostPortUsage(baseline map[*NodeClaimTemplate]*karpscheduling.HostPortUsage) map[*NodeClaimTemplate]*karpscheduling.HostPortUsage {
