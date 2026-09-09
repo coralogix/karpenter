@@ -266,28 +266,10 @@ func (p *Provisioner) NewScheduler(
 	// will always attempt to schedule on the first nodeTemplate
 	nodepoolutils.OrderByWeight(nodePools)
 
-	instanceTypes := map[string][]*cloudprovider.InstanceType{}
-	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseGetInstanceTypes)
-	for _, np := range nodePools {
-		its, err := p.cloudProvider.GetInstanceTypes(phaseCtx, np)
-		if err != nil {
-			if cloudprovider.IsUnevaluatedNodePoolError(err) {
-				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).V(1).Info("skipping, awaiting nodeoverlay evaluation")
-				continue
-			}
-			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("getting instance types, %w", err)
-			}
-			log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Error(err, "skipping, unable to resolve instance types")
-			continue
-		}
-		if len(its) == 0 {
-			log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, no resolved instance types found")
-			continue
-		}
-		instanceTypes[np.Name] = its
+	instanceTypes, err := p.getInstanceTypes(ctx, nodePools)
+	if err != nil {
+		return nil, err
 	}
-	stop()
 
 	// Get volume topology requirements WITHOUT modifying pods.
 	// Volume requirements are passed separately and added to nodeRequirements only.
@@ -314,6 +296,33 @@ func (p *Provisioner) NewScheduler(
 	}
 	// Pass volumeReqs to scheduler - added to nodeRequirements for NodeClaim zone selection
 	return scheduler.NewScheduler(ctx, p.kubeClient, nodePools, p.cluster, stateNodes, topology, instanceTypes, daemonSetPods, p.recorder, p.clock, volumeReqs, opts...), nil
+}
+
+func (p *Provisioner) getInstanceTypes(ctx context.Context, nodePools []*v1.NodePool) (map[string][]*cloudprovider.InstanceType, error) {
+	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseGetInstanceTypes)
+	defer stop()
+
+	instanceTypes := map[string][]*cloudprovider.InstanceType{}
+	for _, np := range nodePools {
+		its, err := p.cloudProvider.GetInstanceTypes(phaseCtx, np)
+		if err != nil {
+			if cloudprovider.IsUnevaluatedNodePoolError(err) {
+				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).V(1).Info("skipping, awaiting nodeoverlay evaluation")
+				continue
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, fmt.Errorf("getting instance types, %w", err)
+			}
+			log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Error(err, "skipping, unable to resolve instance types")
+			continue
+		}
+		if len(its) == 0 {
+			log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, no resolved instance types found")
+			continue
+		}
+		instanceTypes[np.Name] = its
+	}
+	return instanceTypes, nil
 }
 
 func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {

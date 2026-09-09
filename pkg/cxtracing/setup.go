@@ -75,7 +75,6 @@ func otelEndpointConfigured() bool {
 	for _, key := range []string{
 		"OTEL_EXPORTER_OTLP_ENDPOINT",
 		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-		"OTEL_EXPORTER_OTLP_AGENT_HOST",
 	} {
 		if os.Getenv(key) != "" {
 			return true
