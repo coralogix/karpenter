@@ -241,7 +241,9 @@ func (p *Provisioner) NewScheduler(
 	stateNodes []*state.StateNode,
 	opts ...scheduler.Options,
 ) (*scheduler.Scheduler, error) {
-	nodePools, err := nodepoolutils.ListManaged(ctx, p.kubeClient, p.cloudProvider)
+	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListNodePools)
+	nodePools, err := nodepoolutils.ListManaged(phaseCtx, p.kubeClient, p.cloudProvider)
+	stop()
 	if err != nil {
 		return nil, fmt.Errorf("listing nodepools, %w", err)
 	}
@@ -264,9 +266,45 @@ func (p *Provisioner) NewScheduler(
 	// will always attempt to schedule on the first nodeTemplate
 	nodepoolutils.OrderByWeight(nodePools)
 
+	instanceTypes, err := p.getInstanceTypes(ctx, nodePools)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get volume topology requirements WITHOUT modifying pods.
+	// Volume requirements are passed separately and added to nodeRequirements only.
+	// Pods that fail volume topology lookup are excluded from scheduling.
+	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseVolumeTopology)
+	pods, volumeReqs, err := p.getVolumeTopologyRequirements(phaseCtx, pods)
+	stop()
+	if err != nil {
+		return nil, fmt.Errorf("getting volume topology requirements, %w", err)
+	}
+
+	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
+	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseNewTopology)
+	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, nodePools, instanceTypes, pods, opts...)
+	stop()
+	if err != nil {
+		return nil, fmt.Errorf("tracking topology counts, %w", err)
+	}
+	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListDaemonSets)
+	daemonSetPods, err := p.getDaemonSetPods(phaseCtx)
+	stop()
+	if err != nil {
+		return nil, fmt.Errorf("getting daemon pods, %w", err)
+	}
+	// Pass volumeReqs to scheduler - added to nodeRequirements for NodeClaim zone selection
+	return scheduler.NewScheduler(ctx, p.kubeClient, nodePools, p.cluster, stateNodes, topology, instanceTypes, daemonSetPods, p.recorder, p.clock, volumeReqs, opts...), nil
+}
+
+func (p *Provisioner) getInstanceTypes(ctx context.Context, nodePools []*v1.NodePool) (map[string][]*cloudprovider.InstanceType, error) {
+	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseGetInstanceTypes)
+	defer stop()
+
 	instanceTypes := map[string][]*cloudprovider.InstanceType{}
 	for _, np := range nodePools {
-		its, err := p.cloudProvider.GetInstanceTypes(ctx, np)
+		its, err := p.cloudProvider.GetInstanceTypes(phaseCtx, np)
 		if err != nil {
 			if cloudprovider.IsUnevaluatedNodePoolError(err) {
 				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).V(1).Info("skipping, awaiting nodeoverlay evaluation")
@@ -284,26 +322,7 @@ func (p *Provisioner) NewScheduler(
 		}
 		instanceTypes[np.Name] = its
 	}
-
-	// Get volume topology requirements WITHOUT modifying pods.
-	// Volume requirements are passed separately and added to nodeRequirements only.
-	// Pods that fail volume topology lookup are excluded from scheduling.
-	pods, volumeReqs, err := p.getVolumeTopologyRequirements(ctx, pods)
-	if err != nil {
-		return nil, fmt.Errorf("getting volume topology requirements, %w", err)
-	}
-
-	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
-	topology, err := scheduler.NewTopology(ctx, p.kubeClient, p.cluster, stateNodes, nodePools, instanceTypes, pods, opts...)
-	if err != nil {
-		return nil, fmt.Errorf("tracking topology counts, %w", err)
-	}
-	daemonSetPods, err := p.getDaemonSetPods(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting daemon pods, %w", err)
-	}
-	// Pass volumeReqs to scheduler - added to nodeRequirements for NodeClaim zone selection
-	return scheduler.NewScheduler(ctx, p.kubeClient, nodePools, p.cluster, stateNodes, topology, instanceTypes, daemonSetPods, p.recorder, p.clock, volumeReqs, opts...), nil
+	return instanceTypes, nil
 }
 
 func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
