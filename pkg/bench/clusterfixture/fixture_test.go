@@ -190,6 +190,7 @@ func TestSlimPodPreservesSchedulingFields(t *testing.T) {
 	}
 }
 
+//nolint:gocyclo
 func TestLoadAndBuildEnvPreservesStorageSchedulingState(t *testing.T) {
 	const (
 		nodeName     = "node-a"

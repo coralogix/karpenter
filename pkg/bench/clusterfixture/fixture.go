@@ -110,6 +110,8 @@ func moduleRoot() (string, error) {
 }
 
 // Load reads a cluster fixture from dir.
+//
+//nolint:gocyclo
 func Load(dir string) (*Fixture, error) {
 	dir = ResolveDir(dir)
 	fixture := &Fixture{Dir: dir}

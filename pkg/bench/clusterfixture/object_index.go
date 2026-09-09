@@ -52,6 +52,7 @@ type objectIndex struct {
 	namespaces             []runtime.Object
 }
 
+//nolint:gocyclo
 func newObjectIndex(f *Fixture) *objectIndex {
 	idx := &objectIndex{
 		podsByNamespace: map[string][]runtime.Object{},
@@ -104,6 +105,7 @@ func runtimeObject(obj client.Object) runtime.Object {
 	return obj.DeepCopyObject()
 }
 
+//nolint:gocyclo
 func (idx *objectIndex) get(key client.ObjectKey, obj client.Object) error {
 	switch dst := obj.(type) {
 	case *corev1.Node:
@@ -157,6 +159,7 @@ func (idx *objectIndex) get(key client.ObjectKey, obj client.Object) error {
 	}
 }
 
+//nolint:gocyclo
 func (idx *objectIndex) list(list client.ObjectList, opts client.ListOptions) error {
 	switch dst := list.(type) {
 	case *corev1.PodList:
