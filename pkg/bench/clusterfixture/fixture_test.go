@@ -88,6 +88,10 @@ func TestBuildEnvAndReset(t *testing.T) {
 	if env.StateNodeForProviderID("aws:///us-west-2a/i-nodea") == nil {
 		t.Fatal("expected state node for node-a provider ID")
 	}
+	if !fixture.NodePools[0].StatusConditions().IsTrue(v1.ConditionTypeValidationSucceeded) ||
+		!fixture.NodePools[0].StatusConditions().IsTrue(v1.ConditionTypeNodeClassReady) {
+		t.Fatal("expected fixture node pool to be ready for scheduling")
+	}
 
 	env.Cluster.NominateNodeForPod(ctx, "aws:///us-west-2a/i-nodea")
 	if err := env.Reset(ctx); err != nil {

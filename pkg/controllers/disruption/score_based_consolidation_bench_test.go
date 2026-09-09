@@ -43,17 +43,16 @@ func init() {
 //
 //	CLUSTER_FIXTURE_DIR=testdata/clusterfixtures/example-cluster \
 //	go test -tags=test_performance -run='^$' \
-//	  -bench=BenchmarkEvaluateMoveSet_ClusterFixture -benchtime=10s -count=1 \
-//	  -cpuprofile=/tmp/evaluate_move_set_example-cluster.cpu.pprof ./pkg/controllers/disruption
+//	  -bench=BenchmarkSimulateScheduling_ClusterFixture -benchtime=10s -count=1 \
+//	  -cpuprofile=/tmp/simulate_scheduling_example-cluster.cpu.pprof ./pkg/controllers/disruption
 //
-//	go tool pprof -http=:0 /tmp/evaluate_move_set_example-cluster.cpu.pprof
+//	go tool pprof -http=:0 /tmp/simulate_scheduling_example-cluster.cpu.pprof
 
 const clusterFixtureDirEnvVar = "CLUSTER_FIXTURE_DIR"
 
 type clusterFixtureBench struct {
 	ctx        context.Context
 	env        *clusterfixture.Env
-	compute    consolidationComputer
 	candidates []*Candidate
 	rng        *rand.Rand
 }
@@ -118,13 +117,12 @@ func newClusterFixtureBench(dir string) (*clusterFixtureBench, error) {
 	return &clusterFixtureBench{
 		ctx:        ctx,
 		env:        env,
-		compute:    consolidation.computeConsolidation,
 		candidates: candidates,
 		rng:        rand.New(rand.NewSource(42)), //nolint:gosec
 	}, nil
 }
 
-func BenchmarkEvaluateMoveSet_ClusterFixture(b *testing.B) {
+func BenchmarkSimulateScheduling_ClusterFixture(b *testing.B) {
 	dir := clusterfixture.ResolveDir(clusterFixtureDir())
 	if !clusterfixture.Exists(dir) {
 		b.Skipf("cluster fixture not found at %q", dir)
@@ -146,10 +144,11 @@ func BenchmarkEvaluateMoveSet_ClusterFixture(b *testing.B) {
 	b.ReportMetric(float64(bench.env.PodCount), "pods")
 	b.ReportMetric(float64(len(bench.candidates)), "candidates")
 
-	stats := &moveSetSearchStats{}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		candidate := bench.candidates[bench.rng.Intn(len(bench.candidates))]
-		_ = evaluateMoveSet(bench.ctx, moveSet{Nodes: []*Candidate{candidate}}, bench.compute, stats)
+		if _, err := SimulateScheduling(bench.ctx, bench.env.Client, bench.env.Cluster, bench.env.Provisioner, candidate); err != nil {
+			b.Fatalf("simulating scheduling for candidate %q: %v", candidate.Name(), err)
+		}
 	}
 }

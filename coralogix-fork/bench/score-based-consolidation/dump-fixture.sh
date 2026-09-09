@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dump cluster state for evaluateMoveSet cluster-fixture benchmarks.
+# Dump cluster state for SimulateScheduling cluster-fixture benchmarks.
 #
 # Usage:
 #   ./coralogix-fork/bench/score-based-consolidation/dump-fixture.sh <cluster-name> [output-dir]

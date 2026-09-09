@@ -245,6 +245,8 @@ func (f *Fixture) normalize() {
 		nc.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 	}
 	for _, np := range f.NodePools {
+		np.StatusConditions().SetTrue(v1.ConditionTypeValidationSucceeded)
+		np.StatusConditions().SetTrue(v1.ConditionTypeNodeClassReady)
 		if np.Spec.Disruption.ConsolidateAfter.Duration == nil {
 			np.Spec.Disruption.ConsolidateAfter = v1.MustParseNillableDuration("0s")
 		}

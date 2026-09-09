@@ -1,4 +1,4 @@
-# evaluateMoveSet cluster-fixture benchmark
+# SimulateScheduling cluster-fixture benchmark
 
 Benchmark score-based consolidation against a real cluster snapshot.
 
@@ -31,7 +31,7 @@ The benchmark runs with `PreferencePolicy=Ignore`. Required scheduling constrain
 ```bash
 CLUSTER_FIXTURE_DIR=testdata/clusterfixtures/example-cluster \
 go test -tags=test_performance -run='^$' \
-  -bench=BenchmarkEvaluateMoveSet_ClusterFixture -benchtime=30s -count=1 \
+  -bench=BenchmarkSimulateScheduling_ClusterFixture -benchtime=30s -count=1 \
   ./pkg/controllers/disruption
 ```
 
@@ -40,12 +40,12 @@ Skipped when `CLUSTER_FIXTURE_DIR` is missing (CI-safe).
 ## 3. Flamegraph
 
 ```bash
-PROFILE=profiles/evaluate_move_set_example-cluster-$(date +%Y%m%d-%H%M%S).cpu.pprof
+PROFILE=profiles/simulate_scheduling_example-cluster-$(date +%Y%m%d-%H%M%S).cpu.pprof
 mkdir -p profiles
 
 CLUSTER_FIXTURE_DIR=testdata/clusterfixtures/example-cluster \
 go test -tags=test_performance -run='^$' \
-  -bench=BenchmarkEvaluateMoveSet_ClusterFixture -benchtime=30s -count=1 \
+  -bench=BenchmarkSimulateScheduling_ClusterFixture -benchtime=30s -count=1 \
   -cpuprofile="$PROFILE" \
   ./pkg/controllers/disruption
 
@@ -57,4 +57,4 @@ Open **Flame Graph** at http://localhost:8080 (or the port you set via `PPROF_PO
 
 ## What it measures
 
-Each iteration picks a **random eligible node** (seed `42`) from the candidate list built once via `GetCandidates`, then calls `evaluateMoveSet` — matching `searchForMoveSets` in production.
+Each iteration picks a **random eligible node** (seed `42`) from the candidate list built once via `GetCandidates`, then calls `SimulateScheduling` directly for that candidate. This isolates scheduler construction and solving from consolidation price filtering, savings checks, and move-set evaluation bookkeeping.
