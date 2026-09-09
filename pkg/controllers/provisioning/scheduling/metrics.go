@@ -17,20 +17,57 @@ limitations under the License.
 package scheduling
 
 import (
+	"context"
+
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 )
 
 const (
-	ControllerLabel    = "controller"
-	schedulingIDLabel  = "scheduling_id"
-	schedulerSubsystem = "scheduler"
+	ControllerLabel                  = "controller"
+	schedulingIDLabel                = "scheduling_id"
+	schedulerSubsystem               = "scheduler"
+	newSchedulerPhaseLabel           = "phase"
+	PhaseListNodePools               = "list_node_pools"
+	PhaseGetInstanceTypes            = "get_instance_types"
+	PhaseVolumeTopology              = "volume_topology"
+	PhaseNewTopology                 = "new_topology"
+	PhaseListDaemonSets              = "list_daemonsets"
+	PhaseFilterInstanceTypes         = "filter_instance_types"
+	PhaseDaemonOverhead              = "daemon_overhead"
+	PhaseDaemonHostPorts             = "daemon_host_ports"
+	PhaseReservationManager          = "reservation_manager"
+	PhaseCalculateExistingNodeClaims = "calculate_existing_node_claims"
+	PhaseBuildDomainGroups           = "build_domain_groups"
+	PhaseUpdateInverseAffinities     = "update_inverse_affinities"
+	PhaseTopologyUpdate              = "topology_update"
+	PhaseCountDomains                = "count_domains"
 )
 
+// MeasureNewSchedulerPhase records a phase metric and span. Use the returned context only for
+// work inside the phase; pass the original ctx when starting sibling phases.
+func MeasureNewSchedulerPhase(ctx context.Context, phase string) (context.Context, func()) {
+	metricStop := metrics.Measure(NewSchedulerPhaseDurationSeconds, map[string]string{newSchedulerPhaseLabel: phase})
+	return cxtracing.Measure(ctx, metricStop, "karpenter.scheduler.new."+phase, attribute.String("phase", phase))
+}
+
 var (
+	NewSchedulerPhaseDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: schedulerSubsystem,
+			Name:      "new_scheduler_phase_duration_seconds",
+			Help:      "Duration of phases within NewScheduler in seconds. Labeled by phase.",
+			Buckets:   metrics.DurationBuckets(),
+		},
+		[]string{newSchedulerPhaseLabel},
+	)
 	DurationSeconds = opmetrics.NewPrometheusHistogram(
 		crmetrics.Registry,
 		prometheus.HistogramOpts{

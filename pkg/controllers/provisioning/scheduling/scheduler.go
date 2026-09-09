@@ -153,6 +153,7 @@ func NewScheduler(
 	}
 	// Pre-filter instance types eligible for NodePools to reduce work done during scheduling loops for pods
 	// if no templates remain, we still want to build the scheduler so that Karpenter can ack pods which can schedule to existing and in-flight capacity
+	_, stop := MeasureNewSchedulerPhase(ctx, PhaseFilterInstanceTypes)
 	templates := lo.FilterMap(nodePools, func(np *v1.NodePool, _ int) (*NodeClaimTemplate, bool) {
 		var err error
 		nct := NewNodeClaimTemplate(np)
@@ -169,13 +170,22 @@ func NewScheduler(
 		}
 		return nct, true
 	})
+	stop()
+
+	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseDaemonOverhead)
+	daemonOverheadGroups := buildDaemonOverheadGroups(phaseCtx, templates, daemonSetPods)
+	stop()
+
+	_, stop = MeasureNewSchedulerPhase(ctx, PhaseReservationManager)
+	reservationManager := NewReservationManager(instanceTypes)
+	stop()
 	s := &Scheduler{
 		uuid:                 uuid.NewUUID(),
 		kubeClient:           kubeClient,
 		nodeClaimTemplates:   templates,
 		topology:             topology,
 		cluster:              cluster,
-		daemonOverheadGroups: buildDaemonOverheadGroups(ctx, templates, daemonSetPods),
+		daemonOverheadGroups: daemonOverheadGroups,
 		cachedPodData:        map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
 		volumeReqsByPod:      volumeReqsByPod,          // Volume requirements per pod
 		recorder:             recorder,
@@ -184,7 +194,7 @@ func NewScheduler(
 			return np.Name, corev1.ResourceList(np.Spec.Limits)
 		}),
 		clock:                   clock,
-		reservationManager:      NewReservationManager(instanceTypes),
+		reservationManager:      reservationManager,
 		reservedOfferingMode:    option.Resolve(opts...).reservedOfferingMode,
 		preferencePolicy:        option.Resolve(opts...).preferencePolicy,
 		minValuesPolicy:         minValuesPolicy,
@@ -210,7 +220,9 @@ func NewScheduler(
 		}
 	}
 	s.deletingNodeNames = deletingNodeNames
-	s.calculateExistingNodeClaims(ctx, stateNodes, daemonSetPods, nodeToNodePool, option.Resolve(opts...).enforceConsolidateAfter)
+	phaseCtx, stop = MeasureNewSchedulerPhase(ctx, PhaseCalculateExistingNodeClaims)
+	s.calculateExistingNodeClaims(phaseCtx, stateNodes, daemonSetPods, nodeToNodePool, option.Resolve(opts...).enforceConsolidateAfter)
+	stop()
 	return s
 }
 

@@ -269,7 +269,9 @@ func (p *Provisioner) NewScheduler(
 	deletingPodUIDs sets.Set[types.UID],
 	opts ...scheduler.Options,
 ) (*scheduler.Scheduler, error) {
-	nodePools, err := nodepoolutils.ListManaged(ctx, p.kubeClient, p.cloudProvider)
+	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListNodePools)
+	nodePools, err := nodepoolutils.ListManaged(phaseCtx, p.kubeClient, p.cloudProvider)
+	stop()
 	if err != nil {
 		return nil, fmt.Errorf("listing nodepools, %w", err)
 	}
@@ -292,9 +294,10 @@ func (p *Provisioner) NewScheduler(
 	// will always attempt to schedule on the first nodeTemplate
 	nodepoolutils.OrderByWeight(nodePools)
 
+	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseGetInstanceTypes)
 	instanceTypes := map[string][]*cloudprovider.InstanceType{}
 	for _, np := range nodePools {
-		its, err := p.cloudProvider.GetInstanceTypes(ctx, np)
+		its, err := p.cloudProvider.GetInstanceTypes(phaseCtx, np)
 		if err != nil {
 			if cloudprovider.IsUnevaluatedNodePoolError(err) {
 				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).V(1).Info("skipping, awaiting nodeoverlay evaluation")
@@ -312,21 +315,28 @@ func (p *Provisioner) NewScheduler(
 		}
 		instanceTypes[np.Name] = its
 	}
+	stop()
 
 	// Get volume topology requirements WITHOUT modifying pods.
 	// Volume requirements are passed separately and added to nodeRequirements only.
 	// Pods that fail volume topology lookup are excluded from scheduling.
-	pods, volumeReqs, err := p.getVolumeTopologyRequirements(ctx, pods)
+	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseVolumeTopology)
+	pods, volumeReqs, err := p.getVolumeTopologyRequirements(phaseCtx, pods)
+	stop()
 	if err != nil {
 		return nil, fmt.Errorf("getting volume topology requirements, %w", err)
 	}
 
 	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
-	topology, err := scheduler.NewTopology(ctx, p.kubeClient, p.cluster, stateNodes, nodePools, instanceTypes, pods, opts...)
+	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseNewTopology)
+	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, nodePools, instanceTypes, pods, opts...)
+	stop()
 	if err != nil {
 		return nil, fmt.Errorf("tracking topology counts, %w", err)
 	}
-	daemonSetPods, err := p.getDaemonSetPods(ctx)
+	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListDaemonSets)
+	daemonSetPods, err := p.getDaemonSetPods(phaseCtx)
+	stop()
 	if err != nil {
 		return nil, fmt.Errorf("getting daemon pods, %w", err)
 	}

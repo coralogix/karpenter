@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -38,6 +39,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	operatorlogging "sigs.k8s.io/karpenter/pkg/operator/logging"
@@ -49,12 +51,22 @@ import (
 
 var errCandidateDeleting = fmt.Errorf("candidate is deleting")
 
+func measureSimulateSchedulingPhase(ctx context.Context, phase string) (context.Context, func()) {
+	metricStop := metrics.Measure(SimulateSchedulingPhaseDurationSeconds, map[string]string{simulateSchedulingPhaseLabel: phase})
+	return cxtracing.Measure(ctx, metricStop, "karpenter.disruption.simulate_scheduling."+phase, attribute.String("phase", phase))
+}
+
 //nolint:gocyclo
 func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
 	schedulerOpts []scheduling.Options, candidates ...*Candidate,
 ) (scheduling.Results, error) {
+	ctx, stopRoot := cxtracing.Measure(ctx, metrics.Measure(SimulateSchedulingDurationSeconds, map[string]string{}), "karpenter.disruption.simulate_scheduling")
+	defer stopRoot()
+
 	candidateNames := sets.NewString(lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
+	_, stop := measureSimulateSchedulingPhase(ctx, phaseDeepCopyNodes)
 	nodes := cluster.DeepCopyNodes()
+	stop()
 	deletingNodes := nodes.Deleting()
 	stateNodes := lo.Filter(nodes.Active(), func(n *state.StateNode, _ int) bool {
 		return !candidateNames.Has(n.Name())
@@ -70,7 +82,9 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	}
 
 	// start by getting all pending pods
-	pods, err := provisioner.GetPendingPods(ctx)
+	phaseCtx, stop := measureSimulateSchedulingPhase(ctx, phaseGetPendingPods)
+	pods, err := provisioner.GetPendingPods(phaseCtx)
+	stop()
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("determining pending pods, %w", err)
 	}
@@ -110,13 +124,15 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	// Both consolidation candidate pods and pods on already-deleting nodes are migrating off their current nodes, so
 	// the DRA allocator should treat the devices they hold as available for reallocation (and re-allocate their claims).
 	deletingPodUIDs := sets.New(lo.Map(append(candidatePods, deletingNodePods...), func(p *corev1.Pod, _ int) types.UID { return p.UID })...)
+	phaseCtx, stop = measureSimulateSchedulingPhase(ctx, phaseNewScheduler)
 	scheduler, err := provisioner.NewScheduler(
-		log.IntoContext(ctx, operatorlogging.NopLogger),
+		log.IntoContext(phaseCtx, operatorlogging.NopLogger),
 		pods,
 		stateNodes,
 		deletingPodUIDs,
 		opts...,
 	)
+	stop()
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("creating scheduler, %w", err)
 	}
@@ -125,7 +141,9 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 		return client.ObjectKeyFromObject(p), nil
 	})
 
-	results, err := scheduler.Solve(log.IntoContext(ctx, operatorlogging.NopLogger), pods)
+	phaseCtx, stop = measureSimulateSchedulingPhase(ctx, phaseSolve)
+	results, err := scheduler.Solve(log.IntoContext(phaseCtx, operatorlogging.NopLogger), pods)
+	stop()
 	if err != nil {
 		return scheduling.Results{}, fmt.Errorf("scheduling pods, %w", err)
 	}
