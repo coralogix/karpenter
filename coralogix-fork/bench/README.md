@@ -7,16 +7,16 @@ Run from the **repo root**.
 ## 1. Dump a cluster fixture
 
 ```bash
-./coralogix-fork/bench/dump-cluster-fixture.sh cx498
+./coralogix-fork/bench/dump-cluster-fixture.sh example-cluster
 ```
 
-Writes a gitignored fixture to `testdata/clusterfixtures/cx498/`. Terminating resources are dropped at load time. The fixture includes PVCs, PVs, StorageClasses, and CSINodes so volume topology and attachment limits remain part of scheduling simulation. Re-dump fixtures created before these storage resources were added.
+Writes a gitignored fixture to `testdata/clusterfixtures/example-cluster/`. Terminating resources are dropped at load time. The fixture includes PVCs, PVs, StorageClasses, and CSINodes so volume topology and attachment limits remain part of scheduling simulation. Re-dump fixtures created before these storage resources were added.
 
-**Dump time (needs kubectl + AWS EC2 read once):** `instance-types.json` is generated from the AWS provider’s instance-type resolution (same as production `GetInstanceTypes`, without node overlays). Region is stored in `metadata.json`.
+**Dump time (needs kubectl + AWS EC2 read once):** `instance-types.json` is generated from the AWS provider’s instance-type resolution (same as production `GetInstanceTypes`, without node overlays). Region is stored in `metadata.json`; the dump script uses `AWS_REGION` when set, otherwise the first node’s standard `topology.kubernetes.io/region` label. The catalog exporter also accepts an explicit `--region`.
 
-**Benchmark time (fully offline):** `go test` only reads YAML/JSON from the fixture directory and uses the fake cloud provider. It does **not** call AWS or the internet. Do not re-run `build-instance-catalog.go` unless you intend to refresh the catalog from AWS.
+**Benchmark time (fully offline):** `go test` only reads YAML/JSON from the fixture directory and uses the fake cloud provider. It does **not** call AWS or the internet. Do not re-run the instance catalog exporter unless you intend to refresh the catalog from AWS.
 
-If `instance-types.json` is missing, the loader falls back to a tiny node-derived catalog (~30 instance types on cx498) which does not match production.
+If `instance-types.json` is missing, the loader falls back to a small node-derived catalog which does not match production.
 
 **Local smoke test** (committed mini fixture, no dump):
 
@@ -26,10 +26,10 @@ export CLUSTER_FIXTURE_DIR=pkg/bench/clusterfixture/testdata/mini
 
 ## 2. Run the benchmark
 
-The cx498 benchmark runs with `PreferencePolicy=Ignore`, matching the production configuration. Required scheduling constraints remain enforced.
+The example-cluster benchmark runs with `PreferencePolicy=Ignore`, matching the production configuration. Required scheduling constraints remain enforced.
 
 ```bash
-CLUSTER_FIXTURE_DIR=testdata/clusterfixtures/cx498 \
+CLUSTER_FIXTURE_DIR=testdata/clusterfixtures/example-cluster \
 go test -tags=test_performance -run='^$' \
   -bench=BenchmarkEvaluateMoveSet_ClusterFixture -benchtime=30s -count=1 \
   ./pkg/controllers/disruption
@@ -40,10 +40,10 @@ Skipped when `CLUSTER_FIXTURE_DIR` is missing (CI-safe).
 ## 3. Flamegraph
 
 ```bash
-PROFILE=profiles/evaluate_move_set_cx498-$(date +%Y%m%d-%H%M%S).cpu.pprof
+PROFILE=profiles/evaluate_move_set_example-cluster-$(date +%Y%m%d-%H%M%S).cpu.pprof
 mkdir -p profiles
 
-CLUSTER_FIXTURE_DIR=testdata/clusterfixtures/cx498 \
+CLUSTER_FIXTURE_DIR=testdata/clusterfixtures/example-cluster \
 go test -tags=test_performance -run='^$' \
   -bench=BenchmarkEvaluateMoveSet_ClusterFixture -benchtime=30s -count=1 \
   -cpuprofile="$PROFILE" \

@@ -42,12 +42,12 @@ import (
 	awsv1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
 	awscache "github.com/aws/karpenter-provider-aws/pkg/cache"
 	"github.com/aws/karpenter-provider-aws/pkg/fake"
+	awsoptions "github.com/aws/karpenter-provider-aws/pkg/operator/options"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/capacityreservation"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instancetype"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/pricing"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/subnet"
 	awstest "github.com/aws/karpenter-provider-aws/pkg/test"
-	awsoptions "github.com/aws/karpenter-provider-aws/pkg/operator/options"
 
 	"sigs.k8s.io/karpenter/pkg/bench/clusterfixture"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -61,7 +61,7 @@ import (
 func main() {
 	fixtureDir := flag.String("fixture", "", "path to cluster fixture directory")
 	output := flag.String("output", "", "path to write instance-types.json")
-	region := flag.String("region", "", "AWS region (default: from AWS config)")
+	region := flag.String("region", "", "AWS region (default: from AWS_REGION or fixture metadata/node labels)")
 	fromNodes := flag.Bool("from-nodes", false, "build catalog from fixture nodes only (legacy)")
 	flag.Parse()
 
@@ -190,16 +190,16 @@ func loadAWSConfig(ctx context.Context, fixture *clusterfixture.Fixture, regionF
 	if region == "" {
 		region = clusterfixture.RegionFromFixture(fixture)
 	}
-	opts := []func(*config.LoadOptions) error{}
-	if region != "" {
-		opts = append(opts, config.WithRegion(region))
+	if region == "" {
+		return aws.Config{}, fmt.Errorf("AWS region is required (set --region, AWS_REGION, metadata.json region, or a node topology region label)")
 	}
-	cfg, err := config.LoadDefaultConfig(ctx, opts...)
+
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		return aws.Config{}, fmt.Errorf("loading AWS config: %w", err)
 	}
 	if cfg.Region == "" {
-		return aws.Config{}, fmt.Errorf("AWS region is required (set --region, AWS_REGION, metadata.json region, or node region label)")
+		return aws.Config{}, fmt.Errorf("AWS region is required (set --region, AWS_REGION, metadata.json region, or a node topology region label)")
 	}
 	return cfg, nil
 }

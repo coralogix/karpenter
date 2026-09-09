@@ -41,12 +41,12 @@ func init() {
 
 // Run against a dumped cluster fixture:
 //
-//	CLUSTER_FIXTURE_DIR=testdata/clusterfixtures/cx498 \
+//	CLUSTER_FIXTURE_DIR=testdata/clusterfixtures/example-cluster \
 //	go test -tags=test_performance -run='^$' \
 //	  -bench=BenchmarkEvaluateMoveSet_ClusterFixture -benchtime=10s -count=1 \
-//	  -cpuprofile=/tmp/evaluate_move_set_cx498.cpu.pprof ./pkg/controllers/disruption
+//	  -cpuprofile=/tmp/evaluate_move_set_example-cluster.cpu.pprof ./pkg/controllers/disruption
 //
-//	go tool pprof -http=:0 /tmp/evaluate_move_set_cx498.cpu.pprof
+//	go tool pprof -http=:0 /tmp/evaluate_move_set_example-cluster.cpu.pprof
 
 const clusterFixtureDirEnvVar = "CLUSTER_FIXTURE_DIR"
 
@@ -68,7 +68,7 @@ func clusterFixtureDir() string {
 	if dir := os.Getenv(clusterFixtureDirEnvVar); dir != "" {
 		return dir
 	}
-	return "testdata/clusterfixtures/cx498"
+	return "testdata/clusterfixtures/example-cluster"
 }
 
 func getClusterFixtureBench(tb testing.TB) *clusterFixtureBench {
@@ -85,7 +85,7 @@ func getClusterFixtureBench(tb testing.TB) *clusterFixtureBench {
 func newClusterFixtureBench(dir string) (*clusterFixtureBench, error) {
 	dir = clusterfixture.ResolveDir(dir)
 	if !clusterfixture.Exists(dir) {
-		return nil, fmt.Errorf("cluster fixture not found at %q (set %s or run coralogix-fork/bench/dump-cluster-fixture.sh)", dir, clusterFixtureDirEnvVar)
+		return nil, fmt.Errorf("cluster fixture not found at %q (set %s or run the cluster fixture dump script)", dir, clusterFixtureDirEnvVar)
 	}
 
 	fixture, err := clusterfixture.Load(dir)
@@ -134,7 +134,7 @@ func BenchmarkEvaluateMoveSet_ClusterFixture(b *testing.B) {
 	catalog := bench.env.Fixture().Catalog
 	if !catalog.HasFullInstanceCatalog() && bench.env.NodeCount > 10 {
 		b.Fatalf("fixture %q has no full instance-types.json (only node-derived catalog). "+
-			"Run ./coralogix-fork/bench/dump-cluster-fixture.sh once; the benchmark itself does not call AWS.", dir)
+			"Run the cluster fixture dump script once; the benchmark itself does not call AWS.", dir)
 	}
 	totalITs := 0
 	for _, names := range catalog.NodePoolInstanceTypes {

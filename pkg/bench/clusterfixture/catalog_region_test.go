@@ -18,13 +18,15 @@ package clusterfixture
 
 import (
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestRegionFromFixture(t *testing.T) {
 	fixture := &Fixture{
 		Metadata: Metadata{
-			Region:  "eu-west-1",
-			Context: "gateway.coralogix.net-us2-cx498-aws-us-west-2",
+			Region: "eu-west-1",
 		},
 	}
 	if got := RegionFromFixture(fixture); got != "eu-west-1" {
@@ -32,8 +34,11 @@ func TestRegionFromFixture(t *testing.T) {
 	}
 
 	fixture.Metadata.Region = ""
+	fixture.Nodes = []*corev1.Node{{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+		corev1.LabelTopologyRegion: "us-west-2",
+	}}}}
 	if got := RegionFromFixture(fixture); got != "us-west-2" {
-		t.Fatalf("RegionFromFixture() from context = %q, want us-west-2", got)
+		t.Fatalf("RegionFromFixture() from node topology = %q, want us-west-2", got)
 	}
 }
 

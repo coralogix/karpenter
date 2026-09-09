@@ -18,7 +18,6 @@ package clusterfixture
 
 import (
 	"maps"
-	"strings"
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
@@ -79,7 +78,7 @@ func (c *Catalog) HasFullInstanceCatalog() bool {
 	return c != nil && len(c.InstanceTypeSpecs) > 0
 }
 
-// RegionFromFixture returns the AWS region recorded in or inferred from a fixture.
+// RegionFromFixture returns the AWS region recorded in or inferred from node topology in a fixture.
 func RegionFromFixture(f *Fixture) string {
 	if f == nil {
 		return ""
@@ -87,21 +86,10 @@ func RegionFromFixture(f *Fixture) string {
 	if f.Metadata.Region != "" {
 		return f.Metadata.Region
 	}
-	if r := regionFromContext(f.Metadata.Context); r != "" {
-		return r
-	}
 	for _, node := range f.Nodes {
 		if r := node.Labels[corev1.LabelTopologyRegion]; r != "" {
 			return r
 		}
-	}
-	return ""
-}
-
-func regionFromContext(context string) string {
-	const marker = "-aws-"
-	if i := strings.Index(context, marker); i >= 0 {
-		return context[i+len(marker):]
 	}
 	return ""
 }

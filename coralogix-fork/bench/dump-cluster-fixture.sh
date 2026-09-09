@@ -2,14 +2,19 @@
 # Dump cluster state for evaluateMoveSet cluster-fixture benchmarks.
 #
 # Usage:
-#   ./coralogix-fork/bench/dump-cluster-fixture.sh [cluster-name] [output-dir]
+#   ./coralogix-fork/bench/dump-cluster-fixture.sh <cluster-name> [output-dir]
 #
 # Prerequisites:
-#   - kubectl context pointed at the target cluster (e.g. cx498)
+#   - kubectl context pointed at the target cluster
 #   - go toolchain for instance catalog generation
 set -euo pipefail
 
-CLUSTER_NAME="${1:-cx498}"
+if [ "$#" -lt 1 ] || [ -z "${1}" ]; then
+  echo "usage: $0 <cluster-name> [output-dir]" >&2
+  exit 2
+fi
+
+CLUSTER_NAME="$1"
 OUT_DIR="${2:-testdata/clusterfixtures/${CLUSTER_NAME}}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
@@ -46,7 +51,7 @@ POD_COUNT=$(kubectl get pods -A --no-headers 2>/dev/null | wc -l | tr -d ' ')
 PDB_COUNT=$(kubectl get pdb -A --no-headers 2>/dev/null | wc -l | tr -d ' ')
 NODEPOOL_COUNT=$(kubectl get nodepools.karpenter.sh --no-headers 2>/dev/null | wc -l | tr -d ' ')
 
-REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null)}"
+REGION="${AWS_REGION:-}"
 if [ -z "${REGION}" ]; then
   REGION="$(kubectl get nodes -o jsonpath='{.items[0].metadata.labels.topology\.kubernetes\.io/region}' 2>/dev/null || true)"
 fi
