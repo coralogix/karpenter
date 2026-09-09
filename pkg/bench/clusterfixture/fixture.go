@@ -32,14 +32,15 @@ import (
 
 // Metadata describes a dumped cluster fixture.
 type Metadata struct {
-	Cluster       string `json:"cluster"`
-	Context       string `json:"context"`
-	Region        string `json:"region"`
-	DumpedAt      string `json:"dumpedAt"`
-	NodeCount     int    `json:"nodeCount"`
-	PodCount      int    `json:"podCount"`
-	PDBCount      int    `json:"pdbCount"`
-	NodePoolCount int    `json:"nodePoolCount"`
+	Cluster        string `json:"cluster"`
+	Context        string `json:"context"`
+	Region         string `json:"region"`
+	DumpedAt       string `json:"dumpedAt"`
+	NodeCount      int    `json:"nodeCount"`
+	NamespaceCount int    `json:"namespaceCount"`
+	PodCount       int    `json:"podCount"`
+	PDBCount       int    `json:"pdbCount"`
+	NodePoolCount  int    `json:"nodePoolCount"`
 }
 
 // Fixture holds parsed cluster objects from a dump directory.
@@ -49,6 +50,7 @@ type Fixture struct {
 	Metadata Metadata
 
 	Nodes      []*corev1.Node
+	Namespaces []*corev1.Namespace
 	Pods       []*corev1.Pod
 	DaemonSets []*appsv1.DaemonSet
 	PDBs       []*policyv1.PodDisruptionBudget
@@ -126,9 +128,13 @@ func Load(dir string) (*Fixture, error) {
 	if fixture.Nodes, err = decodeYAMLFile[*corev1.Node](filepath.Join(dir, "nodes.yaml")); err != nil {
 		return nil, fmt.Errorf("decoding nodes: %w", err)
 	}
+	if fixture.Namespaces, err = decodeYAMLFile[*corev1.Namespace](filepath.Join(dir, "namespaces.yaml")); err != nil {
+		return nil, fmt.Errorf("decoding namespaces: %w", err)
+	}
 	if fixture.Pods, err = decodeYAMLFile[*corev1.Pod](filepath.Join(dir, "pods.yaml")); err != nil {
 		return nil, fmt.Errorf("decoding pods: %w", err)
 	}
+	ensurePodUIDs(fixture.Pods)
 	if fixture.DaemonSets, err = decodeYAMLFile[*appsv1.DaemonSet](filepath.Join(dir, "daemonsets.yaml")); err != nil {
 		return nil, fmt.Errorf("decoding daemonsets: %w", err)
 	}

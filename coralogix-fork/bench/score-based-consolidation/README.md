@@ -10,7 +10,7 @@ Run from the **repo root**.
 ./coralogix-fork/bench/score-based-consolidation/dump-fixture.sh example-cluster
 ```
 
-Writes a gitignored fixture to `testdata/clusterfixtures/example-cluster/`. Terminating resources are dropped at load time. The fixture includes PVCs, PVs, StorageClasses, and CSINodes so volume topology and attachment limits remain part of scheduling simulation. Re-dump fixtures created before these storage resources were added.
+Writes a gitignored fixture to `testdata/clusterfixtures/example-cluster/`. Terminating resources are dropped at load time. The fixture includes Namespaces, PVCs, PVs, StorageClasses, and CSINodes so namespace selectors, volume topology, and attachment limits remain part of scheduling simulation. Re-dump fixtures created before these resources were added.
 
 **Dump time (needs kubectl + AWS EC2 read once):** `instance-types.json` is generated from the AWS provider’s instance-type resolution (same as production `GetInstanceTypes`, without node overlays). Region is stored in `metadata.json`; the dump script uses `AWS_REGION` when set, otherwise the first node’s standard `topology.kubernetes.io/region` label. The catalog exporter also accepts an explicit `--region`.
 

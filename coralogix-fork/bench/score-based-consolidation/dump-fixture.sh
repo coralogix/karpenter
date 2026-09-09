@@ -36,6 +36,7 @@ echo "Dumping cluster fixture to ${OUT_DIR}"
 echo "kubectl context: $(kubectl config current-context 2>/dev/null || echo unknown)"
 
 dump_to "${OUT_DIR}/nodes.yaml" kubectl get nodes -o yaml
+dump_to "${OUT_DIR}/namespaces.yaml" kubectl get namespaces -o yaml
 dump_to "${OUT_DIR}/pods.yaml" kubectl get pods -A -o yaml
 dump_to "${OUT_DIR}/daemonsets.yaml" kubectl get daemonsets -A -o yaml
 dump_to "${OUT_DIR}/pdbs.yaml" kubectl get pdb -A -o yaml
@@ -48,6 +49,7 @@ dump_to "${OUT_DIR}/storageclasses.yaml" kubectl get storageclasses -o yaml
 dump_to "${OUT_DIR}/csinodes.yaml" kubectl get csinodes -o yaml
 
 NODE_COUNT=$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')
+NAMESPACE_COUNT=$(kubectl get namespaces --no-headers 2>/dev/null | wc -l | tr -d ' ')
 POD_COUNT=$(kubectl get pods -A --no-headers 2>/dev/null | wc -l | tr -d ' ')
 PDB_COUNT=$(kubectl get pdb -A --no-headers 2>/dev/null | wc -l | tr -d ' ')
 NODEPOOL_COUNT=$(kubectl get nodepools.karpenter.sh --no-headers 2>/dev/null | wc -l | tr -d ' ')
@@ -68,6 +70,7 @@ cat >"${OUT_DIR}/metadata.json" <<EOF
   "region": "${REGION}",
   "dumpedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
   "nodeCount": ${NODE_COUNT},
+  "namespaceCount": ${NAMESPACE_COUNT},
   "podCount": ${POD_COUNT},
   "pdbCount": ${PDB_COUNT},
   "nodePoolCount": ${NODEPOOL_COUNT}

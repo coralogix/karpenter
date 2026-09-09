@@ -71,6 +71,42 @@ func TestObjectIndexListPods(t *testing.T) {
 	})
 }
 
+func TestObjectIndexListNamespacesByLabel(t *testing.T) {
+	idx := newObjectIndex(&Fixture{
+		Namespaces: []*corev1.Namespace{
+			{ObjectMeta: metav1.ObjectMeta{Name: "selected", Labels: map[string]string{"team": "platform"}}},
+			{ObjectMeta: metav1.ObjectMeta{Name: "other", Labels: map[string]string{"team": "application"}}},
+		},
+		Pods: []*corev1.Pod{
+			{ObjectMeta: metav1.ObjectMeta{Name: "pod-only", Namespace: "pod-only"}},
+		},
+	})
+
+	namespaceList := &corev1.NamespaceList{}
+	if err := idx.list(namespaceList, client.ListOptions{
+		LabelSelector: labels.Set{"team": "platform"}.AsSelector(),
+	}); err != nil {
+		t.Fatalf("list namespaces: %v", err)
+	}
+	if len(namespaceList.Items) != 1 || namespaceList.Items[0].Name != "selected" {
+		t.Fatalf("filtered namespaces = %#v, want selected", namespaceList.Items)
+	}
+
+	namespace := &corev1.Namespace{}
+	if err := idx.get(client.ObjectKey{Name: "selected"}, namespace); err != nil {
+		t.Fatalf("get namespace: %v", err)
+	}
+	if namespace.Labels["team"] != "platform" {
+		t.Fatalf("namespace labels = %#v, want team=platform", namespace.Labels)
+	}
+
+	// Pod namespaces without a dumped Namespace object remain available as
+	// unlabeled synthetic objects for fixtures created before namespaces.yaml.
+	if err := idx.get(client.ObjectKey{Name: "pod-only"}, &corev1.Namespace{}); err != nil {
+		t.Fatalf("get synthesized namespace: %v", err)
+	}
+}
+
 func fieldsOne(key, value string) fields.Selector {
 	sel, err := fields.ParseSelector(key + "=" + value)
 	if err != nil {

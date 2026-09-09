@@ -177,6 +177,7 @@ func (f *Fixture) filterTerminating() {
 	f.PDBs = filterLiveObjects(f.PDBs)
 	f.NodePools = filterLiveObjects(f.NodePools)
 	f.NodeClaims = filterLiveObjects(f.NodeClaims)
+	f.Namespaces = filterLiveObjects(f.Namespaces)
 	f.PersistentVolumeClaims = filterLiveObjects(f.PersistentVolumeClaims)
 	f.PersistentVolumes = filterLiveObjects(f.PersistentVolumes)
 	f.StorageClasses = filterLiveObjects(f.StorageClasses)
@@ -212,9 +213,10 @@ func slimContainers(containers []corev1.Container) []corev1.Container {
 	out := make([]corev1.Container, len(containers))
 	for i, c := range containers {
 		out[i] = corev1.Container{
-			Name:      c.Name,
-			Resources: c.Resources,
-			Ports:     c.Ports,
+			Name:          c.Name,
+			Resources:     c.Resources,
+			Ports:         c.Ports,
+			RestartPolicy: c.RestartPolicy,
 		}
 	}
 	return out
@@ -232,6 +234,7 @@ func (f *Fixture) indexPodsByNode() {
 
 func (f *Fixture) normalize() {
 	f.filterTerminating()
+	ensurePodUIDs(f.Pods)
 	f.slimPodsForBench()
 	f.indexPodsByNode()
 	f.normalizeNodeClassRefs()
@@ -279,9 +282,13 @@ func (f *Fixture) annotateScoreBasedPools() {
 	}
 }
 
+//nolint:gocyclo
 func (f *Fixture) clientObjects() []client.Object {
 	var objects []client.Object
 	for _, obj := range f.Nodes {
+		objects = append(objects, obj.DeepCopy())
+	}
+	for _, obj := range f.Namespaces {
 		objects = append(objects, obj.DeepCopy())
 	}
 	for _, obj := range f.Pods {

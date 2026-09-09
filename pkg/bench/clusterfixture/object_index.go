@@ -41,6 +41,7 @@ type objectIndex struct {
 	podsByNamespace        map[string][]runtime.Object
 	podsByNodeName         map[string][]runtime.Object
 	nodesByName            map[string]runtime.Object
+	namespacesByName       map[string]runtime.Object
 	daemonSets             []runtime.Object
 	pdbs                   []runtime.Object
 	nodePools              []runtime.Object
@@ -55,9 +56,10 @@ type objectIndex struct {
 //nolint:gocyclo
 func newObjectIndex(f *Fixture) *objectIndex {
 	idx := &objectIndex{
-		podsByNamespace: map[string][]runtime.Object{},
-		podsByNodeName:  map[string][]runtime.Object{},
-		nodesByName:     map[string]runtime.Object{},
+		podsByNamespace:  map[string][]runtime.Object{},
+		podsByNodeName:   map[string][]runtime.Object{},
+		nodesByName:      map[string]runtime.Object{},
+		namespacesByName: map[string]runtime.Object{},
 	}
 
 	for _, pod := range f.Pods {
@@ -68,6 +70,10 @@ func newObjectIndex(f *Fixture) *objectIndex {
 	}
 	for _, node := range f.Nodes {
 		idx.nodesByName[node.Name] = runtimeObject(node)
+	}
+	for _, namespace := range f.Namespaces {
+		idx.namespacesByName[namespace.Name] = runtimeObject(namespace)
+		idx.namespaces = append(idx.namespaces, runtimeObject(namespace))
 	}
 	for _, ds := range f.DaemonSets {
 		idx.daemonSets = append(idx.daemonSets, runtimeObject(ds))
@@ -94,9 +100,12 @@ func newObjectIndex(f *Fixture) *objectIndex {
 		idx.csiNodes = append(idx.csiNodes, runtimeObject(csiNode))
 	}
 	for ns := range idx.podsByNamespace {
-		idx.namespaces = append(idx.namespaces, runtimeObject(&corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{Name: ns},
-		}))
+		if _, ok := idx.namespacesByName[ns]; ok {
+			continue
+		}
+		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+		idx.namespacesByName[ns] = runtimeObject(namespace)
+		idx.namespaces = append(idx.namespaces, runtimeObject(namespace))
 	}
 	return idx
 }
@@ -112,6 +121,12 @@ func (idx *objectIndex) get(key client.ObjectKey, obj client.Object) error {
 		src, ok := idx.nodesByName[key.Name]
 		if !ok {
 			return apierrors.NewNotFound(corev1.Resource("nodes"), key.Name)
+		}
+		return assignObject(dst, src)
+	case *corev1.Namespace:
+		src, ok := idx.namespacesByName[key.Name]
+		if !ok {
+			return apierrors.NewNotFound(corev1.Resource("namespaces"), key.Name)
 		}
 		return assignObject(dst, src)
 	case *corev1.Pod:
@@ -183,9 +198,6 @@ func (idx *objectIndex) list(list client.ObjectList, opts client.ListOptions) er
 	case *storagev1.CSINodeList:
 		return idx.listInto(dst, idx.csiNodes, csiNodeFieldSet, csiNodeLabels, opts)
 	case *corev1.NamespaceList:
-		if opts.LabelSelector != nil && !opts.LabelSelector.Empty() {
-			return errNotIndexed
-		}
 		return idx.listInto(dst, idx.namespaces, namespaceFieldSet, namespaceLabels, opts)
 	default:
 		return errNotIndexed

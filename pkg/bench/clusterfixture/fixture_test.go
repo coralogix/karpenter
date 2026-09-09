@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes/scheme"
+	resourcehelper "k8s.io/component-helpers/resource"
 	volumehelpers "k8s.io/component-helpers/storage/volume"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -61,6 +62,9 @@ func TestLoadMiniFixture(t *testing.T) {
 	}
 	if len(fixture.Pods) != 2 {
 		t.Fatalf("pods = %d, want 2", len(fixture.Pods))
+	}
+	if len(fixture.Namespaces) != 1 || fixture.Namespaces[0].Labels["team"] != "platform" {
+		t.Fatalf("namespaces = %#v, want platform-labeled default namespace", fixture.Namespaces)
 	}
 	if fixture.Catalog == nil || len(fixture.Catalog.InstanceTypes) == 0 {
 		t.Fatal("expected synthesized instance type catalog")
@@ -187,6 +191,38 @@ func TestSlimPodPreservesSchedulingFields(t *testing.T) {
 	}
 	if got := slim.Spec.Containers[0].Ports; len(got) != 1 || got[0].HostPort != 8080 {
 		t.Fatalf("container ports = %#v, want host port 8080 preserved", got)
+	}
+}
+
+func TestSlimPodPreservesNativeSidecarResourceAccounting(t *testing.T) {
+	restartPolicy := corev1.ContainerRestartPolicyAlways
+	pod := &corev1.Pod{Spec: corev1.PodSpec{
+		Containers: []corev1.Container{{
+			Name: "app",
+			Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+				corev1.ResourceCPU: resource.MustParse("100m"),
+			}},
+		}},
+		InitContainers: []corev1.Container{{
+			Name:          "sidecar",
+			RestartPolicy: &restartPolicy,
+			Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+				corev1.ResourceCPU: resource.MustParse("200m"),
+			}},
+		}},
+	}}
+
+	want := resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{})
+	slim := slimPodForBench(pod)
+	if slim.Spec.InitContainers[0].RestartPolicy == nil || *slim.Spec.InitContainers[0].RestartPolicy != restartPolicy {
+		t.Fatalf("init container restart policy = %v, want %q", slim.Spec.InitContainers[0].RestartPolicy, restartPolicy)
+	}
+	got := resourcehelper.PodRequests(slim, resourcehelper.PodResourcesOptions{})
+	if got.Cpu().Cmp(*want.Cpu()) != 0 {
+		t.Fatalf("pod CPU requests after slimming = %s, want %s", got.Cpu(), want.Cpu())
+	}
+	if got.Cpu().Cmp(resource.MustParse("300m")) != 0 {
+		t.Fatalf("pod CPU requests = %s, want native sidecar accounting of 300m", got.Cpu())
 	}
 }
 

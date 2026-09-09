@@ -23,6 +23,7 @@ import (
 	"os"
 	"reflect"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/yaml"
@@ -114,8 +115,15 @@ func decodeObject[T client.Object](raw []byte) (T, bool, error) {
 }
 
 func sanitizeObject(obj client.Object) {
+	uid := obj.GetUID()
 	obj.SetManagedFields(nil)
 	obj.SetResourceVersion("")
 	obj.SetUID("")
 	obj.SetGeneration(0)
+	// Pod UIDs are used as identity keys by the scheduler. Keep a dumped UID
+	// when available; missing or duplicate UIDs are filled in during fixture
+	// normalization.
+	if _, ok := obj.(*corev1.Pod); ok {
+		obj.SetUID(uid)
+	}
 }
