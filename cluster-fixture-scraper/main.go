@@ -25,6 +25,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/go-logr/logr"
+	ctrlLog "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 type options struct {
@@ -37,6 +40,8 @@ type options struct {
 }
 
 func main() {
+	ctrlLog.SetLogger(logr.Discard())
+
 	var opts options
 	flags := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
