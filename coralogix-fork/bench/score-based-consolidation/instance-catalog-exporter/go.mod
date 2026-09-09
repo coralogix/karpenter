@@ -1,8 +1,8 @@
-module sigs.k8s.io/karpenter/hack/bench/catalogtool
+module sigs.k8s.io/karpenter/coralogix-fork/bench/score-based-consolidation/instance-catalog-exporter
 
 go 1.25.7
 
-replace sigs.k8s.io/karpenter => ../../..
+replace sigs.k8s.io/karpenter => ../../../../
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.1

@@ -7,7 +7,7 @@ Run from the **repo root**.
 ## 1. Dump a cluster fixture
 
 ```bash
-./coralogix-fork/bench/dump-cluster-fixture.sh example-cluster
+./coralogix-fork/bench/score-based-consolidation/dump-fixture.sh example-cluster
 ```
 
 Writes a gitignored fixture to `testdata/clusterfixtures/example-cluster/`. Terminating resources are dropped at load time. The fixture includes PVCs, PVs, StorageClasses, and CSINodes so volume topology and attachment limits remain part of scheduling simulation. Re-dump fixtures created before these storage resources were added.
@@ -26,7 +26,7 @@ export CLUSTER_FIXTURE_DIR=pkg/bench/clusterfixture/testdata/mini
 
 ## 2. Run the benchmark
 
-The example-cluster benchmark runs with `PreferencePolicy=Ignore`, matching the production configuration. Required scheduling constraints remain enforced.
+The benchmark runs with `PreferencePolicy=Ignore`. Required scheduling constraints remain enforced.
 
 ```bash
 CLUSTER_FIXTURE_DIR=testdata/clusterfixtures/example-cluster \

@@ -85,7 +85,7 @@ func getClusterFixtureBench(tb testing.TB) *clusterFixtureBench {
 func newClusterFixtureBench(dir string) (*clusterFixtureBench, error) {
 	dir = clusterfixture.ResolveDir(dir)
 	if !clusterfixture.Exists(dir) {
-		return nil, fmt.Errorf("cluster fixture not found at %q (set %s or run the cluster fixture dump script)", dir, clusterFixtureDirEnvVar)
+		return nil, fmt.Errorf("cluster fixture not found at %q (set %s or run coralogix-fork/bench/score-based-consolidation/dump-fixture.sh)", dir, clusterFixtureDirEnvVar)
 	}
 
 	fixture, err := clusterfixture.Load(dir)

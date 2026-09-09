@@ -2,7 +2,7 @@
 # Dump cluster state for evaluateMoveSet cluster-fixture benchmarks.
 #
 # Usage:
-#   ./coralogix-fork/bench/dump-cluster-fixture.sh <cluster-name> [output-dir]
+#   ./coralogix-fork/bench/score-based-consolidation/dump-fixture.sh <cluster-name> [output-dir]
 #
 # Prerequisites:
 #   - kubectl context pointed at the target cluster
@@ -16,9 +16,10 @@ fi
 
 CLUSTER_NAME="$1"
 OUT_DIR="${2:-testdata/clusterfixtures/${CLUSTER_NAME}}"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 
 mkdir -p "${OUT_DIR}"
+OUT_DIR="$(cd "${OUT_DIR}" && pwd)"
 
 dump_to() {
   local outfile=$1
@@ -56,7 +57,7 @@ if [ -z "${REGION}" ]; then
   REGION="$(kubectl get nodes -o jsonpath='{.items[0].metadata.labels.topology\.kubernetes\.io/region}' 2>/dev/null || true)"
 fi
 if [ -z "${REGION}" ]; then
-  echo "error: could not determine AWS region (set AWS_REGION or configure AWS CLI)" >&2
+  echo "error: could not determine AWS region (set AWS_REGION or label a node with topology.kubernetes.io/region)" >&2
   exit 1
 fi
 
@@ -75,8 +76,8 @@ EOF
 echo "wrote ${OUT_DIR}/metadata.json"
 
 (
-  cd "${REPO_ROOT}"
-  go run ./hack/bench/build-instance-catalog.go \
+  cd "${REPO_ROOT}/coralogix-fork/bench/score-based-consolidation/instance-catalog-exporter"
+  go run . \
     --fixture "${OUT_DIR}" \
     --output "${OUT_DIR}/instance-types.json" \
     --region "${REGION}"

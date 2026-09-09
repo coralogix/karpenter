@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// catalogtool exports a production-scale instance type catalog for cluster fixture benchmarks.
+// instance-catalog-exporter exports a production-scale instance type catalog for cluster fixture benchmarks.
 //
 // It resolves instance types the same way Karpenter does in production: EC2 DescribeInstanceTypes
 // plus offerings for each EC2NodeClass subnet zone. Node overlays are not applied.
@@ -66,7 +66,7 @@ func main() {
 	flag.Parse()
 
 	if *fixtureDir == "" || *output == "" {
-		fmt.Fprintln(os.Stderr, "usage: catalogtool --fixture <dir> --output <file>")
+		fmt.Fprintln(os.Stderr, "usage: instance-catalog-exporter --fixture <dir> --output <file>")
 		os.Exit(2)
 	}
 

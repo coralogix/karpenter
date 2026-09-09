@@ -10,7 +10,7 @@ report.json
 *__debug_*
 bin/
 
-# Local cluster benchmark fixtures (see coralogix-fork/bench/README.md)
+# Local cluster benchmark fixtures (see coralogix-fork/bench/score-based-consolidation/README.md)
 testdata/clusterfixtures/
 profiles/
 
