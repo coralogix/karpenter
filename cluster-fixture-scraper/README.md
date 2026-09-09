@@ -5,6 +5,11 @@ the AWS instance catalog used by the
 `BenchmarkSimulateScheduling_ClusterFixture` benchmark. It is a single command
 so the Kubernetes snapshot and production-like catalog are generated together.
 
+The scraper uses the current Kubernetes context from your kubeconfig and the
+active AWS SDK configuration and credentials, including `AWS_PROFILE` when it
+is set. Use `--context`, `--kubeconfig`, or `--region` to override the relevant
+defaults.
+
 Run it from the repository root:
 
 ```bash
