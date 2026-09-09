@@ -41,6 +41,8 @@ func init() {
 
 // Run against a dumped cluster fixture:
 //
+//	go -C cluster-fixture-scraper run . --cluster example-cluster
+//
 //	CLUSTER_FIXTURE_DIR=testdata/clusterfixtures/example-cluster \
 //	go test -tags=test_performance -run='^$' \
 //	  -bench=BenchmarkSimulateScheduling_ClusterFixture -benchtime=10s -count=1 \
@@ -84,7 +86,7 @@ func getClusterFixtureBench(tb testing.TB) *clusterFixtureBench {
 func newClusterFixtureBench(dir string) (*clusterFixtureBench, error) {
 	dir = clusterfixture.ResolveDir(dir)
 	if !clusterfixture.Exists(dir) {
-		return nil, fmt.Errorf("cluster fixture not found at %q (set %s or run coralogix-fork/bench/score-based-consolidation/dump-fixture.sh)", dir, clusterFixtureDirEnvVar)
+		return nil, fmt.Errorf("cluster fixture not found at %q (set %s or run go -C cluster-fixture-scraper run . --cluster <cluster-name>)", dir, clusterFixtureDirEnvVar)
 	}
 
 	fixture, err := clusterfixture.Load(dir)
@@ -132,7 +134,7 @@ func BenchmarkSimulateScheduling_ClusterFixture(b *testing.B) {
 	catalog := bench.env.Fixture().Catalog
 	if !catalog.HasFullInstanceCatalog() && bench.env.NodeCount > 10 {
 		b.Fatalf("fixture %q has no full instance-types.json (only node-derived catalog). "+
-			"Run the cluster fixture dump script once; the benchmark itself does not call AWS.", dir)
+			"Run the cluster-fixture-scraper command once; the benchmark itself does not call AWS.", dir)
 	}
 	totalITs := 0
 	for _, names := range catalog.NodePoolInstanceTypes {

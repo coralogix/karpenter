@@ -1,8 +1,8 @@
-module sigs.k8s.io/karpenter/coralogix-fork/bench/score-based-consolidation/instance-catalog-exporter
+module sigs.k8s.io/karpenter/cluster-fixture-scraper
 
 go 1.25.7
 
-replace sigs.k8s.io/karpenter => ../../../../
+replace sigs.k8s.io/karpenter => ../
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.1
@@ -10,11 +10,13 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.279.2
 	github.com/aws/karpenter-provider-aws v1.9.0
 	github.com/patrickmn/go-cache v2.1.0+incompatible
+	k8s.io/api v0.35.0
 	k8s.io/apimachinery v0.35.0
 	k8s.io/client-go v0.35.0
 	k8s.io/utils v0.0.0-20251222233032-718f0e51e6d2
 	sigs.k8s.io/controller-runtime v0.22.4
 	sigs.k8s.io/karpenter v1.9.0
+	sigs.k8s.io/yaml v1.6.0
 )
 
 require (
@@ -123,7 +125,6 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
-	k8s.io/api v0.35.0 // indirect
 	k8s.io/apiextensions-apiserver v0.35.0 // indirect
 	k8s.io/cloud-provider v0.35.0 // indirect
 	k8s.io/component-base v0.35.0 // indirect
@@ -134,5 +135,4 @@ require (
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.1 // indirect
-	sigs.k8s.io/yaml v1.6.0 // indirect
 )

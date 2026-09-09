@@ -14,18 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// instance-catalog-exporter exports a production-scale instance type catalog for cluster fixture benchmarks.
-//
-// It resolves instance types the same way Karpenter does in production: EC2 DescribeInstanceTypes
-// plus offerings for each EC2NodeClass subnet zone. Node overlays are not applied.
 package main
 
 import (
 	"context"
-	"encoding/json"
-	"flag"
 	"fmt"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -58,51 +51,10 @@ import (
 	_ "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
-func main() {
-	fixtureDir := flag.String("fixture", "", "path to cluster fixture directory")
-	output := flag.String("output", "", "path to write instance-types.json")
-	region := flag.String("region", "", "AWS region (default: from AWS_REGION or fixture metadata/node labels)")
-	fromNodes := flag.Bool("from-nodes", false, "build catalog from fixture nodes only (legacy)")
-	flag.Parse()
-
-	if *fixtureDir == "" || *output == "" {
-		fmt.Fprintln(os.Stderr, "usage: instance-catalog-exporter --fixture <dir> --output <file>")
-		os.Exit(2)
-	}
-
-	fixture, err := clusterfixture.Load(*fixtureDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "loading fixture: %v\n", err)
-		os.Exit(1)
-	}
-
-	var catalog *clusterfixture.Catalog
-	if *fromNodes {
-		catalog = clusterfixture.BuildCatalog(fixture)
-	} else {
-		catalog, err = exportFromCloudProvider(context.Background(), fixture, *region)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "exporting instance catalog: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-	data, err := json.MarshalIndent(catalog, "", "  ")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "marshaling catalog: %v\n", err)
-		os.Exit(1)
-	}
-	if err := os.WriteFile(*output, data, 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "writing catalog: %v\n", err)
-		os.Exit(1)
-	}
-
-	total := 0
-	for _, names := range catalog.NodePoolInstanceTypes {
-		total += len(names)
-	}
-	fmt.Printf("wrote %s (%d instance type specs, %d node pool assignments)\n", *output, len(catalog.InstanceTypeSpecs), total)
-}
+// catalogExporter is a seam for command tests. Production uses
+// exportFromCloudProvider, while tests can provide a deterministic catalog
+// without making AWS API calls.
+var catalogExporter = exportFromCloudProvider
 
 func exportFromCloudProvider(ctx context.Context, fixture *clusterfixture.Fixture, region string) (*clusterfixture.Catalog, error) {
 	ctx = coreoptions.ToContext(ctx, coretest.Options())
@@ -128,7 +80,7 @@ func exportFromCloudProvider(ctx context.Context, fixture *clusterfixture.Fixtur
 		WithObjects(objects...).
 		Build()
 
-	cfg, err := loadAWSConfig(ctx, fixture, region)
+	cfg, err := loadAWSConfig(ctx, region)
 	if err != nil {
 		return nil, err
 	}
@@ -182,24 +134,16 @@ func exportFromCloudProvider(ctx context.Context, fixture *clusterfixture.Fixtur
 	return clusterfixture.BuildCatalogFromInstanceTypes(perPool), nil
 }
 
-func loadAWSConfig(ctx context.Context, fixture *clusterfixture.Fixture, regionFlag string) (aws.Config, error) {
-	region := regionFlag
+func loadAWSConfig(ctx context.Context, region string) (aws.Config, error) {
 	if region == "" {
-		region = os.Getenv("AWS_REGION")
+		return aws.Config{}, fmt.Errorf("AWS region is required")
 	}
-	if region == "" {
-		region = clusterfixture.RegionFromFixture(fixture)
-	}
-	if region == "" {
-		return aws.Config{}, fmt.Errorf("AWS region is required (set --region, AWS_REGION, metadata.json region, or a node topology region label)")
-	}
-
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		return aws.Config{}, fmt.Errorf("loading AWS config: %w", err)
 	}
 	if cfg.Region == "" {
-		return aws.Config{}, fmt.Errorf("AWS region is required (set --region, AWS_REGION, metadata.json region, or a node topology region label)")
+		return aws.Config{}, fmt.Errorf("AWS region is required")
 	}
 	return cfg, nil
 }
