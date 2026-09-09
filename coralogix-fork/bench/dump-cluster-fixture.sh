@@ -36,6 +36,10 @@ dump_to "${OUT_DIR}/pdbs.yaml" kubectl get pdb -A -o yaml
 dump_to "${OUT_DIR}/nodepools.yaml" kubectl get nodepools.karpenter.sh -o yaml
 dump_to "${OUT_DIR}/nodeclaims.yaml" kubectl get nodeclaims.karpenter.sh -A -o yaml
 dump_to "${OUT_DIR}/nodeclasses.yaml" kubectl get ec2nodeclasses.karpenter.k8s.aws -o yaml
+dump_to "${OUT_DIR}/persistentvolumeclaims.yaml" kubectl get persistentvolumeclaims -A -o yaml
+dump_to "${OUT_DIR}/persistentvolumes.yaml" kubectl get persistentvolumes -o yaml
+dump_to "${OUT_DIR}/storageclasses.yaml" kubectl get storageclasses -o yaml
+dump_to "${OUT_DIR}/csinodes.yaml" kubectl get csinodes -o yaml
 
 NODE_COUNT=$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')
 POD_COUNT=$(kubectl get pods -A --no-headers 2>/dev/null | wc -l | tr -d ' ')

@@ -25,6 +25,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	storagev1 "k8s.io/api/storage/v1"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
@@ -53,6 +54,11 @@ type Fixture struct {
 	PDBs       []*policyv1.PodDisruptionBudget
 	NodePools  []*v1.NodePool
 	NodeClaims []*v1.NodeClaim
+
+	PersistentVolumeClaims []*corev1.PersistentVolumeClaim
+	PersistentVolumes      []*corev1.PersistentVolume
+	StorageClasses         []*storagev1.StorageClass
+	CSINodes               []*storagev1.CSINode
 
 	Catalog *Catalog
 
@@ -132,6 +138,18 @@ func Load(dir string) (*Fixture, error) {
 	}
 	if fixture.NodeClaims, err = decodeYAMLFile[*v1.NodeClaim](filepath.Join(dir, "nodeclaims.yaml")); err != nil {
 		return nil, fmt.Errorf("decoding nodeclaims: %w", err)
+	}
+	if fixture.PersistentVolumeClaims, err = decodeYAMLFile[*corev1.PersistentVolumeClaim](filepath.Join(dir, "persistentvolumeclaims.yaml")); err != nil {
+		return nil, fmt.Errorf("decoding persistentvolumeclaims: %w", err)
+	}
+	if fixture.PersistentVolumes, err = decodeYAMLFile[*corev1.PersistentVolume](filepath.Join(dir, "persistentvolumes.yaml")); err != nil {
+		return nil, fmt.Errorf("decoding persistentvolumes: %w", err)
+	}
+	if fixture.StorageClasses, err = decodeYAMLFile[*storagev1.StorageClass](filepath.Join(dir, "storageclasses.yaml")); err != nil {
+		return nil, fmt.Errorf("decoding storageclasses: %w", err)
+	}
+	if fixture.CSINodes, err = decodeYAMLFile[*storagev1.CSINode](filepath.Join(dir, "csinodes.yaml")); err != nil {
+		return nil, fmt.Errorf("decoding csinodes: %w", err)
 	}
 
 	catalogPath := filepath.Join(dir, "instance-types.json")

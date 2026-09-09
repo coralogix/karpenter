@@ -118,6 +118,7 @@ verify: ## Verify code. Includes codegen, docgen, dependencies, linting, formatt
 	@perl -i -pe 's/sets.Set/sets.Set[string]/g' pkg/scheduling/zz_generated.deepcopy.go
 	go tool -modfile=go.tools.mod nwa config -c add
 	go vet ./...
+	cd hack/bench/catalogtool && go mod tidy -diff && go test ./...
 	go tool -modfile=go.tools.mod golangci-lint-kube-api-linter run
 	cd kwok/charts && go tool -modfile=../../go.tools.mod helm-docs
 	@git diff --quiet ||\

@@ -18,17 +18,27 @@ package clusterfixture
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes/scheme"
+	volumehelpers "k8s.io/component-helpers/storage/volume"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/yaml"
 
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	provisioningscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 )
 
@@ -152,5 +162,161 @@ func TestBuildEnvSkipsTerminatingPods(t *testing.T) {
 	}
 	if env.PodCount != 1 {
 		t.Fatalf("PodCount = %d, want 1 after filtering terminating pod", env.PodCount)
+	}
+}
+
+func TestSlimPodPreservesSchedulingFields(t *testing.T) {
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: "data",
+				}},
+			}},
+			Containers: []corev1.Container{{
+				Name:  "app",
+				Ports: []corev1.ContainerPort{{ContainerPort: 8080, HostPort: 8080}},
+			}},
+		},
+	}
+
+	slim := slimPodForBench(pod)
+	if len(slim.Spec.Volumes) != 1 || slim.Spec.Volumes[0].PersistentVolumeClaim == nil {
+		t.Fatalf("volumes = %#v, want PVC volume preserved", slim.Spec.Volumes)
+	}
+	if got := slim.Spec.Containers[0].Ports; len(got) != 1 || got[0].HostPort != 8080 {
+		t.Fatalf("container ports = %#v, want host port 8080 preserved", got)
+	}
+}
+
+func TestLoadAndBuildEnvPreservesStorageSchedulingState(t *testing.T) {
+	const (
+		nodeName     = "node-a"
+		podNamespace = "default"
+		podName      = "app"
+		claimName    = "data"
+		volumeName   = "pv-data"
+		storageClass = "ebs"
+		driverName   = "ebs.csi.aws.com"
+	)
+	ctx := options.ToContext(context.Background(), test.Options())
+	dir := t.TempDir()
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: nodeName,
+			Labels: map[string]string{
+				v1.NodePoolLabelKey:            "bench-pool",
+				corev1.LabelInstanceTypeStable: "m5.large",
+				corev1.LabelTopologyZone:       "test-zone-1",
+				v1.CapacityTypeLabelKey:        "on-demand",
+			},
+		},
+		Spec: corev1.NodeSpec{ProviderID: "aws:///us-west-2a/i-nodea"},
+		Status: corev1.NodeStatus{Allocatable: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("2"),
+			corev1.ResourceMemory: resource.MustParse("8Gi"),
+		}},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: podNamespace},
+		Spec: corev1.PodSpec{
+			NodeName: nodeName,
+			Volumes: []corev1.Volume{{
+				Name: "data",
+				VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: claimName,
+				}},
+			}},
+			Containers: []corev1.Container{{
+				Name:  "app",
+				Ports: []corev1.ContainerPort{{ContainerPort: 8080, HostPort: 8080}},
+			}},
+		},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        claimName,
+			Namespace:   podNamespace,
+			Annotations: map[string]string{volumehelpers.AnnBindCompleted: "yes"},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName:       volumeName,
+			StorageClassName: lo.ToPtr(storageClass),
+		},
+	}
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: volumeName},
+		Spec: corev1.PersistentVolumeSpec{
+			PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{Driver: driverName}},
+			NodeAffinity: &corev1.VolumeNodeAffinity{Required: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+				MatchExpressions: []corev1.NodeSelectorRequirement{{
+					Key:      corev1.LabelTopologyZone,
+					Operator: corev1.NodeSelectorOpIn,
+					Values:   []string{"test-zone-1"},
+				}},
+			}}}},
+		},
+	}
+	sc := &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: storageClass}, Provisioner: driverName}
+	volumeLimit := int32(1)
+	csiNode := &storagev1.CSINode{
+		ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+		Spec: storagev1.CSINodeSpec{Drivers: []storagev1.CSINodeDriver{{
+			Name:        driverName,
+			Allocatable: &storagev1.VolumeNodeResources{Count: &volumeLimit},
+		}}},
+	}
+	writeYAML := func(name string, obj any) {
+		t.Helper()
+		data, err := yaml.Marshal(obj)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	writeYAML("nodes.yaml", node)
+	writeYAML("pods.yaml", pod)
+	writeYAML("persistentvolumeclaims.yaml", pvc)
+	writeYAML("persistentvolumes.yaml", pv)
+	writeYAML("storageclasses.yaml", sc)
+	writeYAML("csinodes.yaml", csiNode)
+
+	fixture, err := Load(dir)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(fixture.PersistentVolumeClaims) != 1 || len(fixture.PersistentVolumes) != 1 || len(fixture.StorageClasses) != 1 || len(fixture.CSINodes) != 1 {
+		t.Fatalf("storage objects = PVC %d, PV %d, SC %d, CSINode %d; want one each", len(fixture.PersistentVolumeClaims), len(fixture.PersistentVolumes), len(fixture.StorageClasses), len(fixture.CSINodes))
+	}
+
+	env, err := fixture.BuildEnv(ctx, Options{})
+	if err != nil {
+		t.Fatalf("BuildEnv() error = %v", err)
+	}
+	for _, obj := range []client.Object{pvc, pv, sc, csiNode} {
+		if err := env.Client.Get(ctx, client.ObjectKeyFromObject(obj), obj.DeepCopyObject().(client.Object)); err != nil {
+			t.Fatalf("Get(%T/%s) error = %v", obj, obj.GetName(), err)
+		}
+	}
+	stateNode := env.StateNodeForProviderID(node.Spec.ProviderID)
+	if stateNode == nil {
+		t.Fatal("expected state node")
+	}
+	if err := stateNode.HostPortUsage().Conflicts(&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: podNamespace}}, scheduling.GetHostPorts(pod)); err == nil {
+		t.Fatal("expected preserved host port to conflict")
+	}
+	if err := stateNode.VolumeUsage().ExceedsLimits(scheduling.Volumes{driverName: sets.New("default/another")}); err == nil {
+		t.Fatal("expected preserved PVC volume usage to reach CSINode limit")
+	}
+	requirements, err := provisioningscheduling.NewVolumeTopology(env.Client).GetRequirements(ctx, pod)
+	if err != nil {
+		t.Fatalf("GetRequirements() error = %v", err)
+	}
+	if !requirements.Get(corev1.LabelTopologyZone).Has("test-zone-1") {
+		t.Fatalf("volume topology requirements = %v, want test-zone-1", requirements)
 	}
 }

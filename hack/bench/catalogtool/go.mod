@@ -4,13 +4,11 @@ go 1.25.7
 
 replace sigs.k8s.io/karpenter => ../../..
 
-replace github.com/aws/karpenter-provider-aws => ../../../../karpenter-provider-aws
-
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.1
 	github.com/aws/aws-sdk-go-v2/config v1.32.7
 	github.com/aws/aws-sdk-go-v2/service/ec2 v1.279.2
-	github.com/aws/karpenter-provider-aws v0.0.0-00010101000000-000000000000
+	github.com/aws/karpenter-provider-aws v1.9.0
 	github.com/patrickmn/go-cache v2.1.0+incompatible
 	k8s.io/apimachinery v0.35.0
 	k8s.io/client-go v0.35.0

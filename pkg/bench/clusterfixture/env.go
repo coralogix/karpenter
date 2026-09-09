@@ -177,6 +177,10 @@ func (f *Fixture) filterTerminating() {
 	f.PDBs = filterLiveObjects(f.PDBs)
 	f.NodePools = filterLiveObjects(f.NodePools)
 	f.NodeClaims = filterLiveObjects(f.NodeClaims)
+	f.PersistentVolumeClaims = filterLiveObjects(f.PersistentVolumeClaims)
+	f.PersistentVolumes = filterLiveObjects(f.PersistentVolumes)
+	f.StorageClasses = filterLiveObjects(f.StorageClasses)
+	f.CSINodes = filterLiveObjects(f.CSINodes)
 }
 
 func filterLiveObjects[T client.Object](objs []T) []T {
@@ -195,7 +199,6 @@ func slimPodForBench(pod *corev1.Pod) *corev1.Pod {
 	slim := pod.DeepCopy()
 	slim.ManagedFields = nil
 	slim.Status = corev1.PodStatus{Phase: pod.Status.Phase}
-	slim.Spec.Volumes = nil
 	slim.Spec.EphemeralContainers = nil
 	slim.Spec.Containers = slimContainers(slim.Spec.Containers)
 	slim.Spec.InitContainers = slimContainers(slim.Spec.InitContainers)
@@ -211,6 +214,7 @@ func slimContainers(containers []corev1.Container) []corev1.Container {
 		out[i] = corev1.Container{
 			Name:      c.Name,
 			Resources: c.Resources,
+			Ports:     c.Ports,
 		}
 	}
 	return out
@@ -293,6 +297,18 @@ func (f *Fixture) clientObjects() []client.Object {
 		objects = append(objects, obj.DeepCopy())
 	}
 	for _, obj := range f.NodeClaims {
+		objects = append(objects, obj.DeepCopy())
+	}
+	for _, obj := range f.PersistentVolumeClaims {
+		objects = append(objects, obj.DeepCopy())
+	}
+	for _, obj := range f.PersistentVolumes {
+		objects = append(objects, obj.DeepCopy())
+	}
+	for _, obj := range f.StorageClasses {
+		objects = append(objects, obj.DeepCopy())
+	}
+	for _, obj := range f.CSINodes {
 		objects = append(objects, obj.DeepCopy())
 	}
 	return objects

@@ -22,6 +22,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,15 +37,19 @@ import (
 var errNotIndexed = errors.New("object not indexed")
 
 type objectIndex struct {
-	allPods         []runtime.Object
-	podsByNamespace map[string][]runtime.Object
-	podsByNodeName  map[string][]runtime.Object
-	nodesByName     map[string]runtime.Object
-	daemonSets      []runtime.Object
-	pdbs            []runtime.Object
-	nodePools       []runtime.Object
-	nodeClaims      []runtime.Object
-	namespaces      []runtime.Object
+	allPods                []runtime.Object
+	podsByNamespace        map[string][]runtime.Object
+	podsByNodeName         map[string][]runtime.Object
+	nodesByName            map[string]runtime.Object
+	daemonSets             []runtime.Object
+	pdbs                   []runtime.Object
+	nodePools              []runtime.Object
+	nodeClaims             []runtime.Object
+	persistentVolumeClaims []runtime.Object
+	persistentVolumes      []runtime.Object
+	storageClasses         []runtime.Object
+	csiNodes               []runtime.Object
+	namespaces             []runtime.Object
 }
 
 func newObjectIndex(f *Fixture) *objectIndex {
@@ -75,6 +80,18 @@ func newObjectIndex(f *Fixture) *objectIndex {
 	for _, nc := range f.NodeClaims {
 		idx.nodeClaims = append(idx.nodeClaims, runtimeObject(nc))
 	}
+	for _, pvc := range f.PersistentVolumeClaims {
+		idx.persistentVolumeClaims = append(idx.persistentVolumeClaims, runtimeObject(pvc))
+	}
+	for _, pv := range f.PersistentVolumes {
+		idx.persistentVolumes = append(idx.persistentVolumes, runtimeObject(pv))
+	}
+	for _, sc := range f.StorageClasses {
+		idx.storageClasses = append(idx.storageClasses, runtimeObject(sc))
+	}
+	for _, csiNode := range f.CSINodes {
+		idx.csiNodes = append(idx.csiNodes, runtimeObject(csiNode))
+	}
 	for ns := range idx.podsByNamespace {
 		idx.namespaces = append(idx.namespaces, runtimeObject(&corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: ns},
@@ -103,6 +120,38 @@ func (idx *objectIndex) get(key client.ObjectKey, obj client.Object) error {
 			}
 		}
 		return apierrors.NewNotFound(corev1.Resource("pods"), key.Name)
+	case *corev1.PersistentVolumeClaim:
+		for _, candidate := range idx.persistentVolumeClaims {
+			pvc := candidate.(*corev1.PersistentVolumeClaim)
+			if pvc.Namespace == key.Namespace && pvc.Name == key.Name {
+				return assignObject(dst, candidate)
+			}
+		}
+		return apierrors.NewNotFound(corev1.Resource("persistentvolumeclaims"), key.Name)
+	case *corev1.PersistentVolume:
+		for _, candidate := range idx.persistentVolumes {
+			pv := candidate.(*corev1.PersistentVolume)
+			if pv.Name == key.Name {
+				return assignObject(dst, candidate)
+			}
+		}
+		return apierrors.NewNotFound(corev1.Resource("persistentvolumes"), key.Name)
+	case *storagev1.StorageClass:
+		for _, candidate := range idx.storageClasses {
+			sc := candidate.(*storagev1.StorageClass)
+			if sc.Name == key.Name {
+				return assignObject(dst, candidate)
+			}
+		}
+		return apierrors.NewNotFound(storagev1.Resource("storageclasses"), key.Name)
+	case *storagev1.CSINode:
+		for _, candidate := range idx.csiNodes {
+			csiNode := candidate.(*storagev1.CSINode)
+			if csiNode.Name == key.Name {
+				return assignObject(dst, candidate)
+			}
+		}
+		return apierrors.NewNotFound(storagev1.Resource("csinodes"), key.Name)
 	default:
 		return errNotIndexed
 	}
@@ -122,6 +171,14 @@ func (idx *objectIndex) list(list client.ObjectList, opts client.ListOptions) er
 		return idx.listInto(dst, idx.nodePools, nodePoolFieldSet, nodePoolLabels, opts)
 	case *v1.NodeClaimList:
 		return idx.listInto(dst, idx.nodeClaims, nodeClaimFieldSet, nodeClaimLabels, opts)
+	case *corev1.PersistentVolumeClaimList:
+		return idx.listInto(dst, idx.persistentVolumeClaims, persistentVolumeClaimFieldSet, persistentVolumeClaimLabels, opts)
+	case *corev1.PersistentVolumeList:
+		return idx.listInto(dst, idx.persistentVolumes, persistentVolumeFieldSet, persistentVolumeLabels, opts)
+	case *storagev1.StorageClassList:
+		return idx.listInto(dst, idx.storageClasses, storageClassFieldSet, storageClassLabels, opts)
+	case *storagev1.CSINodeList:
+		return idx.listInto(dst, idx.csiNodes, csiNodeFieldSet, csiNodeLabels, opts)
 	case *corev1.NamespaceList:
 		if opts.LabelSelector != nil && !opts.LabelSelector.Empty() {
 			return errNotIndexed
@@ -275,4 +332,28 @@ func namespaceFieldSet(runtime.Object) fields.Set { return fields.Set{} }
 
 func namespaceLabels(obj runtime.Object) labels.Set {
 	return labels.Set(obj.(*corev1.Namespace).Labels)
+}
+
+func persistentVolumeClaimFieldSet(runtime.Object) fields.Set { return fields.Set{} }
+
+func persistentVolumeClaimLabels(obj runtime.Object) labels.Set {
+	return labels.Set(obj.(*corev1.PersistentVolumeClaim).Labels)
+}
+
+func persistentVolumeFieldSet(runtime.Object) fields.Set { return fields.Set{} }
+
+func persistentVolumeLabels(obj runtime.Object) labels.Set {
+	return labels.Set(obj.(*corev1.PersistentVolume).Labels)
+}
+
+func storageClassFieldSet(runtime.Object) fields.Set { return fields.Set{} }
+
+func storageClassLabels(obj runtime.Object) labels.Set {
+	return labels.Set(obj.(*storagev1.StorageClass).Labels)
+}
+
+func csiNodeFieldSet(runtime.Object) fields.Set { return fields.Set{} }
+
+func csiNodeLabels(obj runtime.Object) labels.Set {
+	return labels.Set(obj.(*storagev1.CSINode).Labels)
 }

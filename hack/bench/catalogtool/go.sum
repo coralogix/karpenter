@@ -50,6 +50,8 @@ github.com/aws/aws-sdk-go-v2/service/sts v1.41.6 h1:5fFjR/ToSOzB2OQ/XqWpZBmNvmP/
 github.com/aws/aws-sdk-go-v2/service/sts v1.41.6/go.mod h1:qgFDZQSD/Kys7nJnVqYlWKnh0SSdMjAi0uSwON4wgYQ=
 github.com/aws/aws-sdk-go-v2/service/timestreamwrite v1.35.16 h1:0lxNpE8zuNIvxUSpEESYALrokVdjtcso8hNF6EIip84=
 github.com/aws/aws-sdk-go-v2/service/timestreamwrite v1.35.16/go.mod h1:3FcOfkSHwdxE2w0pDKTXkt1PmloObRPokcCt1fkLSK0=
+github.com/aws/karpenter-provider-aws v1.9.0 h1:JER51ivJqzz4FeAuRpA5ozEUEmJhHpyqHQlscJW7M14=
+github.com/aws/karpenter-provider-aws v1.9.0/go.mod h1:luLmzj7d9IhXS9O4OuO44QYySzKwkZc0TFb8yGHxfyw=
 github.com/aws/smithy-go v1.24.0 h1:LpilSUItNPFr1eY85RYgTIg5eIEPtvFbskaFcmmIUnk=
 github.com/aws/smithy-go v1.24.0/go.mod h1:LEj2LM3rBRQJxPZTB4KuzZkaZYnZPnvgIhb4pu07mx0=
 github.com/awslabs/amazon-eks-ami/nodeadm v0.0.0-20240229193347-cfab22a10647 h1:8yRBVsjGmI7qQsPWtIrbWP+XfwHO9Wq7gdLVzjqiZFs=
