@@ -26,6 +26,8 @@ export CLUSTER_FIXTURE_DIR=pkg/bench/clusterfixture/testdata/mini
 
 ## 2. Run the benchmark
 
+The cx498 benchmark runs with `PreferencePolicy=Ignore`, matching the production configuration. Required scheduling constraints remain enforced.
+
 ```bash
 CLUSTER_FIXTURE_DIR=testdata/clusterfixtures/cx498 \
 go test -tags=test_performance -run='^$' \

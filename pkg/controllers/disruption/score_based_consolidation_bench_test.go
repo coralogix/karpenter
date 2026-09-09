@@ -93,7 +93,10 @@ func newClusterFixtureBench(dir string) (*clusterFixtureBench, error) {
 		return nil, err
 	}
 
-	ctx := options.ToContext(context.Background(), test.Options())
+	preferencePolicy := options.PreferencePolicyIgnore
+	ctx := options.ToContext(context.Background(), test.Options(test.OptionsFields{
+		PreferencePolicy: &preferencePolicy,
+	}))
 	env, err := fixture.BuildEnv(ctx, clusterfixture.Options{AssumeScoreBasedAllPools: true})
 	if err != nil {
 		return nil, err
