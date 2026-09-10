@@ -63,7 +63,7 @@ func NewSchedulerFactory(ctx context.Context, provisioner *provisioning.Provisio
 	}
 	opts = append(opts, scheduling.MinValuesPolicy(options.FromContext(ctx).MinValuesPolicy))
 	opts = append(opts, schedulerOpts...)
-	factory, err := provisioner.NewSchedulerFactory(ctx, opts...)
+	factory, err := provisioner.NewSchedulerFactory(log.IntoContext(ctx, operatorlogging.NopLogger), opts...)
 	if err != nil {
 		return nil, fmt.Errorf("creating scheduler factory, %w", err)
 	}

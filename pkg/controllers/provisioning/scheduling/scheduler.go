@@ -127,11 +127,10 @@ var IsConsolidationSimulation = func(opts *options) {
 func NewScheduler(
 	ctx context.Context,
 	kubeClient client.Client,
-	nodePools []*v1.NodePool,
+	inputs *NodePoolInputs,
 	cluster *state.Cluster,
 	stateNodes []*state.StateNode,
 	topology *Topology,
-	instanceTypes map[string][]*cloudprovider.InstanceType,
 	daemonSetPods []*corev1.Pod,
 	recorder events.Recorder,
 	clock clock.Clock,
@@ -140,6 +139,8 @@ func NewScheduler(
 	opts ...Options,
 ) *Scheduler {
 	minValuesPolicy := option.Resolve(opts...).minValuesPolicy
+	nodePools := inputs.nodePools
+	instanceTypes := inputs.instanceTypes
 
 	// if any of the nodePools add a taint with a prefer no schedule effect, we add a toleration for the taint
 	// during preference relaxation
@@ -151,26 +152,7 @@ func NewScheduler(
 			}
 		}
 	}
-	// Pre-filter instance types eligible for NodePools to reduce work done during scheduling loops for pods
-	// if no templates remain, we still want to build the scheduler so that Karpenter can ack pods which can schedule to existing and in-flight capacity
-	_, stop := MeasureNewSchedulerPhase(ctx, PhaseFilterInstanceTypes)
-	templates := lo.FilterMap(nodePools, func(np *v1.NodePool, _ int) (*NodeClaimTemplate, bool) {
-		var err error
-		nct := NewNodeClaimTemplate(np)
-		nct.InstanceTypeOptions, _, err = filterInstanceTypesByRequirements(instanceTypes[np.Name], nct.Requirements, &corev1.Pod{}, corev1.ResourceList{}, []DaemonOverheadGroup{{InstanceTypes: instanceTypes[np.Name], HostPortUsage: scheduling.NewHostPortUsage()}}, corev1.ResourceList{}, minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
-		if len(nct.InstanceTypeOptions) == 0 {
-			if instanceTypeFilterErr, ok := lo.ErrorsAs[InstanceTypeFilterError](err); ok && instanceTypeFilterErr.minValuesIncompatibleErr != nil {
-				recorder.Publish(NoCompatibleInstanceTypes(np, true))
-				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, nodepool requirements filtered out all instance types", "minValuesIncompatibleErr", instanceTypeFilterErr.minValuesIncompatibleErr)
-			} else {
-				recorder.Publish(NoCompatibleInstanceTypes(np, false))
-				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Info("skipping, nodepool requirements filtered out all instance types")
-			}
-			return nil, false
-		}
-		return nct, true
-	})
-	stop()
+	templates := inputs.nodeClaimTemplates
 
 	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseDaemonOverhead)
 	daemonOverheadGroups := buildDaemonOverheadGroups(phaseCtx, templates, daemonSetPods)

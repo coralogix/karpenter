@@ -263,10 +263,9 @@ var ErrNodePoolsNotFound = errors.New("no nodepools found")
 
 // SchedulerFactory calculates the NodePool inputs once and reuses them across scheduling simulations.
 type SchedulerFactory struct {
-	provisioner   *Provisioner
-	nodePools     []*v1.NodePool
-	instanceTypes map[string][]*cloudprovider.InstanceType
-	opts          []scheduler.Options
+	provisioner *Provisioner
+	inputs      *scheduler.NodePoolInputs
+	opts        []scheduler.Options
 }
 
 func (p *Provisioner) NewSchedulerFactory(ctx context.Context, opts ...scheduler.Options) (*SchedulerFactory, error) {
@@ -274,7 +273,8 @@ func (p *Provisioner) NewSchedulerFactory(ctx context.Context, opts ...scheduler
 	if err != nil {
 		return nil, err
 	}
-	return &SchedulerFactory{provisioner: p, nodePools: nodePools, instanceTypes: instanceTypes, opts: opts}, nil
+	inputs := scheduler.NewNodePoolInputs(ctx, p.recorder, nodePools, instanceTypes, opts...)
+	return &SchedulerFactory{provisioner: p, inputs: inputs, opts: opts}, nil
 }
 
 func (f *SchedulerFactory) NewScheduler(ctx context.Context, pods []*corev1.Pod, stateNodes []*state.StateNode, deletingPodUIDs sets.Set[types.UID]) (*scheduler.Scheduler, error) {
@@ -287,7 +287,7 @@ func (f *SchedulerFactory) NewScheduler(ctx context.Context, pods []*corev1.Pod,
 	}
 
 	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseNewTopology)
-	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, f.nodePools, f.instanceTypes, pods, f.opts...)
+	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, f.inputs, pods, f.opts...)
 	stop()
 	if err != nil {
 		return nil, fmt.Errorf("tracking topology counts, %w", err)
@@ -309,9 +309,9 @@ func (f *SchedulerFactory) NewScheduler(ctx context.Context, pods []*corev1.Pod,
 		if err != nil {
 			return nil, fmt.Errorf("gathering allocated devices, %w", err)
 		}
-		allocator = dynamicresources.NewAllocator(inClusterSlices, allocatedDevices, dynamicresources.BuildAttributeBindings(f.instanceTypes), p.kubeClient, deletingPodUIDs)
+		allocator = dynamicresources.NewAllocator(inClusterSlices, allocatedDevices, dynamicresources.BuildAttributeBindings(f.inputs.InstanceTypes()), p.kubeClient, deletingPodUIDs)
 	}
-	return scheduler.NewScheduler(ctx, p.kubeClient, f.nodePools, p.cluster, stateNodes, topology, f.instanceTypes, daemonSetPods, p.recorder, p.clock, volumeReqs, allocator, f.opts...), nil
+	return scheduler.NewScheduler(ctx, p.kubeClient, f.inputs, p.cluster, stateNodes, topology, daemonSetPods, p.recorder, p.clock, volumeReqs, allocator, f.opts...), nil
 }
 
 func (p *Provisioner) NewScheduler(

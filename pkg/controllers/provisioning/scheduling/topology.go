@@ -66,20 +66,6 @@ type Topology struct {
 	stateNodes   []*state.StateNode
 }
 
-type NodePoolInputs struct {
-	nodePools     []*v1.NodePool
-	instanceTypes map[string][]*cloudprovider.InstanceType
-	domainGroups  map[string]TopologyDomainGroup
-}
-
-func NewNodePoolInputs(nodePools []*v1.NodePool, instanceTypes map[string][]*cloudprovider.InstanceType) *NodePoolInputs {
-	return &NodePoolInputs{
-		nodePools:     nodePools,
-		instanceTypes: instanceTypes,
-		domainGroups:  buildDomainGroups(nodePools, instanceTypes),
-	}
-}
-
 func NewTopology(
 	ctx context.Context,
 	kubeClient client.Client,
