@@ -53,10 +53,11 @@ func init() {
 const clusterFixtureDirEnvVar = "CLUSTER_FIXTURE_DIR"
 
 type clusterFixtureBench struct {
-	ctx        context.Context
-	env        *clusterfixture.Env
-	candidates []*Candidate
-	rng        *rand.Rand
+	ctx              context.Context
+	env              *clusterfixture.Env
+	schedulerFactory *provisioning.SchedulerFactory
+	candidates       []*Candidate
+	rng              *rand.Rand
 }
 
 var (
@@ -116,11 +117,16 @@ func newClusterFixtureBench(dir string) (*clusterFixtureBench, error) {
 		return nil, fmt.Errorf("no eligible score-based consolidation candidates in fixture %q", dir)
 	}
 
+	schedulerFactory, err := NewSchedulerFactory(ctx, env.Provisioner)
+	if err != nil {
+		return nil, err
+	}
 	return &clusterFixtureBench{
-		ctx:        ctx,
-		env:        env,
-		candidates: candidates,
-		rng:        rand.New(rand.NewSource(42)), //nolint:gosec
+		ctx:              ctx,
+		env:              env,
+		schedulerFactory: schedulerFactory,
+		candidates:       candidates,
+		rng:              rand.New(rand.NewSource(42)), //nolint:gosec
 	}, nil
 }
 
@@ -149,7 +155,7 @@ func BenchmarkSimulateScheduling_ClusterFixture(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		candidate := bench.candidates[bench.rng.Intn(len(bench.candidates))]
-		if _, err := SimulateScheduling(bench.ctx, bench.env.Client, bench.env.Cluster, bench.env.Provisioner, candidate); err != nil {
+		if _, err := SimulateScheduling(bench.ctx, bench.env.Client, bench.env.Cluster, bench.env.Provisioner, bench.schedulerFactory, candidate); err != nil {
 			b.Fatalf("simulating scheduling for candidate %q: %v", candidate.Name(), err)
 		}
 	}

@@ -241,7 +241,9 @@ var _ = Describe("Simulate Scheduling", func() {
 		candidate, err := disruption.NewCandidate(ctx, env.Client, recorder, fakeClock, stateNode, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, queue, disruption.GracefulDisruptionClass)
 		Expect(err).To(Succeed())
 
-		results, err := disruption.SimulateScheduling(ctx, env.Client, cluster, prov, candidate)
+		schedulerFactory, err := disruption.NewSchedulerFactory(ctx, prov)
+		Expect(err).To(Succeed())
+		results, err := disruption.SimulateScheduling(ctx, env.Client, cluster, prov, schedulerFactory, candidate)
 		Expect(err).To(Succeed())
 		Expect(results.PodErrors[pod]).To(BeNil())
 	})

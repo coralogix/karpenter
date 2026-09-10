@@ -164,7 +164,14 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 	for i, candidate := range validCandidates {
 		moveSets[i] = moveSet{Nodes: []*Candidate{candidate}}
 	}
-	return evaluateMoveSetsPar(ctx, moveSets, deadline, s.computeConsolidation)
+	schedulerFactory, err := NewSchedulerFactory(ctx, s.provisioner)
+	if err != nil {
+		return nil, 0, err
+	}
+	compute := func(ctx context.Context, candidates ...*Candidate) (Command, error) {
+		return s.computeConsolidation(ctx, schedulerFactory, candidates...)
+	}
+	return evaluateMoveSetsPar(ctx, moveSets, deadline, compute)
 }
 
 func evaluateMoveSetsPar(
