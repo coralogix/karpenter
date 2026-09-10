@@ -31,6 +31,13 @@ type ReservationManager struct {
 }
 
 func NewReservationManager(instanceTypes map[string][]*cloudprovider.InstanceType) *ReservationManager {
+	return newReservationManager(reservationCapacityForInstanceTypes(instanceTypes))
+}
+
+// reservationCapacityForInstanceTypes computes the initial capacity for each reservation ID.
+// If multiple instance types expose the same reservation, the smallest capacity is used since
+// each offering must remain launchable under the same pessimistic reservation accounting.
+func reservationCapacityForInstanceTypes(instanceTypes map[string][]*cloudprovider.InstanceType) map[string]int {
 	capacity := map[string]int{}
 	for _, its := range instanceTypes {
 		for _, it := range its {
@@ -47,9 +54,18 @@ func NewReservationManager(instanceTypes map[string][]*cloudprovider.InstanceTyp
 			}
 		}
 	}
+	return capacity
+}
+
+// newReservationManager creates an attempt-local manager from an immutable capacity snapshot.
+func newReservationManager(capacity map[string]int) *ReservationManager {
+	capacityCopy := map[string]int{}
+	for reservationID, count := range capacity {
+		capacityCopy[reservationID] = count
+	}
 	return &ReservationManager{
 		reservations: map[string]sets.Set[string]{},
-		capacity:     capacity,
+		capacity:     capacityCopy,
 	}
 }
 
