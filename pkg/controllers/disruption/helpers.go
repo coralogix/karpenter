@@ -30,18 +30,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	"sigs.k8s.io/karpenter/pkg/operator/options"
-
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
-	operatorlogging "sigs.k8s.io/karpenter/pkg/operator/logging"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/pdb"
@@ -52,118 +48,6 @@ var errCandidateDeleting = fmt.Errorf("candidate is deleting")
 func measureSimulateSchedulingPhase(ctx context.Context, phase string) (context.Context, func()) {
 	metricStop := metrics.Measure(SimulateSchedulingPhaseDurationSeconds, map[string]string{simulateSchedulingPhaseLabel: phase})
 	return cxtracing.Measure(ctx, metricStop, "karpenter.disruption.simulate_scheduling."+phase, attribute.String("phase", phase))
-}
-
-func NewSchedulerFactory(ctx context.Context, provisioner *provisioning.Provisioner) (*provisioning.SchedulerFactory, error) {
-	var opts []scheduling.Options
-	if options.FromContext(ctx).PreferencePolicy == options.PreferencePolicyIgnore {
-		opts = append(opts, scheduling.IgnorePreferences)
-	}
-	opts = append(opts, scheduling.MinValuesPolicy(options.FromContext(ctx).MinValuesPolicy))
-	factory, err := provisioner.NewSchedulerFactory(log.IntoContext(ctx, operatorlogging.NopLogger), opts...)
-	if err != nil {
-		return nil, fmt.Errorf("creating scheduler factory, %w", err)
-	}
-	return factory, nil
-}
-
-//nolint:gocyclo
-func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner,
-	schedulerFactory *provisioning.SchedulerFactory, candidates ...*Candidate,
-) (scheduling.Results, error) {
-	ctx, stopRoot := cxtracing.Measure(ctx, metrics.Measure(SimulateSchedulingDurationSeconds, map[string]string{}), "karpenter.disruption.simulate_scheduling")
-	defer stopRoot()
-
-	candidateNames := sets.NewString(lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
-	_, stop := measureSimulateSchedulingPhase(ctx, phaseDeepCopyNodes)
-	nodes := cluster.DeepCopyNodes()
-	stop()
-	deletingNodes := nodes.Deleting()
-	stateNodes := lo.Filter(nodes.Active(), func(n *state.StateNode, _ int) bool {
-		return !candidateNames.Has(n.Name())
-	})
-
-	// We do one final check to ensure that the node that we are attempting to consolidate isn't
-	// already handled for deletion by some other controller. This could happen if the node was markedForDeletion
-	// between returning the candidates and getting the stateNodes above
-	if _, ok := lo.Find(deletingNodes, func(n *state.StateNode) bool {
-		return candidateNames.Has(n.Name())
-	}); ok {
-		return scheduling.Results{}, errCandidateDeleting
-	}
-
-	// start by getting all pending pods
-	phaseCtx, stop := measureSimulateSchedulingPhase(ctx, phaseGetPendingPods)
-	pods, err := provisioner.GetPendingPods(phaseCtx)
-	stop()
-	if err != nil {
-		return scheduling.Results{}, fmt.Errorf("determining pending pods, %w", err)
-	}
-
-	// Don't provision capacity for pods which will not get evicted due to fully blocking PDBs.
-	// Since Karpenter doesn't know when these pods will be successfully evicted, spinning up capacity until
-	// these pods are evicted is wasteful.
-	pdbs, err := pdb.NewLimits(ctx, kubeClient)
-	if err != nil {
-		return scheduling.Results{}, fmt.Errorf("tracking PodDisruptionBudgets, %w", err)
-	}
-	for _, n := range candidates {
-		currentlyReschedulablePods := lo.Filter(n.reschedulablePods, func(p *corev1.Pod, _ int) bool {
-			return pdbs.IsCurrentlyReschedulable(p)
-		})
-		pods = append(pods, currentlyReschedulablePods...)
-	}
-
-	// We get the pods that are on nodes that are deleting
-	deletingNodePods, err := deletingNodes.CurrentlyReschedulablePods(ctx, kubeClient)
-	if err != nil {
-		return scheduling.Results{}, fmt.Errorf("failed to get pods from deleting nodes, %w", err)
-	}
-	pods = append(pods, deletingNodePods...)
-
-	phaseCtx, stop = measureSimulateSchedulingPhase(ctx, phaseNewScheduler)
-	scheduler, err := schedulerFactory.NewScheduler(
-		log.IntoContext(phaseCtx, operatorlogging.NopLogger),
-		pods,
-		stateNodes,
-	)
-	stop()
-	if err != nil {
-		return scheduling.Results{}, fmt.Errorf("creating scheduler, %w", err)
-	}
-
-	deletingNodePodKeys := lo.SliceToMap(deletingNodePods, func(p *corev1.Pod) (client.ObjectKey, interface{}) {
-		return client.ObjectKeyFromObject(p), nil
-	})
-
-	phaseCtx, stop = measureSimulateSchedulingPhase(ctx, phaseSolve)
-	results, err := scheduler.Solve(log.IntoContext(phaseCtx, operatorlogging.NopLogger), pods)
-	stop()
-	if err != nil {
-		return scheduling.Results{}, fmt.Errorf("scheduling pods, %w", err)
-	}
-	results = results.TruncateInstanceTypes(ctx, scheduling.MaxInstanceTypes)
-	for _, n := range results.ExistingNodes {
-		// We consider existing nodes for scheduling. When these nodes are unmanaged, their taint logic should
-		// tell us if we can schedule to them or not; however, if these nodes are managed, we will still schedule to them
-		// even if they are still in the middle of their initialization loop. In the case of disruption, we don't want
-		// to proceed disrupting if our scheduling decision relies on nodes that haven't entered a terminal state.
-		if !n.Initialized() {
-			for _, p := range n.Pods {
-				// Only add a pod scheduling error if it isn't on an already deleting node.
-				// If the pod is on a deleting node, we assume one of two things has already happened:
-				// 1. The node was manually terminated, at which the provisioning controller has scheduled or is scheduling a node
-				//    for the pod.
-				// 2. The node was chosen for a previous disruption command, we assume that the uninitialized node will come up
-				//    for this command, and we assume it will be successful. If it is not successful, the node will become
-				//    not terminating, and we will no longer need to consider these pods.
-				if _, ok := deletingNodePodKeys[client.ObjectKeyFromObject(p)]; !ok {
-					results.PodErrors[p] = NewUninitializedNodeError(n)
-				}
-			}
-		}
-	}
-	return results, nil
 }
 
 // UninitializedNodeError tracks a special pod error for disruption where pods schedule to a node

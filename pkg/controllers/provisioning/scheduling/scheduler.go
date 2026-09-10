@@ -188,7 +188,7 @@ func NewScheduler(
 	opts ...Options,
 ) *Scheduler {
 	baseline := NewSchedulerBaseline(ctx, inputs, daemonSetPods, opts...)
-	return newSchedulerFromBaseline(ctx, kubeClient, baseline, cluster, stateNodes, topology, recorder, clock, volumeReqsByPod)
+	return newSchedulerFromBaseline(ctx, kubeClient, baseline, cluster, stateNodes, topology, recorder, clock, NewLiveVolumeSource(kubeClient, volumeReqsByPod))
 }
 
 // NewSchedulerFromBaseline creates an attempt-local scheduler from a reusable baseline.
@@ -201,12 +201,15 @@ func NewSchedulerFromBaseline(
 	topology *Topology,
 	recorder events.Recorder,
 	clock clock.Clock,
-	volumeReqsByPod map[types.UID]scheduling.Requirements,
+	volumeSource VolumeSource,
 ) (*Scheduler, error) {
+	if volumeSource == nil {
+		return nil, errors.New("volume source must be provided")
+	}
 	if baseline.ignoreDRARequests != karpopts.FromContext(ctx).IgnoreDRARequests {
 		return nil, fmt.Errorf("scheduler baseline was prepared with IgnoreDRARequests=%t but attempt context has IgnoreDRARequests=%t", baseline.ignoreDRARequests, karpopts.FromContext(ctx).IgnoreDRARequests)
 	}
-	return newSchedulerFromBaseline(ctx, kubeClient, baseline, cluster, stateNodes, topology, recorder, clock, volumeReqsByPod), nil
+	return newSchedulerFromBaseline(ctx, kubeClient, baseline, cluster, stateNodes, topology, recorder, clock, volumeSource), nil
 }
 
 func newSchedulerFromBaseline(
@@ -218,7 +221,7 @@ func newSchedulerFromBaseline(
 	topology *Topology,
 	recorder events.Recorder,
 	clock clock.Clock,
-	volumeReqsByPod map[types.UID]scheduling.Requirements,
+	volumeSource VolumeSource,
 ) *Scheduler {
 	inputs := baseline.inputs
 	s := &Scheduler{
@@ -230,7 +233,7 @@ func newSchedulerFromBaseline(
 		daemonOverhead:      cloneDaemonOverhead(baseline.daemonOverhead),
 		daemonHostPortUsage: cloneDaemonHostPortUsage(baseline.daemonHostPortUsage),
 		cachedPodData:       map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
-		volumeReqsByPod:     volumeReqsByPod,          // Volume requirements per pod
+		volumeSource:        volumeSource,
 		recorder:            recorder,
 		preferences:         &Preferences{ToleratePreferNoSchedule: baseline.toleratePreferNoSchedule},
 		remainingResources: lo.SliceToMap(inputs.nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
@@ -291,8 +294,8 @@ type Scheduler struct {
 	remainingResources      map[string]corev1.ResourceList // (NodePool name) -> remaining resources for that NodePool
 	daemonOverhead          map[*NodeClaimTemplate]corev1.ResourceList
 	daemonHostPortUsage     map[*NodeClaimTemplate]*scheduling.HostPortUsage
-	cachedPodData           map[types.UID]*PodData                // (Pod Namespace/Name) -> pre-computed data for pods to avoid re-computation and memory usage
-	volumeReqsByPod         map[types.UID]scheduling.Requirements // Volume topology requirements per pod
+	cachedPodData           map[types.UID]*PodData // (Pod Namespace/Name) -> pre-computed data for pods to avoid re-computation and memory usage
+	volumeSource            VolumeSource
 	preferences             *Preferences
 	topology                *Topology
 	cluster                 *state.Cluster
@@ -578,7 +581,7 @@ func (s *Scheduler) updateCachedPodData(p *corev1.Pod) {
 		Requirements:             requirements,
 		StrictRequirements:       strictRequirements,
 		HasResourceClaimRequests: pod.HasDRARequirements(p),
-		VolumeRequirements:       s.volumeReqsByPod[p.UID], // Volume requirements
+		VolumeRequirements:       s.volumeSource.Requirements(p), // Volume requirements
 	}
 }
 
@@ -617,7 +620,7 @@ func (s *Scheduler) addToExistingNode(ctx context.Context, pod *corev1.Pod) erro
 	var requirements scheduling.Requirements
 
 	// determine the volumes that will be mounted if the pod schedules
-	volumes, err := scheduling.GetVolumes(ctx, s.kubeClient, pod)
+	volumes, err := s.volumeSource.Volumes(ctx, pod)
 	if err != nil {
 		return err
 	}
