@@ -247,9 +247,7 @@ func (p *Provisioner) NewSchedulerFactory(ctx context.Context, opts ...scheduler
 	if err != nil {
 		return nil, err
 	}
-	_, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseBuildDomainGroups)
-	inputs := scheduler.NewNodePoolInputs(nodePools, instanceTypes)
-	stop()
+	inputs := scheduler.NewNodePoolInputs(ctx, p.recorder, nodePools, instanceTypes, opts...)
 	return &SchedulerFactory{provisioner: p, inputs: inputs, opts: opts}, nil
 }
 
