@@ -319,7 +319,7 @@ func assertSparseInverseHostnameMatchesDense(t *testing.T, materialized *Topolog
 		t.Fatalf("dense topology requirements: %v", err)
 	}
 	if got, want := sparseResult.Get(corev1.LabelHostname).NodeSelectorRequirement(), denseResult.Get(corev1.LabelHostname).NodeSelectorRequirement(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("NewAttempt topology result = %v, dense result = %v", got, want)
+		t.Fatalf("NewRun topology result = %v, dense result = %v", got, want)
 	}
 }
 
