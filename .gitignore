@@ -10,6 +10,10 @@ report.json
 *__debug_*
 bin/
 
+# Local cluster benchmark fixtures (see cluster-fixture-scraper/README.md)
+testdata/clusterfixtures/
+profiles/
+
 # Common in OSs and IDEs
 .idea
 .vscode

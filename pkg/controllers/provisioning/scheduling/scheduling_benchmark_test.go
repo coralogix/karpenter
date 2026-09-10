@@ -101,9 +101,6 @@ func BenchmarkScheduling10000(b *testing.B) {
 func BenchmarkScheduling20000(b *testing.B) {
 	benchmarkScheduler(b, makeDiversePods(20000))
 }
-func BenchmarkRespectPreferences(b *testing.B) {
-	benchmarkScheduler(b, makePreferencePods(4000))
-}
 func BenchmarkIgnorePreferences(b *testing.B) {
 	benchmarkScheduler(b, makePreferencePods(4000), scheduling.IgnorePreferences)
 }
@@ -143,7 +140,7 @@ func TestSchedulingProfile(t *testing.T) {
 		totalNodes += int(nodeCount)
 	}
 	fmt.Fprintf(tw, "============== Preference Pods ==============\n")
-	for _, opt := range []scheduling.Options{nil, scheduling.IgnorePreferences} {
+	for _, opt := range []scheduling.Options{scheduling.IgnorePreferences} {
 		start := time.Now()
 		podCount := 4000
 		res := testing.Benchmark(func(b *testing.B) {
@@ -151,7 +148,7 @@ func TestSchedulingProfile(t *testing.T) {
 		})
 		totalTime += time.Since(start) / time.Duration(res.N)
 		nodeCount := res.Extra["nodes"]
-		fmt.Fprintf(tw, "%s\t%d pods\t%d nodes\t%s per scheduling\t%s per pod\n", lo.Ternary(opt == nil, "PreferencePolicy=Respect", "PreferencePolicy=Ignore"), podCount, int(nodeCount), time.Duration(res.NsPerOp()), time.Duration(res.NsPerOp()/int64(podCount)))
+		fmt.Fprintf(tw, "PreferencePolicy=Ignore\t%d pods\t%d nodes\t%s per scheduling\t%s per pod\n", podCount, int(nodeCount), time.Duration(res.NsPerOp()), time.Duration(res.NsPerOp()/int64(podCount)))
 		totalPods += podCount
 		totalNodes += int(nodeCount)
 	}

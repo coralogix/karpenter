@@ -61,9 +61,9 @@ type Topology struct {
 	domainGroups map[string]TopologyDomainGroup
 	// excludedPods are the pod UIDs of pods that are excluded from counting.  This is used so we can simulate
 	// moving pods to prevent them from being double counted.
-	excludedPods          sets.Set[string]
-	cluster               *state.Cluster
-	stateNodes            []*state.StateNode
+	excludedPods sets.Set[string]
+	cluster      *state.Cluster
+	stateNodes   []*state.StateNode
 }
 
 func NewTopology(

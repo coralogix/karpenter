@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: List
+items:
+  - apiVersion: v1
+    kind: Node
+    metadata:
+      name: node-a
+      labels:
+        karpenter.sh/nodepool: bench-pool
+        node.kubernetes.io/instance-type: m5.4xlarge
+        karpenter.sh/capacity-type: on-demand
+        topology.kubernetes.io/zone: test-zone-1
+        karpenter.sh/registered: "true"
+        karpenter.sh/initialized: "true"
+    spec:
+      providerID: aws:///us-west-2a/i-nodea
+    status:
+      phase: Running
+      allocatable:
+        cpu: "16"
+        memory: 64Gi
+      capacity:
+        cpu: "16"
+        memory: 64Gi
+      conditions:
+        - type: Ready
+          status: "True"
+  - apiVersion: v1
+    kind: Node
+    metadata:
+      name: node-b
+      labels:
+        karpenter.sh/nodepool: bench-pool
+        node.kubernetes.io/instance-type: m5.large
+        karpenter.sh/capacity-type: on-demand
+        topology.kubernetes.io/zone: test-zone-1
+        karpenter.sh/registered: "true"
+        karpenter.sh/initialized: "true"
+    spec:
+      providerID: aws:///us-west-2a/i-nodeb
+    status:
+      phase: Running
+      allocatable:
+        cpu: "2"
+        memory: 8Gi
+      capacity:
+        cpu: "2"
+        memory: 8Gi
+      conditions:
+        - type: Ready
+          status: "True"
