@@ -1,0 +1,6 @@
+{
+  "cluster": "mini",
+  "nodeCount": 2,
+  "namespaceCount": 1,
+  "podCount": 2
+}

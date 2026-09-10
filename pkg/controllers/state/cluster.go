@@ -372,6 +372,33 @@ func (c *Cluster) UpdateNode(ctx context.Context, node *corev1.Node) error {
 	return nil
 }
 
+// UpdateNodeWithPods updates node state using a precomputed pod list. This avoids per-node
+// client lists and is intended for large cluster benchmarks.
+func (c *Cluster) UpdateNodeWithPods(ctx context.Context, node *corev1.Node, pods []*corev1.Pod) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	managed := node.Labels[v1.NodePoolLabelKey] != ""
+	initialized := node.Labels[v1.NodeInitializedLabelKey] != ""
+	if node.Spec.ProviderID == "" {
+		if managed {
+			return nil
+		}
+		node.Spec.ProviderID = node.Name
+	}
+	if managed && node.Labels[corev1.LabelInstanceTypeStable] == "" && !initialized {
+		return nil
+	}
+	n, err := c.newStateFromNodeWithPods(ctx, node, c.nodes[node.Spec.ProviderID], pods)
+	if err != nil {
+		return err
+	}
+	c.nodes[node.Spec.ProviderID] = n
+	c.nodeNameToProviderID[node.Name] = node.Spec.ProviderID
+	ClusterStateNodesCount.Set(float64(len(c.nodes)), nil)
+	return nil
+}
+
 func (c *Cluster) DeleteNode(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -720,6 +747,36 @@ func (c *Cluster) newStateFromNode(ctx context.Context, node *corev1.Node, oldNo
 	return n, nil
 }
 
+func (c *Cluster) newStateFromNodeWithPods(ctx context.Context, node *corev1.Node, oldNode *StateNode, pods []*corev1.Pod) (*StateNode, error) {
+	if oldNode == nil {
+		oldNode = NewNode()
+	}
+	n := &StateNode{
+		Node:              node,
+		NodeClaim:         oldNode.NodeClaim,
+		daemonSetRequests: map[types.NamespacedName]corev1.ResourceList{},
+		daemonSetLimits:   map[types.NamespacedName]corev1.ResourceList{},
+		podRequests:       map[types.NamespacedName]corev1.ResourceList{},
+		podLimits:         map[types.NamespacedName]corev1.ResourceList{},
+		hostPortUsage:     scheduling.NewHostPortUsage(),
+		volumeUsage:       scheduling.NewVolumeUsage(),
+		markedForDeletion: oldNode.markedForDeletion,
+		nominatedUntil:    oldNode.nominatedUntil,
+	}
+	if err := multierr.Combine(
+		c.populateResourceRequestsFromPods(ctx, n, pods),
+		c.populateVolumeLimits(ctx, n),
+	); err != nil {
+		return nil, err
+	}
+	if id, ok := c.nodeNameToProviderID[node.Name]; ok && id != node.Spec.ProviderID {
+		c.cleanupNode(node.Name)
+	}
+	c.updateNodePoolResources(oldNode, n)
+	c.triggerConsolidationOnChange(oldNode, n)
+	return n, nil
+}
+
 func (c *Cluster) cleanupNode(name string) {
 	if id := c.nodeNameToProviderID[name]; id != "" {
 		if c.nodes[id].NodeClaim == nil {
@@ -808,6 +865,20 @@ func (c *Cluster) populateResourceRequests(ctx context.Context, n *StateNode) er
 	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+		if podutils.IsTerminal(pod) {
+			continue
+		}
+		if err := n.updateForPod(ctx, c.kubeClient, pod); err != nil {
+			return err
+		}
+		c.cleanupOldBindings(pod)
+		c.bindings[client.ObjectKeyFromObject(pod)] = pod.Spec.NodeName
+	}
+	return nil
+}
+
+func (c *Cluster) populateResourceRequestsFromPods(ctx context.Context, n *StateNode, pods []*corev1.Pod) error {
+	for _, pod := range pods {
 		if podutils.IsTerminal(pod) {
 			continue
 		}

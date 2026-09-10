@@ -1,4 +1,5 @@
 # This is the format of an AWS ECR Public Repo as an example.
+export GOTOOLCHAIN ?= go1.25.7
 export KWOK_REPO ?= ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
 export KARPENTER_NAMESPACE=kube-system
 
@@ -118,6 +119,7 @@ verify: ## Verify code. Includes codegen, docgen, dependencies, linting, formatt
 	@perl -i -pe 's/sets.Set/sets.Set[string]/g' pkg/scheduling/zz_generated.deepcopy.go
 	go tool -modfile=go.tools.mod nwa config -c add
 	go vet ./...
+	cd cluster-fixture-scraper && go mod tidy -diff && go test ./...
 	go tool -modfile=go.tools.mod golangci-lint-kube-api-linter run
 	cd kwok/charts && go tool -modfile=../../go.tools.mod helm-docs
 	@git diff --quiet ||\
