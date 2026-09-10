@@ -240,15 +240,48 @@ type SchedulerFactory struct {
 	provisioner *Provisioner
 	inputs      *scheduler.NodePoolInputs
 	opts        []scheduler.Options
+	precompute  *scheduler.SchedulerPrecompute
+	// stateNodes is the cluster snapshot used for all scheduling simulations
+	// created by this factory. Callers must use DeepCopyNodes before passing
+	// these nodes to a scheduler since scheduling mutates existing nodes.
+	stateNodes state.StateNodes
 }
 
 func (p *Provisioner) NewSchedulerFactory(ctx context.Context, opts ...scheduler.Options) (*SchedulerFactory, error) {
+	return p.newSchedulerFactory(ctx, p.cluster.DeepCopyNodes(), opts...)
+}
+
+// newSchedulerFactory creates a SchedulerFactory using the supplied cluster
+// snapshot. This is used by the non-consolidation scheduling path, which has
+// already captured the StateNodes it intends to schedule against.
+func (p *Provisioner) newSchedulerFactory(ctx context.Context, stateNodes state.StateNodes, opts ...scheduler.Options) (*SchedulerFactory, error) {
 	nodePools, instanceTypes, err := p.listNodePoolsAndInstanceTypes(ctx)
 	if err != nil {
 		return nil, err
 	}
 	inputs := scheduler.NewNodePoolInputs(ctx, p.recorder, nodePools, instanceTypes, opts...)
-	return &SchedulerFactory{provisioner: p, inputs: inputs, opts: opts}, nil
+
+	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListDaemonSets)
+	daemonSetPods, err := p.getDaemonSetPods(phaseCtx)
+	stop()
+	if err != nil {
+		return nil, fmt.Errorf("getting daemon pods, %w", err)
+	}
+
+	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhasePrecomputeScheduler)
+	precompute := scheduler.NewSchedulerPrecompute(phaseCtx, inputs, daemonSetPods, stateNodes.Active())
+	stop()
+
+	return &SchedulerFactory{provisioner: p, inputs: inputs, opts: opts, precompute: precompute, stateNodes: stateNodes}, nil
+}
+
+// DeepCopyNodes returns an independent copy of the cluster snapshot captured
+// when the factory was created. Each scheduling simulation must receive its
+// own copy because scheduling mutates existing nodes.
+func (f *SchedulerFactory) DeepCopyNodes() state.StateNodes {
+	return lo.Map(f.stateNodes, func(n *state.StateNode, _ int) *state.StateNode {
+		return n.DeepCopy()
+	})
 }
 
 func (f *SchedulerFactory) NewScheduler(ctx context.Context, pods []*corev1.Pod, stateNodes []*state.StateNode) (*scheduler.Scheduler, error) {
@@ -266,19 +299,13 @@ func (f *SchedulerFactory) NewScheduler(ctx context.Context, pods []*corev1.Pod,
 
 	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
 	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseNewTopology)
-	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, f.inputs, pods, f.opts...)
+	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, f.inputs, pods, f.precompute.NodeLabelRequirements, f.opts...)
 	stop()
 	if err != nil {
 		return nil, fmt.Errorf("tracking topology counts, %w", err)
 	}
-	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListDaemonSets)
-	daemonSetPods, err := p.getDaemonSetPods(phaseCtx)
-	stop()
-	if err != nil {
-		return nil, fmt.Errorf("getting daemon pods, %w", err)
-	}
 	// Pass volumeReqs to scheduler - added to nodeRequirements for NodeClaim zone selection
-	return scheduler.NewScheduler(ctx, p.kubeClient, f.inputs, p.cluster, stateNodes, topology, daemonSetPods, p.recorder, p.clock, volumeReqs, f.opts...), nil
+	return scheduler.NewScheduler(ctx, p.kubeClient, f.inputs, p.cluster, stateNodes, topology, nil, f.precompute, p.recorder, p.clock, volumeReqs, f.opts...), nil
 }
 
 func (p *Provisioner) NewScheduler(
@@ -287,11 +314,11 @@ func (p *Provisioner) NewScheduler(
 	stateNodes []*state.StateNode,
 	opts ...scheduler.Options,
 ) (*scheduler.Scheduler, error) {
-	factory, err := p.NewSchedulerFactory(ctx, opts...)
+	factory, err := p.newSchedulerFactory(ctx, stateNodes, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return factory.NewScheduler(ctx, pods, stateNodes)
+	return factory.NewScheduler(ctx, pods, factory.DeepCopyNodes())
 }
 
 //nolint:gocyclo

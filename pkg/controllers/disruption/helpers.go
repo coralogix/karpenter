@@ -68,7 +68,7 @@ func NewSchedulerFactory(ctx context.Context, provisioner *provisioning.Provisio
 }
 
 //nolint:gocyclo
-func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner,
+func SimulateScheduling(ctx context.Context, kubeClient client.Client, provisioner *provisioning.Provisioner,
 	schedulerFactory *provisioning.SchedulerFactory, candidates ...*Candidate,
 ) (scheduling.Results, error) {
 	ctx, stopRoot := cxtracing.Measure(ctx, metrics.Measure(SimulateSchedulingDurationSeconds, map[string]string{}), "karpenter.disruption.simulate_scheduling")
@@ -76,16 +76,20 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 
 	candidateNames := sets.NewString(lo.Map(candidates, func(t *Candidate, i int) string { return t.Name() })...)
 	_, stop := measureSimulateSchedulingPhase(ctx, phaseDeepCopyNodes)
-	nodes := cluster.DeepCopyNodes()
+	// Use an isolated copy of the snapshot captured by the scheduler factory.
+	// The factory snapshot is shared by all simulations in this disruption
+	// iteration, while each simulation must receive independent StateNodes since
+	// scheduling mutates existing nodes.
+	nodes := schedulerFactory.DeepCopyNodes()
 	stop()
 	deletingNodes := nodes.Deleting()
 	stateNodes := lo.Filter(nodes.Active(), func(n *state.StateNode, _ int) bool {
 		return !candidateNames.Has(n.Name())
 	})
 
-	// We do one final check to ensure that the node that we are attempting to consolidate isn't
-	// already handled for deletion by some other controller. This could happen if the node was markedForDeletion
-	// between returning the candidates and getting the stateNodes above
+	// Check the factory snapshot to ensure that the node we are attempting to
+	// consolidate isn't already handled for deletion. Changes to cluster state
+	// after the factory was created are checked during validation.
 	if _, ok := lo.Find(deletingNodes, func(n *state.StateNode) bool {
 		return candidateNames.Has(n.Name())
 	}); ok {

@@ -38,6 +38,7 @@ const (
 	PhaseVolumeTopology              = "volume_topology"
 	PhaseNewTopology                 = "new_topology"
 	PhaseListDaemonSets              = "list_daemonsets"
+	PhasePrecomputeScheduler         = "precompute_scheduler"
 	PhaseFilterInstanceTypes         = "filter_instance_types"
 	PhaseDaemonOverhead              = "daemon_overhead"
 	PhaseDaemonHostPorts             = "daemon_host_ports"

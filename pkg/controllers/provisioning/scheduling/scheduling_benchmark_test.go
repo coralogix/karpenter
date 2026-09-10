@@ -232,7 +232,7 @@ func setupScheduler(ctx context.Context, pods []*corev1.Pod, opts ...scheduling.
 	inputs := scheduling.NewNodePoolInputs(ctx, events.NewRecorder(&record.FakeRecorder{}), []*v1.NodePool{nodePool}, map[string][]*cloudprovider.InstanceType{
 		nodePool.Name: instanceTypes,
 	}, opts...)
-	topology, err := scheduling.NewTopology(ctx, client, cluster, nil, inputs, pods, opts...)
+	topology, err := scheduling.NewTopology(ctx, client, cluster, nil, inputs, pods, nil, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("creating topology, %w", err)
 	}
@@ -244,6 +244,7 @@ func setupScheduler(ctx context.Context, pods []*corev1.Pod, opts ...scheduling.
 		cluster,
 		nil,
 		topology,
+		nil,
 		nil,
 		events.NewRecorder(&record.FakeRecorder{}),
 		clock,

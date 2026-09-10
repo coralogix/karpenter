@@ -121,6 +121,7 @@ func NewScheduler(
 	stateNodes []*state.StateNode,
 	topology *Topology,
 	daemonSetPods []*corev1.Pod,
+	precompute *SchedulerPrecompute,
 	recorder events.Recorder,
 	clock clock.Clock,
 	volumeReqsByPod map[types.UID]scheduling.Requirements,
@@ -140,30 +141,45 @@ func NewScheduler(
 	}
 	templates := inputs.nodeClaimTemplates
 
-	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseDaemonOverhead)
-	daemonOverhead := getDaemonOverhead(phaseCtx, templates, daemonSetPods)
-	stop()
+	var daemonOverhead map[*NodeClaimTemplate]corev1.ResourceList
+	var daemonHostPortUsage map[*NodeClaimTemplate]*scheduling.HostPortUsage
+	var nodeLabelRequirements map[string]scheduling.Requirements
+	var nodeDaemonResources map[string]corev1.ResourceList
+	if precompute != nil {
+		daemonSetPods = precompute.DaemonSetPods
+		daemonOverhead = precompute.DaemonOverhead
+		daemonHostPortUsage = cloneDaemonHostPortUsage(precompute.DaemonHostPortUsage)
+		nodeLabelRequirements = precompute.NodeLabelRequirements
+		nodeDaemonResources = precompute.NodeDaemonResources
+	} else {
+		phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseDaemonOverhead)
+		daemonOverhead = getDaemonOverhead(phaseCtx, templates, daemonSetPods)
+		stop()
 
-	phaseCtx, stop = MeasureNewSchedulerPhase(ctx, PhaseDaemonHostPorts)
-	daemonHostPortUsage := getDaemonHostPortUsage(phaseCtx, templates, daemonSetPods)
-	stop()
+		phaseCtx, stop = MeasureNewSchedulerPhase(ctx, PhaseDaemonHostPorts)
+		daemonHostPortUsage = getDaemonHostPortUsage(phaseCtx, templates, daemonSetPods)
+		stop()
+	}
 
-	_, stop = MeasureNewSchedulerPhase(ctx, PhaseReservationManager)
+	_, stop := MeasureNewSchedulerPhase(ctx, PhaseReservationManager)
 	reservationManager := NewReservationManager(inputs.instanceTypes)
 	stop()
 
 	s := &Scheduler{
-		uuid:                uuid.NewUUID(),
-		kubeClient:          kubeClient,
-		nodeClaimTemplates:  templates,
-		topology:            topology,
-		cluster:             cluster,
-		daemonOverhead:      daemonOverhead,
-		daemonHostPortUsage: daemonHostPortUsage,
-		cachedPodData:       map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
-		volumeReqsByPod:     volumeReqsByPod,          // Volume requirements per pod
-		recorder:            recorder,
-		preferences:         &Preferences{ToleratePreferNoSchedule: toleratePreferNoSchedule},
+		uuid:                  uuid.NewUUID(),
+		kubeClient:            kubeClient,
+		nodeClaimTemplates:    templates,
+		topology:              topology,
+		cluster:               cluster,
+		daemonOverhead:        daemonOverhead,
+		daemonHostPortUsage:   daemonHostPortUsage,
+		cachedPodData:         map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
+		volumeReqsByPod:       volumeReqsByPod,          // Volume requirements per pod
+		nodeLabelRequirements: nodeLabelRequirements,
+		daemonSetPods:         daemonSetPods,
+		nodeDaemonResources:   nodeDaemonResources,
+		recorder:              recorder,
+		preferences:           &Preferences{ToleratePreferNoSchedule: toleratePreferNoSchedule},
 		remainingResources: lo.SliceToMap(inputs.nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
 			// The limits are copied so that scheduling never mutates the input
 			return np.Name, corev1.ResourceList(np.Spec.Limits).DeepCopy()
@@ -175,8 +191,8 @@ func NewScheduler(
 		minValuesPolicy:         minValuesPolicy,
 		numConcurrentReconciles: lo.Ternary(option.Resolve(opts...).numConcurrentReconciles > 0, option.Resolve(opts...).numConcurrentReconciles, 1),
 	}
-	phaseCtx, stop = MeasureNewSchedulerPhase(ctx, PhaseCalculateExistingNodeClaims)
-	s.calculateExistingNodeClaims(phaseCtx, stateNodes, daemonSetPods)
+	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseCalculateExistingNodeClaims)
+	s.calculateExistingNodeClaims(phaseCtx, stateNodes)
 	stop()
 	return s
 }
@@ -199,6 +215,9 @@ type Scheduler struct {
 	daemonHostPortUsage     map[*NodeClaimTemplate]*scheduling.HostPortUsage
 	cachedPodData           map[types.UID]*PodData                // (Pod Namespace/Name) -> pre-computed data for pods to avoid re-computation and memory usage
 	volumeReqsByPod         map[types.UID]scheduling.Requirements // Volume topology requirements per pod
+	nodeLabelRequirements   map[string]scheduling.Requirements
+	daemonSetPods           []*corev1.Pod
+	nodeDaemonResources     map[string]corev1.ResourceList
 	preferences             *Preferences
 	topology                *Topology
 	cluster                 *state.Cluster
@@ -677,22 +696,29 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 	return multierr.Combine(errs...)
 }
 
-func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []*state.StateNode, daemonSetPods []*corev1.Pod) {
+func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []*state.StateNode) {
 	// create our existing nodes
 	for _, node := range stateNodes {
 		taints := node.Taints()
-		daemons := s.getCompatibleDaemonPods(ctx, node, taints, daemonSetPods)
-		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, resources.RequestsForPods(daemons...)))
+		daemonResources := s.daemonResourcesForNode(ctx, node, taints)
+		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, daemonResources, s.nodeLabelRequirements[stateNodeCacheKey(node)]))
 		s.updateRemainingResources(node)
 	}
 	s.sortExistingNodes()
+}
+
+func (s *Scheduler) daemonResourcesForNode(ctx context.Context, node *state.StateNode, taints []corev1.Taint) corev1.ResourceList {
+	if cached, ok := s.nodeDaemonResources[stateNodeCacheKey(node)]; ok {
+		return cached.DeepCopy()
+	}
+	return resources.RequestsForPods(s.getCompatibleDaemonPods(ctx, node, taints, s.daemonSetPods)...)
 }
 
 // getCompatibleDaemonPods filters daemon pods that can schedule to the given node
 func (s *Scheduler) getCompatibleDaemonPods(ctx context.Context, node *state.StateNode, taints []corev1.Taint, daemonSetPods []*corev1.Pod) []*corev1.Pod {
 	var daemons []*corev1.Pod
 	for _, p := range daemonSetPods {
-		if s.shouldSkipDaemonPod(ctx, p) {
+		if shouldSkipDaemonPod(ctx, p) {
 			continue
 		}
 		if s.isDaemonPodCompatibleWithNode(p, taints, node.Labels()) {
@@ -702,8 +728,7 @@ func (s *Scheduler) getCompatibleDaemonPods(ctx context.Context, node *state.Sta
 	return daemons
 }
 
-// shouldSkipDaemonPod checks if a daemon pod should be skipped due to DRA requirements
-func (s *Scheduler) shouldSkipDaemonPod(ctx context.Context, p *corev1.Pod) bool {
+func shouldSkipDaemonPod(ctx context.Context, p *corev1.Pod) bool {
 	return pod.HasDRARequirements(p) && karpopts.FromContext(ctx).IgnoreDRARequests
 }
 
@@ -712,10 +737,7 @@ func (s *Scheduler) isDaemonPodCompatibleWithNode(p *corev1.Pod, taints []corev1
 	if err := scheduling.Taints(taints).ToleratesPod(p); err != nil {
 		return false
 	}
-	if err := scheduling.NewLabelRequirements(nodeLabels).Compatible(scheduling.NewStrictPodRequirements(p)); err != nil {
-		return false
-	}
-	return true
+	return requirementsCompatible(scheduling.NewLabelRequirements(nodeLabels), daemonPodRequirements(p))
 }
 
 // updateRemainingResources updates the remaining resources for the node's nodepool
@@ -807,24 +829,47 @@ func getDaemonHostPortUsage(ctx context.Context, nodeClaimTemplates []*NodeClaim
 
 // isDaemonPodCompatible determines if the daemon pod is compatible with the NodeClaimTemplate for daemon scheduling
 func isDaemonPodCompatible(nodeClaimTemplate *NodeClaimTemplate, pod *corev1.Pod) bool {
-	preferences := &Preferences{}
-	// Add a toleration for PreferNoSchedule since a daemon pod shouldn't respect the preference
-	_ = preferences.toleratePreferNoScheduleTaints(pod)
-	if err := scheduling.Taints(nodeClaimTemplate.Spec.Taints).ToleratesPod(pod); err != nil {
+	// Add a toleration for PreferNoSchedule since a daemon pod shouldn't respect the preference.
+	if err := scheduling.Taints(nodeClaimTemplate.Spec.Taints).Tolerates(daemonPodTolerations(pod)); err != nil {
 		return false
 	}
-	for {
-		// We don't consider pod preferences for scheduling requirements since we know that pod preferences won't matter with Daemonset scheduling
-		if nodeClaimTemplate.Requirements.IsCompatible(scheduling.NewStrictPodRequirements(pod), scheduling.AllowUndefinedWellKnownLabels) {
+	for _, requirements := range daemonPodRequirements(pod) {
+		// We don't consider pod preferences for scheduling requirements since we know that pod preferences won't matter with Daemonset scheduling.
+		if nodeClaimTemplate.Requirements.IsCompatible(requirements, scheduling.AllowUndefinedWellKnownLabels) {
 			return true
 		}
-		// If relaxing the Node Affinity term didn't succeed, then this DaemonSet can't schedule to this NodePool
-		// We don't consider other forms of relaxation here since we don't consider pod affinities/anti-affinities
-		// when considering DaemonSet schedulability
-		if preferences.removeRequiredNodeAffinityTerm(pod) == nil {
-			return false
+	}
+	return false
+}
+
+// daemonPodRequirements returns the strict requirements for each required node affinity term on a daemon pod.
+// Required node selector terms have OR semantics, so a daemon is compatible when any one of these sets matches
+// the node or NodeClaimTemplate requirements. This deliberately avoids mutating the pod while evaluating terms.
+func daemonPodRequirements(pod *corev1.Pod) []scheduling.Requirements {
+	nodeSelectorRequirements := scheduling.NewLabelRequirements(pod.Spec.NodeSelector)
+	requiredNodeAffinity := pod.Spec.Affinity
+	if requiredNodeAffinity == nil || requiredNodeAffinity.NodeAffinity == nil || requiredNodeAffinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil || len(requiredNodeAffinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms) == 0 {
+		return []scheduling.Requirements{nodeSelectorRequirements}
+	}
+
+	terms := requiredNodeAffinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	result := make([]scheduling.Requirements, 0, len(terms))
+	for _, term := range terms {
+		requirements := scheduling.NewRequirements(nodeSelectorRequirements.Values()...)
+		requirements.Add(scheduling.NewNodeSelectorRequirements(term.MatchExpressions...).Values()...)
+		result = append(result, requirements)
+	}
+	return result
+}
+
+func daemonPodTolerations(pod *corev1.Pod) []corev1.Toleration {
+	toleration := corev1.Toleration{Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectPreferNoSchedule}
+	for _, existing := range pod.Spec.Tolerations {
+		if existing.MatchToleration(&toleration) {
+			return pod.Spec.Tolerations
 		}
 	}
+	return append(append([]corev1.Toleration{}, pod.Spec.Tolerations...), toleration)
 }
 
 // subtractMax returns the remaining resources after subtracting the max resource quantity per instance type. To avoid

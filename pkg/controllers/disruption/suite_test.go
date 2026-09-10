@@ -243,7 +243,7 @@ var _ = Describe("Simulate Scheduling", func() {
 
 		schedulerFactory, err := disruption.NewSchedulerFactory(ctx, prov)
 		Expect(err).To(Succeed())
-		results, err := disruption.SimulateScheduling(ctx, env.Client, cluster, prov, schedulerFactory, candidate)
+		results, err := disruption.SimulateScheduling(ctx, env.Client, prov, schedulerFactory, candidate)
 		Expect(err).To(Succeed())
 		Expect(results.PodErrors[pod]).To(BeNil())
 	})

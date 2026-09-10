@@ -302,7 +302,7 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 	if err != nil {
 		return err
 	}
-	results, err := SimulateScheduling(ctx, v.kubeClient, v.cluster, v.provisioner, schedulerFactory, candidates...)
+	results, err := SimulateScheduling(ctx, v.kubeClient, v.provisioner, schedulerFactory, candidates...)
 	if err != nil {
 		return fmt.Errorf("simluating scheduling, %w", err)
 	}

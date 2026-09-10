@@ -155,7 +155,7 @@ func BenchmarkSimulateScheduling_ClusterFixture(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		candidate := bench.candidates[bench.rng.Intn(len(bench.candidates))]
-		if _, err := SimulateScheduling(bench.ctx, bench.env.Client, bench.env.Cluster, bench.env.Provisioner, bench.schedulerFactory, candidate); err != nil {
+		if _, err := SimulateScheduling(bench.ctx, bench.env.Client, bench.env.Provisioner, bench.schedulerFactory, candidate); err != nil {
 			b.Fatalf("simulating scheduling for candidate %q: %v", candidate.Name(), err)
 		}
 	}
