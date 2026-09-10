@@ -144,6 +144,10 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 	}
 
 	lastSavedCommand := Command{}
+	schedulerFactory, err := newConsolidationSchedulerFactory(ctx, m.provisioner)
+	if err != nil {
+		return Command{}, nil, err
+	}
 	var lastSavedPerPool map[string]ScoreResult
 	// Defer rejection events until search completes to avoid log2(N) * pools
 	// duplicate emissions.
@@ -157,7 +161,7 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 		candidatesToConsolidate := candidates[0 : mid+1]
 
 		// Pass the timeout context to ensure sub-operations can be canceled
-		cmd, err := m.computeConsolidation(timeoutCtx, candidatesToConsolidate...)
+		cmd, err := m.computeConsolidation(timeoutCtx, schedulerFactory, candidatesToConsolidate...)
 		// context deadline exceeded will return to the top of the loop and either return nothing or the last saved command
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {

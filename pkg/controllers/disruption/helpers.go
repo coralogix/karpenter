@@ -56,9 +56,46 @@ func measureSimulateSchedulingPhase(ctx context.Context, phase string) (context.
 	return cxtracing.Measure(ctx, metricStop, "karpenter.disruption.simulate_scheduling."+phase, attribute.String("phase", phase))
 }
 
+func NewSchedulerFactory(ctx context.Context, provisioner *provisioning.Provisioner, schedulerOpts ...scheduling.Options) (*provisioning.SchedulerFactory, error) {
+	var opts []scheduling.Options
+	if options.FromContext(ctx).PreferencePolicy == options.PreferencePolicyIgnore {
+		opts = append(opts, scheduling.IgnorePreferences)
+	}
+	opts = append(opts, scheduling.MinValuesPolicy(options.FromContext(ctx).MinValuesPolicy))
+	opts = append(opts, schedulerOpts...)
+	factory, err := provisioner.NewSchedulerFactory(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("creating scheduler factory, %w", err)
+	}
+	return factory, nil
+}
+
 //nolint:gocyclo
 func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
 	schedulerOpts []scheduling.Options, candidates ...*Candidate,
+) (scheduling.Results, error) {
+	return simulateSchedulingWithOptions(ctx, kubeClient, cluster, provisioner, clk, recorder, schedulerOpts, candidates...)
+}
+
+func simulateSchedulingWithOptions(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
+	schedulerOpts []scheduling.Options, candidates ...*Candidate,
+) (scheduling.Results, error) {
+	factory, err := NewSchedulerFactory(ctx, provisioner, schedulerOpts...)
+	if err != nil {
+		return scheduling.Results{}, err
+	}
+	return simulateScheduling(ctx, kubeClient, cluster, provisioner, clk, recorder, factory, candidates...)
+}
+
+func simulateSchedulingWithFactory(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
+	schedulerFactory *provisioning.SchedulerFactory, candidates ...*Candidate,
+) (scheduling.Results, error) {
+	return simulateScheduling(ctx, kubeClient, cluster, provisioner, clk, recorder, schedulerFactory, candidates...)
+}
+
+//nolint:gocyclo
+func simulateScheduling(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
+	schedulerFactory *provisioning.SchedulerFactory, candidates ...*Candidate,
 ) (scheduling.Results, error) {
 	ctx, stopRoot := cxtracing.Measure(ctx, metrics.Measure(SimulateSchedulingDurationSeconds, map[string]string{}), "karpenter.disruption.simulate_scheduling")
 	defer stopRoot()
@@ -115,22 +152,22 @@ func SimulateScheduling(ctx context.Context, kubeClient client.Client, cluster *
 	}
 	pods = append(pods, deletingNodePods...)
 
-	var opts []scheduling.Options
-	if options.FromContext(ctx).PreferencePolicy == options.PreferencePolicyIgnore {
-		opts = append(opts, scheduling.IgnorePreferences)
+	if schedulerFactory == nil {
+		var err error
+		schedulerFactory, err = NewSchedulerFactory(ctx, provisioner)
+		if err != nil {
+			return scheduling.Results{}, err
+		}
 	}
-	opts = append(opts, scheduling.MinValuesPolicy(options.FromContext(ctx).MinValuesPolicy))
-	opts = append(opts, schedulerOpts...)
 	// Both consolidation candidate pods and pods on already-deleting nodes are migrating off their current nodes, so
 	// the DRA allocator should treat the devices they hold as available for reallocation (and re-allocate their claims).
 	deletingPodUIDs := sets.New(lo.Map(append(candidatePods, deletingNodePods...), func(p *corev1.Pod, _ int) types.UID { return p.UID })...)
 	phaseCtx, stop = measureSimulateSchedulingPhase(ctx, phaseNewScheduler)
-	scheduler, err := provisioner.NewScheduler(
+	scheduler, err := schedulerFactory.NewScheduler(
 		log.IntoContext(phaseCtx, operatorlogging.NopLogger),
 		pods,
 		stateNodes,
 		deletingPodUIDs,
-		opts...,
 	)
 	stop()
 	if err != nil {

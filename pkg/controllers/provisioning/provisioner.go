@@ -261,7 +261,59 @@ func (p *Provisioner) consolidationWarnings(ctx context.Context, pods []*corev1.
 
 var ErrNodePoolsNotFound = errors.New("no nodepools found")
 
-//nolint:gocyclo
+// SchedulerFactory calculates the NodePool inputs once and reuses them across scheduling simulations.
+type SchedulerFactory struct {
+	provisioner   *Provisioner
+	nodePools     []*v1.NodePool
+	instanceTypes map[string][]*cloudprovider.InstanceType
+	opts          []scheduler.Options
+}
+
+func (p *Provisioner) NewSchedulerFactory(ctx context.Context, opts ...scheduler.Options) (*SchedulerFactory, error) {
+	nodePools, instanceTypes, err := p.listNodePoolsAndInstanceTypes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &SchedulerFactory{provisioner: p, nodePools: nodePools, instanceTypes: instanceTypes, opts: opts}, nil
+}
+
+func (f *SchedulerFactory) NewScheduler(ctx context.Context, pods []*corev1.Pod, stateNodes []*state.StateNode, deletingPodUIDs sets.Set[types.UID]) (*scheduler.Scheduler, error) {
+	p := f.provisioner
+	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseVolumeTopology)
+	pods, volumeReqs, err := p.getVolumeTopologyRequirements(phaseCtx, pods)
+	stop()
+	if err != nil {
+		return nil, fmt.Errorf("getting volume topology requirements, %w", err)
+	}
+
+	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseNewTopology)
+	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, f.nodePools, f.instanceTypes, pods, f.opts...)
+	stop()
+	if err != nil {
+		return nil, fmt.Errorf("tracking topology counts, %w", err)
+	}
+	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListDaemonSets)
+	daemonSetPods, err := p.getDaemonSetPods(phaseCtx)
+	stop()
+	if err != nil {
+		return nil, fmt.Errorf("getting daemon pods, %w", err)
+	}
+
+	var allocator *dynamicresources.Allocator
+	if !options.FromContext(ctx).IgnoreDRARequests {
+		inClusterSlices, err := p.gatherResourceSlices(ctx, stateNodes)
+		if err != nil {
+			return nil, fmt.Errorf("gathering resourceslices, %w", err)
+		}
+		allocatedDevices, err := p.gatherAllocatedDevices(ctx, deletingPodUIDs)
+		if err != nil {
+			return nil, fmt.Errorf("gathering allocated devices, %w", err)
+		}
+		allocator = dynamicresources.NewAllocator(inClusterSlices, allocatedDevices, dynamicresources.BuildAttributeBindings(f.instanceTypes), p.kubeClient, deletingPodUIDs)
+	}
+	return scheduler.NewScheduler(ctx, p.kubeClient, f.nodePools, p.cluster, stateNodes, topology, f.instanceTypes, daemonSetPods, p.recorder, p.clock, volumeReqs, allocator, f.opts...), nil
+}
+
 func (p *Provisioner) NewScheduler(
 	ctx context.Context,
 	pods []*corev1.Pod,
@@ -269,11 +321,20 @@ func (p *Provisioner) NewScheduler(
 	deletingPodUIDs sets.Set[types.UID],
 	opts ...scheduler.Options,
 ) (*scheduler.Scheduler, error) {
+	factory, err := p.NewSchedulerFactory(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return factory.NewScheduler(ctx, pods, stateNodes, deletingPodUIDs)
+}
+
+//nolint:gocyclo
+func (p *Provisioner) listNodePoolsAndInstanceTypes(ctx context.Context) ([]*v1.NodePool, map[string][]*cloudprovider.InstanceType, error) {
 	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListNodePools)
 	nodePools, err := nodepoolutils.ListManaged(phaseCtx, p.kubeClient, p.cloudProvider)
 	stop()
 	if err != nil {
-		return nil, fmt.Errorf("listing nodepools, %w", err)
+		return nil, nil, fmt.Errorf("listing nodepools, %w", err)
 	}
 	nodePools = lo.Filter(nodePools, func(np *v1.NodePool, _ int) bool {
 		if nodepoolutils.IsStatic(np) {
@@ -286,7 +347,7 @@ func (p *Provisioner) NewScheduler(
 		return np.DeletionTimestamp.IsZero()
 	})
 	if len(nodePools) == 0 {
-		return nil, ErrNodePoolsNotFound
+		return nil, nil, ErrNodePoolsNotFound
 	}
 
 	// nodeTemplates generated from NodePools are ordered by weight
@@ -304,7 +365,8 @@ func (p *Provisioner) NewScheduler(
 				continue
 			}
 			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("getting instance types, %w", err)
+				stop()
+				return nil, nil, fmt.Errorf("getting instance types, %w", err)
 			}
 			log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Error(err, "skipping, unable to resolve instance types")
 			continue
@@ -316,49 +378,7 @@ func (p *Provisioner) NewScheduler(
 		instanceTypes[np.Name] = its
 	}
 	stop()
-
-	// Get volume topology requirements WITHOUT modifying pods.
-	// Volume requirements are passed separately and added to nodeRequirements only.
-	// Pods that fail volume topology lookup are excluded from scheduling.
-	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseVolumeTopology)
-	pods, volumeReqs, err := p.getVolumeTopologyRequirements(phaseCtx, pods)
-	stop()
-	if err != nil {
-		return nil, fmt.Errorf("getting volume topology requirements, %w", err)
-	}
-
-	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
-	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseNewTopology)
-	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, nodePools, instanceTypes, pods, opts...)
-	stop()
-	if err != nil {
-		return nil, fmt.Errorf("tracking topology counts, %w", err)
-	}
-	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListDaemonSets)
-	daemonSetPods, err := p.getDaemonSetPods(phaseCtx)
-	stop()
-	if err != nil {
-		return nil, fmt.Errorf("getting daemon pods, %w", err)
-	}
-
-	// Build the DRA device allocator for this scheduling loop. Slice/device gathering happens here (rather than in the
-	// scheduler) so the same filtering can be reused by other schedulers, e.g. disruption. When DRA support is disabled,
-	// the allocator is left nil and the scheduler short-circuits DRA pods.
-	var allocator *dynamicresources.Allocator
-	if !options.FromContext(ctx).IgnoreDRARequests {
-		inClusterSlices, err := p.gatherResourceSlices(ctx, stateNodes)
-		if err != nil {
-			return nil, fmt.Errorf("gathering resourceslices, %w", err)
-		}
-		allocatedDevices, err := p.gatherAllocatedDevices(ctx, deletingPodUIDs)
-		if err != nil {
-			return nil, fmt.Errorf("gathering allocated devices, %w", err)
-		}
-		allocator = dynamicresources.NewAllocator(inClusterSlices, allocatedDevices, dynamicresources.BuildAttributeBindings(instanceTypes), p.kubeClient, deletingPodUIDs)
-	}
-
-	// Pass volumeReqs to scheduler - added to nodeRequirements for NodeClaim zone selection
-	return scheduler.NewScheduler(ctx, p.kubeClient, nodePools, p.cluster, stateNodes, topology, instanceTypes, daemonSetPods, p.recorder, p.clock, volumeReqs, allocator, opts...), nil
+	return nodePools, instanceTypes, nil
 }
 
 func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
