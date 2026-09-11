@@ -35,15 +35,39 @@ type ExistingNode struct {
 	topology           *Topology
 	remainingResources v1.ResourceList
 	requirements       scheduling.Requirements
+	// These managers are owned by this scheduling attempt. StateNode is a
+	// captured, read-only view and must not receive mutations from a
+	// simulation.
+	hostPortUsage *scheduling.HostPortUsage
+	volumeUsage   *scheduling.VolumeUsage
 }
 
 func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, daemonResources v1.ResourceList) *ExistingNode {
-	// The state node passed in here must be a deep copy from cluster state as we modify it
-	// the remaining daemonResources to schedule are the total daemonResources minus what has already scheduled
+	return prepareExistingNode(n, taints, daemonResources).materialize(topology)
+}
+
+// preparedExistingNode contains the immutable facts used to evaluate an
+// existing node. The StateNode belongs to the captured cluster snapshot and
+// is only read while scheduling; each materialized ExistingNode receives its
+// own mutable allocation managers and remaining resources.
+type preparedExistingNode struct {
+	stateNode          *state.StateNode
+	cachedAvailable    v1.ResourceList
+	cachedTaints       []v1.Taint
+	remainingResources v1.ResourceList
+	requirements       scheduling.Requirements
+	hostPortUsage      *scheduling.HostPortUsage
+	volumeUsage        *scheduling.VolumeUsage
+}
+
+func prepareExistingNode(n *state.StateNode, taints []v1.Taint, daemonResources v1.ResourceList) *preparedExistingNode {
+	// Work on a copy since the daemon resource map may be shared by the
+	// baseline or by another node preparation.
+	daemonResources = daemonResources.DeepCopy()
 	resources.SubtractFrom(daemonResources, n.DaemonSetRequests())
-	// If unexpected daemonset pods schedule to the node due to labels appearing on the node which cause the
-	// DS to be able to schedule, we need to ensure that we don't let our remainingDaemonResources go negative as
-	// it will cause us to mis-calculate the amount of remaining resources
+	// If unexpected daemonset pods schedule to the node due to labels appearing
+	// on the node which cause the DS to be able to schedule, keep the remaining
+	// daemon resources from going negative.
 	for k, v := range daemonResources {
 		if v.AsApproximateFloat64() < 0 {
 			v.Set(0)
@@ -51,17 +75,60 @@ func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, 
 		}
 	}
 	available := n.Available()
-	node := &ExistingNode{
-		StateNode:          n,
+	requirements := scheduling.NewLabelRequirements(n.Labels())
+	requirements.Add(scheduling.NewRequirement(v1.LabelHostname, v1.NodeSelectorOpIn, n.HostName()))
+	return &preparedExistingNode{
+		stateNode:          n,
 		cachedAvailable:    available,
-		cachedTaints:       taints,
-		topology:           topology,
+		cachedTaints:       append([]v1.Taint(nil), taints...),
 		remainingResources: resources.Subtract(available, daemonResources),
-		requirements:       scheduling.NewLabelRequirements(n.Labels()),
+		requirements:       requirements,
+		hostPortUsage:      cloneHostPortUsage(n.HostPortUsage()),
+		volumeUsage:        cloneVolumeUsage(n.VolumeUsage()),
 	}
-	node.requirements.Add(scheduling.NewRequirement(v1.LabelHostname, v1.NodeSelectorOpIn, n.HostName()))
-	topology.Register(v1.LabelHostname, n.HostName())
-	return node
+}
+
+func (n *preparedExistingNode) materialize(topology *Topology) *ExistingNode {
+	if topology != nil {
+		topology.Register(v1.LabelHostname, n.stateNode.HostName())
+	}
+	return &ExistingNode{
+		StateNode: n.stateNode,
+		// These fields are immutable after preparation and can be shared by
+		// concurrent simulations. Only the managers and remainingResources
+		// below are simulation-owned mutable state.
+		cachedAvailable:    n.cachedAvailable,
+		cachedTaints:       n.cachedTaints,
+		topology:           topology,
+		remainingResources: n.remainingResources.DeepCopy(),
+		requirements:       n.requirements,
+		hostPortUsage:      cloneHostPortUsage(n.hostPortUsage),
+		volumeUsage:        cloneVolumeUsage(n.volumeUsage),
+	}
+}
+
+func cloneHostPortUsage(usage *scheduling.HostPortUsage) *scheduling.HostPortUsage {
+	if usage == nil {
+		return nil
+	}
+	return usage.DeepCopy()
+}
+
+func cloneVolumeUsage(usage *scheduling.VolumeUsage) *scheduling.VolumeUsage {
+	if usage == nil {
+		return nil
+	}
+	return usage.DeepCopy()
+}
+
+// HostPortUsage returns the allocation state owned by this scheduling attempt.
+func (n *ExistingNode) HostPortUsage() *scheduling.HostPortUsage {
+	return n.hostPortUsage
+}
+
+// VolumeUsage returns the allocation state owned by this scheduling attempt.
+func (n *ExistingNode) VolumeUsage() *scheduling.VolumeUsage {
+	return n.volumeUsage
 }
 
 // CanAdd returns whether the pod can be added to the ExistingNode

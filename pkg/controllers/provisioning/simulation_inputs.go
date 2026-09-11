@@ -60,7 +60,10 @@ type PreparedSimulationInputs struct {
 	factory          *SchedulerFactory
 	stateNodes       state.StateNodes
 	catalog          *simulationPodCatalog
-	volumeData       map[types.UID]scheduling.VolumeData
+	volumeSource     scheduling.VolumeSource
+	capturedVolumes  sets.Set[types.UID]
+	topologyErrors   sets.Set[types.UID]
+	schedulerState   *scheduling.PreparedSchedulerState
 	preparedTopology *scheduling.PreparedTopology
 }
 
@@ -96,11 +99,27 @@ func (p *Provisioner) NewPreparedSimulationInputs(ctx context.Context, pods []*c
 	if err != nil {
 		return nil, fmt.Errorf("preparing topology snapshot, %w", err)
 	}
+	ownedStateNodes := cloneStateNodes(stateNodes)
+	schedulerState, err := scheduling.NewPreparedSchedulerState(ctx, factory.baseline, ownedStateNodes)
+	if err != nil {
+		return nil, fmt.Errorf("preparing scheduler state snapshot, %w", err)
+	}
+	topologyErrors := sets.New[types.UID]()
+	capturedVolumes := sets.New[types.UID]()
+	for uid, data := range volumeData {
+		capturedVolumes.Insert(uid)
+		if data.RequirementError != nil {
+			topologyErrors.Insert(uid)
+		}
+	}
 	return &PreparedSimulationInputs{
 		factory:          factory,
-		stateNodes:       cloneStateNodes(stateNodes),
+		stateNodes:       ownedStateNodes,
 		catalog:          catalog,
-		volumeData:       volumeData,
+		volumeSource:     scheduling.NewCapturedVolumeSource(volumeData),
+		capturedVolumes:  capturedVolumes,
+		topologyErrors:   topologyErrors,
+		schedulerState:   schedulerState,
 		preparedTopology: preparedTopology,
 	}, nil
 }
@@ -238,31 +257,28 @@ func (s *PreparedSimulationInputs) validateRemovedNodes(names []string) (sets.Se
 	return removed, nil
 }
 
-func (s *PreparedSimulationInputs) selectSimulationPods(ids []SimulationPodID) ([]*corev1.Pod, []*corev1.Pod, map[types.UID]scheduling.VolumeData, error) {
+func (s *PreparedSimulationInputs) selectSimulationPods(ids []SimulationPodID) ([]*corev1.Pod, []*corev1.Pod, error) {
 	seen := sets.New[SimulationPodID]()
 	pods := make([]*corev1.Pod, 0, len(ids))
 	topologyPods := make([]*corev1.Pod, 0, len(ids))
-	volumeData := make(map[types.UID]scheduling.VolumeData, len(ids))
 	for _, id := range ids {
 		if id.catalog != s.catalog || id.index < 0 || id.index >= len(s.catalog.pods) {
-			return nil, nil, nil, errors.New("pod ID is outside simulation pod catalog")
+			return nil, nil, errors.New("pod ID is outside simulation pod catalog")
 		}
 		if seen.Has(id) {
-			return nil, nil, nil, fmt.Errorf("pod ID at catalog index %d appears more than once", id.index)
+			return nil, nil, fmt.Errorf("pod ID at catalog index %d appears more than once", id.index)
 		}
 		seen.Insert(id)
 		pod := s.catalog.pods[id.index].DeepCopy()
-		data, ok := s.volumeData[pod.UID]
-		if !ok {
-			return nil, nil, nil, fmt.Errorf("volume data for pod %s/%s was not captured", pod.Namespace, pod.Name)
+		if !s.capturedVolumes.Has(pod.UID) {
+			return nil, nil, fmt.Errorf("volume data for pod %s/%s was not captured", pod.Namespace, pod.Name)
 		}
 		pods = append(pods, pod)
-		if data.RequirementError == nil {
+		if !s.topologyErrors.Has(pod.UID) {
 			topologyPods = append(topologyPods, pod)
 		}
-		volumeData[pod.UID] = data
 	}
-	return pods, topologyPods, volumeData, nil
+	return pods, topologyPods, nil
 }
 
 // NewRun creates a scheduler and its exact mutable solve pods from one
@@ -276,20 +292,16 @@ func (s *PreparedSimulationInputs) NewRun(ctx context.Context, scenario Scenario
 	if err != nil {
 		return nil, err
 	}
-	pods, topologyPods, volumeData, err := s.selectSimulationPods(scenario.PodIDs)
+	pods, topologyPods, err := s.selectSimulationPods(scenario.PodIDs)
 	if err != nil {
 		return nil, err
 	}
 
-	stateNodes := lo.Filter(s.stateNodes, func(node *state.StateNode, _ int) bool {
-		return !node.MarkedForDeletion() && !removed.Has(node.Name())
-	})
-	volumeSource := scheduling.NewCapturedVolumeSource(volumeData)
 	topology, err := s.preparedTopology.Materialize(ctx, topologyPods, scenario.RemovedNodeNames...)
 	if err != nil {
 		return nil, fmt.Errorf("materializing topology, %w", err)
 	}
-	newScheduler, err := s.factory.newSchedulerWithTopology(ctx, cloneStateNodes(stateNodes), topology, volumeSource)
+	newScheduler, err := s.schedulerState.NewScheduler(ctx, s.factory.provisioner.cluster, topology, s.factory.provisioner.recorder, s.factory.provisioner.clock, s.volumeSource, removed)
 	if err != nil {
 		return nil, fmt.Errorf("creating simulation scheduler, %w", err)
 	}
