@@ -98,14 +98,10 @@ func (i *NodePoolInputs) DeepCopy() *NodePoolInputs {
 func NewNodePoolInputs(ctx context.Context, recorder events.Recorder, nodePools []*v1.NodePool,
 	instanceTypes map[string][]*cloudprovider.InstanceType, opts ...Options,
 ) *NodePoolInputs {
-	_, stop := MeasureNewSchedulerPhase(ctx, PhaseBuildDomainGroups)
 	domainGroups := buildDomainGroups(nodePools, instanceTypes)
-	stop()
 
 	minValuesPolicy := option.Resolve(opts...).minValuesPolicy
-	_, stop = MeasureNewSchedulerPhase(ctx, PhaseFilterInstanceTypes)
 	nodeClaimTemplates := newNodeClaimTemplates(ctx, recorder, nodePools, instanceTypes, minValuesPolicy)
-	stop()
 
 	return &NodePoolInputs{
 		nodePools:          nodePools,

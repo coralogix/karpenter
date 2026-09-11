@@ -31,10 +31,7 @@ const (
 	CandidatesIneligible         = "candidates_ineligible"
 	simulateSchedulingPhaseLabel = "phase"
 
-	phaseDeepCopyNodes  = "deep_copy_nodes"
-	phaseGetPendingPods = "get_pending_pods"
-	phaseNewScheduler   = "new_scheduler"
-	phaseSolve          = "solve"
+	phaseSolve = "solve"
 )
 
 func init() {
@@ -73,6 +70,17 @@ var (
 			Subsystem: voluntaryDisruptionSubsystem,
 			Name:      "simulate_scheduling_duration_seconds",
 			Help:      "Duration of SimulateScheduling in seconds.",
+			Buckets:   metrics.DurationBuckets(),
+		},
+		[]string{},
+	)
+	SimulateSchedulingPreparationDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "simulate_scheduling_preparation_duration_seconds",
+			Help:      "Duration of preparing the inputs shared by disruption scheduling simulations.",
 			Buckets:   metrics.DurationBuckets(),
 		},
 		[]string{},
