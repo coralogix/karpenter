@@ -66,6 +66,12 @@ type Topology struct {
 	stateNodes   []*state.StateNode
 }
 
+// namespaceResolver supplies the namespaces selected by an affinity term.
+// The live topology uses the API-backed resolver below; a prepared topology
+// can provide a snapshot-backed resolver while reusing the same rule-to-group
+// construction.
+type namespaceResolver func(context.Context, string, []string, *metav1.LabelSelector) (sets.Set[string], error)
+
 func NewTopology(
 	ctx context.Context,
 	kubeClient client.Client,
@@ -304,13 +310,11 @@ func (t *Topology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Po
 	// required to enforce them so it just adds complexity for very little
 	// value.  The problem with them comes from the relaxation process, the pod
 	// we are relaxing is not the pod with the anti-affinity term.
-	for _, term := range pod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
-		namespaces, err := t.buildNamespaceList(ctx, pod.Namespace, term.Namespaces, term.NamespaceSelector)
-		if err != nil {
-			return err
-		}
-
-		tg := NewTopologyGroup(TopologyTypePodAntiAffinity, term.TopologyKey, pod, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil, t.domainGroups[term.TopologyKey])
+	topologyGroups, err := newForInverseAntiAffinity(ctx, pod, t.domainGroups, t.buildNamespaceList)
+	if err != nil {
+		return err
+	}
+	for _, tg := range topologyGroups {
 
 		hash := tg.Hash()
 		if existing, ok := t.inverseTopologyGroups[hash]; !ok {
@@ -439,14 +443,30 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 }
 
 func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
+	return newForTopologies(p, t.preferencePolicy, t.domainGroups)
+}
+
+// newForAffinities returns a list of topology groups that have been constructed based on the input pod and required/preferred affinity terms
+func (t *Topology) newForAffinities(ctx context.Context, p *corev1.Pod) ([]*TopologyGroup, error) {
+	return newForAffinities(ctx, p, t.preferencePolicy, t.domainGroups, t.buildNamespaceList)
+}
+
+func newForTopologies(p *corev1.Pod, preferencePolicy PreferencePolicy, domainGroups map[string]TopologyDomainGroup) []*TopologyGroup {
 	var topologyGroups []*TopologyGroup
 	for _, tsc := range p.Spec.TopologySpreadConstraints {
-		if t.preferencePolicy == PreferencePolicyIgnore && tsc.WhenUnsatisfiable != corev1.DoNotSchedule {
+		if preferencePolicy == PreferencePolicyIgnore && tsc.WhenUnsatisfiable != corev1.DoNotSchedule {
 			continue
+		}
+		// MatchLabelKeys are contextual to this pod. Copy the selector before
+		// adding the contextual expressions so building one group cannot mutate
+		// the pod or affect a later topology update.
+		selector := tsc.LabelSelector.DeepCopy()
+		if selector == nil && len(tsc.MatchLabelKeys) > 0 {
+			selector = &metav1.LabelSelector{}
 		}
 		for _, key := range tsc.MatchLabelKeys {
 			if value, ok := p.Labels[key]; ok {
-				tsc.LabelSelector.MatchExpressions = append(tsc.LabelSelector.MatchExpressions, metav1.LabelSelectorRequirement{
+				selector.MatchExpressions = append(selector.MatchExpressions, metav1.LabelSelectorRequirement{
 					Key:      key,
 					Operator: metav1.LabelSelectorOpIn,
 					Values:   []string{value},
@@ -458,19 +478,18 @@ func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
 			tsc.TopologyKey,
 			p,
 			sets.New(p.Namespace),
-			tsc.LabelSelector,
+			selector,
 			tsc.MaxSkew,
 			tsc.MinDomains,
 			tsc.NodeTaintsPolicy,
 			tsc.NodeAffinityPolicy,
-			t.domainGroups[tsc.TopologyKey],
+			domainGroups[tsc.TopologyKey],
 		))
 	}
 	return topologyGroups
 }
 
-// newForAffinities returns a list of topology groups that have been constructed based on the input pod and required/preferred affinity terms
-func (t *Topology) newForAffinities(ctx context.Context, p *corev1.Pod) ([]*TopologyGroup, error) {
+func newForAffinities(ctx context.Context, p *corev1.Pod, preferencePolicy PreferencePolicy, domainGroups map[string]TopologyDomainGroup, resolveNamespaces namespaceResolver) ([]*TopologyGroup, error) {
 	var topologyGroups []*TopologyGroup
 	// No affinity defined
 	if p.Spec.Affinity == nil {
@@ -481,7 +500,7 @@ func (t *Topology) newForAffinities(ctx context.Context, p *corev1.Pod) ([]*Topo
 	// include both soft and hard affinity terms
 	if p.Spec.Affinity.PodAffinity != nil {
 		affinityTerms[TopologyTypePodAffinity] = append(affinityTerms[TopologyTypePodAffinity], p.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution...)
-		if t.preferencePolicy == PreferencePolicyRespect {
+		if preferencePolicy == PreferencePolicyRespect {
 			for _, term := range p.Spec.Affinity.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution {
 				affinityTerms[TopologyTypePodAffinity] = append(affinityTerms[TopologyTypePodAffinity], term.PodAffinityTerm)
 			}
@@ -491,7 +510,7 @@ func (t *Topology) newForAffinities(ctx context.Context, p *corev1.Pod) ([]*Topo
 	// include both soft and hard antiaffinity terms
 	if p.Spec.Affinity.PodAntiAffinity != nil {
 		affinityTerms[TopologyTypePodAntiAffinity] = append(affinityTerms[TopologyTypePodAntiAffinity], p.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution...)
-		if t.preferencePolicy == PreferencePolicyRespect {
+		if preferencePolicy == PreferencePolicyRespect {
 			for _, term := range p.Spec.Affinity.PodAntiAffinity.PreferredDuringSchedulingIgnoredDuringExecution {
 				affinityTerms[TopologyTypePodAntiAffinity] = append(affinityTerms[TopologyTypePodAntiAffinity], term.PodAffinityTerm)
 			}
@@ -501,12 +520,27 @@ func (t *Topology) newForAffinities(ctx context.Context, p *corev1.Pod) ([]*Topo
 	// build topologies
 	for topologyType, terms := range affinityTerms {
 		for _, term := range terms {
-			namespaces, err := t.buildNamespaceList(ctx, p.Namespace, term.Namespaces, term.NamespaceSelector)
+			namespaces, err := resolveNamespaces(ctx, p.Namespace, term.Namespaces, term.NamespaceSelector)
 			if err != nil {
 				return nil, err
 			}
-			topologyGroups = append(topologyGroups, NewTopologyGroup(topologyType, term.TopologyKey, p, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil, t.domainGroups[term.TopologyKey]))
+			topologyGroups = append(topologyGroups, NewTopologyGroup(topologyType, term.TopologyKey, p, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil, domainGroups[term.TopologyKey]))
 		}
+	}
+	return topologyGroups, nil
+}
+
+func newForInverseAntiAffinity(ctx context.Context, p *corev1.Pod, domainGroups map[string]TopologyDomainGroup, resolveNamespaces namespaceResolver) ([]*TopologyGroup, error) {
+	if p.Spec.Affinity == nil || p.Spec.Affinity.PodAntiAffinity == nil {
+		return nil, nil
+	}
+	var topologyGroups []*TopologyGroup
+	for _, term := range p.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+		namespaces, err := resolveNamespaces(ctx, p.Namespace, term.Namespaces, term.NamespaceSelector)
+		if err != nil {
+			return nil, err
+		}
+		topologyGroups = append(topologyGroups, NewTopologyGroup(TopologyTypePodAntiAffinity, term.TopologyKey, p, namespaces, term.LabelSelector, math.MaxInt32, nil, nil, nil, domainGroups[term.TopologyKey]))
 	}
 	return topologyGroups, nil
 }
