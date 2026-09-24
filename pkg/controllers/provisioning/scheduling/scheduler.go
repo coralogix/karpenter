@@ -124,6 +124,45 @@ var IsConsolidationSimulation = func(opts *options) {
 	opts.enforceConsolidateAfter = true
 }
 
+// SchedulerBaseline holds immutable inputs shared by repeated scheduling attempts.
+type SchedulerBaseline struct {
+	inputs                   *NodePoolInputs
+	daemonSetPods            []*corev1.Pod
+	daemonOverheadGroups     map[*NodeClaimTemplate][]DaemonOverheadGroup
+	reservationCapacity      map[string]int
+	toleratePreferNoSchedule bool
+	ignoreDRARequests        bool
+	options                  options
+}
+
+func NewSchedulerBaseline(ctx context.Context, inputs *NodePoolInputs, daemonSetPods []*corev1.Pod, opts ...Options) *SchedulerBaseline {
+	resolved := option.Resolve(opts...)
+	daemonSetPods = cloneDaemonSetPods(daemonSetPods)
+	toleratePreferNoSchedule := false
+	for _, np := range inputs.nodePools {
+		for _, taint := range np.Spec.Template.Spec.Taints {
+			if taint.Effect == corev1.TaintEffectPreferNoSchedule {
+				toleratePreferNoSchedule = true
+			}
+		}
+	}
+	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseDaemonOverhead)
+	daemonOverheadGroups := buildDaemonOverheadGroups(phaseCtx, inputs.nodeClaimTemplates, daemonSetPods)
+	stop()
+	_, stop = MeasureNewSchedulerPhase(ctx, PhaseReservationManager)
+	reservationCapacity := reservationCapacityForInstanceTypes(inputs.instanceTypes)
+	stop()
+	return &SchedulerBaseline{
+		inputs:                   inputs,
+		daemonSetPods:            daemonSetPods,
+		daemonOverheadGroups:     daemonOverheadGroups,
+		reservationCapacity:      reservationCapacity,
+		toleratePreferNoSchedule: toleratePreferNoSchedule,
+		ignoreDRARequests:        karpopts.FromContext(ctx).IgnoreDRARequests,
+		options:                  *resolved,
+	}
+}
+
 func NewScheduler(
 	ctx context.Context,
 	kubeClient client.Client,
@@ -138,63 +177,72 @@ func NewScheduler(
 	allocator *dynamicresources.Allocator,
 	opts ...Options,
 ) *Scheduler {
-	minValuesPolicy := option.Resolve(opts...).minValuesPolicy
-	nodePools := inputs.nodePools
-	instanceTypes := inputs.instanceTypes
+	baseline := NewSchedulerBaseline(ctx, inputs, daemonSetPods, opts...)
+	return newSchedulerFromBaseline(ctx, kubeClient, baseline, cluster, stateNodes, topology, recorder, clock, volumeReqsByPod, allocator)
+}
 
-	// if any of the nodePools add a taint with a prefer no schedule effect, we add a toleration for the taint
-	// during preference relaxation
-	toleratePreferNoSchedule := false
-	for _, np := range nodePools {
-		for _, taint := range np.Spec.Template.Spec.Taints {
-			if taint.Effect == corev1.TaintEffectPreferNoSchedule {
-				toleratePreferNoSchedule = true
-			}
-		}
+func NewSchedulerFromBaseline(
+	ctx context.Context,
+	kubeClient client.Client,
+	baseline *SchedulerBaseline,
+	cluster *state.Cluster,
+	stateNodes []*state.StateNode,
+	topology *Topology,
+	recorder events.Recorder,
+	clock clock.Clock,
+	volumeReqsByPod map[types.UID][]scheduling.Requirements,
+	allocator *dynamicresources.Allocator,
+) (*Scheduler, error) {
+	if baseline.ignoreDRARequests != karpopts.FromContext(ctx).IgnoreDRARequests {
+		return nil, fmt.Errorf("scheduler baseline was prepared with IgnoreDRARequests=%t but attempt context has IgnoreDRARequests=%t", baseline.ignoreDRARequests, karpopts.FromContext(ctx).IgnoreDRARequests)
 	}
-	templates := inputs.nodeClaimTemplates
+	return newSchedulerFromBaseline(ctx, kubeClient, baseline, cluster, stateNodes, topology, recorder, clock, volumeReqsByPod, allocator), nil
+}
 
-	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseDaemonOverhead)
-	daemonOverheadGroups := buildDaemonOverheadGroups(phaseCtx, templates, daemonSetPods)
-	stop()
-
-	_, stop = MeasureNewSchedulerPhase(ctx, PhaseReservationManager)
-	reservationManager := NewReservationManager(instanceTypes)
-	stop()
+func newSchedulerFromBaseline(
+	ctx context.Context,
+	kubeClient client.Client,
+	baseline *SchedulerBaseline,
+	cluster *state.Cluster,
+	stateNodes []*state.StateNode,
+	topology *Topology,
+	recorder events.Recorder,
+	clock clock.Clock,
+	volumeReqsByPod map[types.UID][]scheduling.Requirements,
+	allocator *dynamicresources.Allocator,
+) *Scheduler {
+	inputs := baseline.inputs
 	s := &Scheduler{
 		uuid:                 uuid.NewUUID(),
 		kubeClient:           kubeClient,
-		nodeClaimTemplates:   templates,
+		nodeClaimTemplates:   inputs.nodeClaimTemplates,
 		topology:             topology,
 		cluster:              cluster,
-		daemonOverheadGroups: daemonOverheadGroups,
-		cachedPodData:        map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
-		volumeReqsByPod:      volumeReqsByPod,          // Volume requirements per pod
+		daemonOverheadGroups: cloneDaemonOverheadGroups(baseline.daemonOverheadGroups),
+		cachedPodData:        map[types.UID]*PodData{},
+		volumeReqsByPod:      volumeReqsByPod,
 		recorder:             recorder,
-		preferences:          &Preferences{ToleratePreferNoSchedule: toleratePreferNoSchedule},
-		remainingResources: lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
-			return np.Name, corev1.ResourceList(np.Spec.Limits)
+		preferences:          &Preferences{ToleratePreferNoSchedule: baseline.toleratePreferNoSchedule},
+		remainingResources: lo.SliceToMap(inputs.nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
+			return np.Name, corev1.ResourceList(np.Spec.Limits).DeepCopy()
 		}),
 		clock:                   clock,
-		reservationManager:      reservationManager,
-		reservedOfferingMode:    option.Resolve(opts...).reservedOfferingMode,
-		preferencePolicy:        option.Resolve(opts...).preferencePolicy,
-		minValuesPolicy:         minValuesPolicy,
-		numConcurrentReconciles: lo.Ternary(option.Resolve(opts...).numConcurrentReconciles > 0, option.Resolve(opts...).numConcurrentReconciles, 1),
+		reservationManager:      newReservationManager(baseline.reservationCapacity),
+		reservedOfferingMode:    baseline.options.reservedOfferingMode,
+		preferencePolicy:        baseline.options.preferencePolicy,
+		minValuesPolicy:         baseline.options.minValuesPolicy,
+		numConcurrentReconciles: lo.Ternary(baseline.options.numConcurrentReconciles > 0, baseline.options.numConcurrentReconciles, 1),
 		allocator:               allocator,
-		instanceTypes:           instanceTypes,
+		instanceTypes:           inputs.instanceTypes,
 		cachedResourceClaims:    map[types.NamespacedName]*resourcev1.ResourceClaim{},
 	}
 
-	npByName := lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, *v1.NodePool) {
+	npByName := lo.SliceToMap(inputs.nodePools, func(np *v1.NodePool) (string, *v1.NodePool) {
 		return np.Name, np
 	})
-
 	nodeToNodePool := lo.SliceToMap(stateNodes, func(n *state.StateNode) (string, *v1.NodePool) {
 		return n.Name(), npByName[n.Labels()[v1.NodePoolLabelKey]]
 	})
-	// Build a set of node names that are marked for deletion so we can exempt their pods
-	// from the consolidateAfter destination check
 	deletingNodeNames := sets.New[string]()
 	for n := range cluster.Nodes() {
 		if n.MarkedForDeletion() {
@@ -202,10 +250,35 @@ func NewScheduler(
 		}
 	}
 	s.deletingNodeNames = deletingNodeNames
-	phaseCtx, stop = MeasureNewSchedulerPhase(ctx, PhaseCalculateExistingNodeClaims)
-	s.calculateExistingNodeClaims(phaseCtx, stateNodes, daemonSetPods, nodeToNodePool, option.Resolve(opts...).enforceConsolidateAfter)
+	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseCalculateExistingNodeClaims)
+	s.calculateExistingNodeClaims(phaseCtx, stateNodes, baseline.daemonSetPods, nodeToNodePool, baseline.options.enforceConsolidateAfter)
 	stop()
 	return s
+}
+
+func cloneDaemonSetPods(pods []*corev1.Pod) []*corev1.Pod {
+	return lo.Map(pods, func(p *corev1.Pod, _ int) *corev1.Pod {
+		if p == nil {
+			return nil
+		}
+		return p.DeepCopy()
+	})
+}
+
+func cloneDaemonOverheadGroups(groups map[*NodeClaimTemplate][]DaemonOverheadGroup) map[*NodeClaimTemplate][]DaemonOverheadGroup {
+	result := make(map[*NodeClaimTemplate][]DaemonOverheadGroup, len(groups))
+	for template, sourceGroups := range groups {
+		cloned := make([]DaemonOverheadGroup, len(sourceGroups))
+		for i, group := range sourceGroups {
+			cloned[i] = DaemonOverheadGroup{
+				InstanceTypes:  append([]*cloudprovider.InstanceType(nil), group.InstanceTypes...),
+				DaemonOverhead: group.DaemonOverhead.DeepCopy(),
+				HostPortUsage:  group.HostPortUsage.DeepCopy(),
+			}
+		}
+		result[template] = cloned
+	}
+	return result
 }
 
 type PodData struct {
@@ -971,7 +1044,7 @@ func buildDaemonOverheadGroups(ctx context.Context, nodeClaimTemplates []*NodeCl
 				if pod.HasDRARequirements(p) && karpopts.FromContext(ctx).IgnoreDRARequests {
 					return false
 				}
-				return isDaemonPodCompatible(nct, it, p)
+				return isDaemonPodCompatible(nct, it, p.DeepCopy())
 			})
 			key := podSetKey(compatible)
 			if g, ok := groups[key]; ok {

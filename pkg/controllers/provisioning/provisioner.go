@@ -265,6 +265,7 @@ var ErrNodePoolsNotFound = errors.New("no nodepools found")
 type SchedulerFactory struct {
 	provisioner *Provisioner
 	inputs      *scheduler.NodePoolInputs
+	baseline    *scheduler.SchedulerBaseline
 	opts        []scheduler.Options
 }
 
@@ -274,7 +275,14 @@ func (p *Provisioner) NewSchedulerFactory(ctx context.Context, opts ...scheduler
 		return nil, err
 	}
 	inputs := scheduler.NewNodePoolInputs(ctx, p.recorder, nodePools, instanceTypes, opts...)
-	return &SchedulerFactory{provisioner: p, inputs: inputs, opts: opts}, nil
+	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListDaemonSets)
+	daemonSetPods, err := p.getDaemonSetPods(phaseCtx)
+	stop()
+	if err != nil {
+		return nil, fmt.Errorf("getting daemon pods, %w", err)
+	}
+	baseline := scheduler.NewSchedulerBaseline(ctx, inputs, daemonSetPods, opts...)
+	return &SchedulerFactory{provisioner: p, inputs: inputs, baseline: baseline, opts: opts}, nil
 }
 
 func (f *SchedulerFactory) NewScheduler(ctx context.Context, pods []*corev1.Pod, stateNodes []*state.StateNode, deletingPodUIDs sets.Set[types.UID]) (*scheduler.Scheduler, error) {
@@ -292,13 +300,6 @@ func (f *SchedulerFactory) NewScheduler(ctx context.Context, pods []*corev1.Pod,
 	if err != nil {
 		return nil, fmt.Errorf("tracking topology counts, %w", err)
 	}
-	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListDaemonSets)
-	daemonSetPods, err := p.getDaemonSetPods(phaseCtx)
-	stop()
-	if err != nil {
-		return nil, fmt.Errorf("getting daemon pods, %w", err)
-	}
-
 	var allocator *dynamicresources.Allocator
 	if !options.FromContext(ctx).IgnoreDRARequests {
 		inClusterSlices, err := p.gatherResourceSlices(ctx, stateNodes)
@@ -311,7 +312,7 @@ func (f *SchedulerFactory) NewScheduler(ctx context.Context, pods []*corev1.Pod,
 		}
 		allocator = dynamicresources.NewAllocator(inClusterSlices, allocatedDevices, dynamicresources.BuildAttributeBindings(f.inputs.InstanceTypes()), p.kubeClient, deletingPodUIDs)
 	}
-	return scheduler.NewScheduler(ctx, p.kubeClient, f.inputs, p.cluster, stateNodes, topology, daemonSetPods, p.recorder, p.clock, volumeReqs, allocator, f.opts...), nil
+	return scheduler.NewSchedulerFromBaseline(ctx, p.kubeClient, f.baseline, p.cluster, stateNodes, topology, p.recorder, p.clock, volumeReqs, allocator)
 }
 
 func (p *Provisioner) NewScheduler(
