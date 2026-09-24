@@ -147,17 +147,9 @@ func NewSchedulerBaseline(ctx context.Context, inputs *NodePoolInputs, daemonSet
 	}
 	templates := inputs.nodeClaimTemplates
 
-	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseDaemonOverhead)
-	daemonOverhead := getDaemonOverhead(phaseCtx, templates, cloneDaemonSetPods(daemonSetPods))
-	stop()
-
-	phaseCtx, stop = MeasureNewSchedulerPhase(ctx, PhaseDaemonHostPorts)
-	daemonHostPortUsage := getDaemonHostPortUsage(phaseCtx, templates, cloneDaemonSetPods(daemonSetPods))
-	stop()
-
-	_, stop = MeasureNewSchedulerPhase(ctx, PhaseReservationManager)
+	daemonOverhead := getDaemonOverhead(ctx, templates, cloneDaemonSetPods(daemonSetPods))
+	daemonHostPortUsage := getDaemonHostPortUsage(ctx, templates, cloneDaemonSetPods(daemonSetPods))
 	reservationCapacity := reservationCapacityForInstanceTypes(inputs.instanceTypes)
-	stop()
 
 	return &SchedulerBaseline{
 		inputs:                   inputs,

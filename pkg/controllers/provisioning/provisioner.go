@@ -249,9 +249,7 @@ func (p *Provisioner) NewSchedulerFactory(ctx context.Context, opts ...scheduler
 		return nil, err
 	}
 	inputs := scheduler.NewNodePoolInputs(ctx, p.recorder, nodePools, instanceTypes, opts...)
-	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListDaemonSets)
-	daemonSetPods, err := p.getDaemonSetPods(phaseCtx)
-	stop()
+	daemonSetPods, err := p.getDaemonSetPods(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getting daemon pods, %w", err)
 	}
@@ -318,9 +316,7 @@ func (p *Provisioner) NewScheduler(
 
 //nolint:gocyclo
 func (p *Provisioner) listNodePoolsAndInstanceTypes(ctx context.Context) ([]*v1.NodePool, map[string][]*cloudprovider.InstanceType, error) {
-	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListNodePools)
-	nodePools, err := nodepoolutils.ListManaged(phaseCtx, p.kubeClient, p.cloudProvider)
-	stop()
+	nodePools, err := nodepoolutils.ListManaged(ctx, p.kubeClient, p.cloudProvider)
 	if err != nil {
 		return nil, nil, fmt.Errorf("listing nodepools, %w", err)
 	}
@@ -351,12 +347,9 @@ func (p *Provisioner) listNodePoolsAndInstanceTypes(ctx context.Context) ([]*v1.
 }
 
 func (p *Provisioner) getInstanceTypes(ctx context.Context, nodePools []*v1.NodePool) (map[string][]*cloudprovider.InstanceType, error) {
-	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseGetInstanceTypes)
-	defer stop()
-
 	instanceTypes := map[string][]*cloudprovider.InstanceType{}
 	for _, np := range nodePools {
-		its, err := p.cloudProvider.GetInstanceTypes(phaseCtx, np)
+		its, err := p.cloudProvider.GetInstanceTypes(ctx, np)
 		if err != nil {
 			if cloudprovider.IsUnevaluatedNodePoolError(err) {
 				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).V(1).Info("skipping, awaiting nodeoverlay evaluation")

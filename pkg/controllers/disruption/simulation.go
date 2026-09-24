@@ -62,9 +62,7 @@ type schedulingSimulationSnapshot struct {
 
 func captureSimulationNodesAndPods(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner) (state.StateNodes, []*corev1.Pod, []*corev1.Pod, pdb.Limits, error) {
 	nodes := cluster.DeepCopyNodes()
-	phaseCtx, stop := measureSimulateSchedulingPhase(ctx, phaseGetPendingPods)
-	pendingPods, err := provisioner.GetPendingPods(phaseCtx)
-	stop()
+	pendingPods, err := provisioner.GetPendingPods(ctx)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("determining pending pods, %w", err)
 	}
@@ -146,6 +144,7 @@ func simulationCatalogIDs(inputs *provisioning.PreparedSimulationInputs, snapsho
 // eligibility, and candidate pods once. The provisioning package owns the
 // resulting catalog, baseline, node snapshot, and volume data.
 func NewSchedulingSimulator(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, candidates ...*Candidate) (*SchedulingSimulator, error) {
+	defer metrics.Measure(SimulateSchedulingPreparationDurationSeconds, map[string]string{})()
 	snapshot, err := buildSchedulingSimulatorSnapshot(ctx, kubeClient, cluster, provisioner, candidates...)
 	if err != nil {
 		return nil, err

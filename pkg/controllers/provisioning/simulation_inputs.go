@@ -297,11 +297,15 @@ func (s *PreparedSimulationInputs) NewRun(ctx context.Context, scenario Scenario
 		return nil, err
 	}
 
-	topology, err := s.preparedTopology.Materialize(ctx, topologyPods, scenario.RemovedNodeNames...)
+	topologyCtx, stop := scheduling.MeasureNewSchedulerPhase(ctx, scheduling.PhaseNewTopology)
+	topology, err := s.preparedTopology.Materialize(topologyCtx, topologyPods, scenario.RemovedNodeNames...)
+	stop()
 	if err != nil {
 		return nil, fmt.Errorf("materializing topology, %w", err)
 	}
-	newScheduler, err := s.schedulerState.NewScheduler(ctx, s.factory.provisioner.cluster, topology, s.factory.provisioner.recorder, s.factory.provisioner.clock, s.volumeSource, removed)
+	schedulerCtx, stop := scheduling.MeasureNewSchedulerPhase(ctx, scheduling.PhaseCalculateExistingNodeClaims)
+	newScheduler, err := s.schedulerState.NewScheduler(schedulerCtx, s.factory.provisioner.cluster, topology, s.factory.provisioner.recorder, s.factory.provisioner.clock, s.volumeSource, removed)
+	stop()
 	if err != nil {
 		return nil, fmt.Errorf("creating simulation scheduler, %w", err)
 	}
