@@ -46,7 +46,6 @@ import (
 )
 
 type Topology struct {
-	kubeClient       client.Client
 	preferencePolicy PreferencePolicy
 	// Both the topologyGroups and inverseTopologies are maps of the hash from TopologyGroup.Hash() to the topology group
 	// itself. This is used to allow us to store one topology group that tracks the topology of many pods instead of
@@ -62,8 +61,41 @@ type Topology struct {
 	// excludedPods are the pod UIDs of pods that are excluded from counting.  This is used so we can simulate
 	// moving pods to prevent them from being double counted.
 	excludedPods sets.Set[string]
-	cluster      *state.Cluster
 	stateNodes   []*state.StateNode
+	// activeHostnameDomains contains the hostnames available in this materialized
+	// snapshot. Prepared inverse hostname groups keep these domains out of their
+	// dense per-group maps and consult this set when evaluating broad hostname
+	// requirements.
+	activeHostnameDomains sets.Set[string]
+	source                topologySource
+}
+
+// topologySource is the narrow data boundary used by Topology. The live
+// implementation owns API access; the prepared implementation owns a frozen
+// snapshot. Topology itself never selects an I/O path based on nil data.
+type topologySource interface {
+	resolveNamespaces(context.Context, string, []string, *metav1.LabelSelector) (sets.Set[string], error)
+	countDomains(context.Context, *TopologyGroup, []*state.StateNode, sets.Set[string]) error
+	forEachInverseAffinity(context.Context, func(*corev1.Pod, *corev1.Node) error) error
+}
+
+type liveTopologySource struct {
+	kubeClient client.Client
+	cluster    *state.Cluster
+}
+
+func (s *liveTopologySource) forEachInverseAffinity(ctx context.Context, fn func(*corev1.Pod, *corev1.Node) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var errs error
+	s.cluster.ForPodsWithAntiAffinity(func(pod *corev1.Pod, node *corev1.Node) bool {
+		if err := fn(pod, node); err != nil {
+			errs = multierr.Append(errs, err)
+		}
+		return true
+	})
+	return errs
 }
 
 // namespaceResolver supplies the namespaces selected by an affinity term.
@@ -82,10 +114,9 @@ func NewTopology(
 	opts ...Options,
 ) (*Topology, error) {
 	t := &Topology{
-		kubeClient:            kubeClient,
 		preferencePolicy:      option.Resolve(opts...).preferencePolicy,
-		cluster:               cluster,
 		stateNodes:            stateNodes,
+		source:                &liveTopologySource{kubeClient: kubeClient, cluster: cluster},
 		domainGroups:          inputs.domainGroups,
 		topologyGroups:        map[uint64]*TopologyGroup{},
 		inverseTopologyGroups: map[uint64]*TopologyGroup{},
@@ -157,13 +188,18 @@ func buildDomainGroups(nodePools []*v1.NodePool, instanceTypes map[string][]*clo
 // we are only interested in the fact that it failed to schedule and not why.
 type topologyError struct {
 	topology    *TopologyGroup
+	domains     map[string]int32
 	podDomains  *scheduling.Requirement
 	nodeDomains *scheduling.Requirement
 }
 
 func (t topologyError) Error() string {
+	domains := t.topology.domains
+	if t.domains != nil {
+		domains = t.domains
+	}
 	return fmt.Sprintf("unsatisfiable topology constraint for %s, key=%s (counts = %s, podDomains = %v, nodeDomains = %v", t.topology.Type, t.topology.Key,
-		pretty.Map(t.topology.domains, 25), t.podDomains, t.nodeDomains)
+		pretty.Map(domains, 25), t.podDomains, t.nodeDomains)
 }
 
 // Update unregisters the pod as the owner of all affinities and then creates any new topologies based on the pod spec
@@ -245,10 +281,16 @@ func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequ
 		if nodeRequirements.Has(topology.Key) {
 			nodeDomains = nodeRequirements.Get(topology.Key)
 		}
-		domains := topology.Get(p, podDomains, nodeDomains)
+		var domains *scheduling.Requirement
+		if topology.sparseHostnameDomains {
+			domains = topology.GetWithActiveDomains(p, podDomains, nodeDomains, t.activeHostnameDomains)
+		} else {
+			domains = topology.Get(p, podDomains, nodeDomains)
+		}
 		if domains.Len() == 0 {
 			return nil, topologyError{
 				topology:    topology,
+				domains:     t.effectiveDomains(topology),
 				podDomains:  podDomains,
 				nodeDomains: nodeDomains,
 			}
@@ -258,15 +300,37 @@ func (t *Topology) AddRequirements(p *corev1.Pod, taints []corev1.Taint, podRequ
 	return requirements, nil
 }
 
+func (t *Topology) effectiveDomains(group *TopologyGroup) map[string]int32 {
+	if !group.sparseHostnameDomains || t.activeHostnameDomains == nil {
+		return group.domains
+	}
+	domains := make(map[string]int32, len(group.domains)+len(t.activeHostnameDomains))
+	for domain, count := range group.domains {
+		domains[domain] = count
+	}
+	for domain := range t.activeHostnameDomains {
+		if _, ok := domains[domain]; !ok {
+			domains[domain] = 0
+		}
+	}
+	return domains
+}
+
 // Register is used to register a domain as available across topologies for the given topology key.
 func (t *Topology) Register(topologyKey string, domain string) {
+	if topologyKey == corev1.LabelHostname && t.activeHostnameDomains != nil {
+		t.activeHostnameDomains.Insert(domain)
+	}
 	for _, tg := range t.topologyGroups {
 		if tg.Key == topologyKey {
 			tg.Register(domain)
 		}
 	}
+	if topologyKey == corev1.LabelHostname && t.activeHostnameDomains != nil {
+		return
+	}
 	for _, tg := range t.inverseTopologyGroups {
-		if tg.Key == topologyKey {
+		if tg.Key == topologyKey && (topologyKey != corev1.LabelHostname || !tg.sparseHostnameDomains) {
 			tg.Register(domain)
 		}
 	}
@@ -274,6 +338,9 @@ func (t *Topology) Register(topologyKey string, domain string) {
 
 // Unregister is used to unregister a domain as available across topologies for the given topology key.
 func (t *Topology) Unregister(topologyKey string, domain string) {
+	if topologyKey == corev1.LabelHostname && t.activeHostnameDomains != nil {
+		t.activeHostnameDomains.Delete(domain)
+	}
 	for _, topology := range t.topologyGroups {
 		if topology.Key == topologyKey {
 			topology.Unregister(domain)
@@ -290,16 +357,19 @@ func (t *Topology) Unregister(topologyKey string, domain string) {
 // have to look at every pod in the cluster as there is no way to query for a pod with anti-affinity terms.
 func (t *Topology) updateInverseAffinities(ctx context.Context) error {
 	var errs error
-	t.cluster.ForPodsWithAntiAffinity(func(pod *corev1.Pod, node *corev1.Node) bool {
+	err := t.source.forEachInverseAffinity(ctx, func(pod *corev1.Pod, node *corev1.Node) error {
 		// don't count the pod we are excluding
 		if t.excludedPods.Has(string(pod.UID)) {
-			return true
+			return nil
 		}
 		if err := t.updateInverseAntiAffinity(ctx, pod, node.Labels); err != nil {
 			errs = multierr.Append(errs, fmt.Errorf("tracking existing pod anti-affinity, %w", err))
 		}
-		return true
+		return nil
 	})
+	if err != nil {
+		return err
+	}
 	return errs
 }
 
@@ -310,11 +380,14 @@ func (t *Topology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Po
 	// required to enforce them so it just adds complexity for very little
 	// value.  The problem with them comes from the relaxation process, the pod
 	// we are relaxing is not the pod with the anti-affinity term.
-	topologyGroups, err := newForInverseAntiAffinity(ctx, pod, t.domainGroups, t.buildNamespaceList)
+	topologyGroups, err := newForInverseAntiAffinity(ctx, pod, t.domainGroups, t.source.resolveNamespaces)
 	if err != nil {
 		return err
 	}
 	for _, tg := range topologyGroups {
+		if tg.Key == corev1.LabelHostname && t.activeHostnameDomains != nil {
+			tg.sparseHostnameDomains = true
+		}
 
 		hash := tg.Hash()
 		if existing, ok := t.inverseTopologyGroups[hash]; !ok {
@@ -332,9 +405,12 @@ func (t *Topology) updateInverseAntiAffinity(ctx context.Context, pod *corev1.Po
 
 // countDomains initializes the topology group by registereding any well known domains and performing pod counts
 // against the cluster for any existing pods.
-//
-//nolint:gocyclo
 func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
+	return t.source.countDomains(ctx, tg, t.stateNodes, t.excludedPods)
+}
+
+//nolint:gocyclo
+func (s *liveTopologySource) countDomains(ctx context.Context, tg *TopologyGroup, stateNodes []*state.StateNode, excluded sets.Set[string]) error {
 	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseCountDomains)
 	defer stop()
 	podList := &corev1.PodList{}
@@ -344,7 +420,7 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 	var pods []corev1.Pod
 	for _, ns := range tg.namespaces.UnsortedList() {
 		listCtx, kubeStop := cxtracing.KubeList(phaseCtx, "Pod", ns)
-		err := t.kubeClient.List(listCtx, podList, TopologyListOptions(ns, tg.rawSelector))
+		err := s.kubeClient.List(listCtx, podList, TopologyListOptions(ns, tg.rawSelector))
 		kubeStop(err)
 		if err != nil {
 			return fmt.Errorf("listing pods, %w", err)
@@ -356,7 +432,7 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 	// scheduled to them already
 	// Note: long term we should handle this when constructing the domain groups, but that would require domain groups
 	// to handle affinity in addition to taints / tolerations.
-	for _, n := range t.stateNodes {
+	for _, n := range stateNodes {
 		// ignore state nodes which are tracking in-flight NodeClaims
 		if n.Node == nil {
 			continue
@@ -387,7 +463,7 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 			continue
 		}
 		// pod is excluded for counting purposes
-		if t.excludedPods.Has(string(p.UID)) {
+		if excluded.Has(string(p.UID)) {
 			continue
 		}
 		var node *corev1.Node
@@ -399,7 +475,7 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 		} else {
 			node = &corev1.Node{}
 			getCtx, kubeStop := cxtracing.KubeGet(phaseCtx, "Node", "", p.Spec.NodeName)
-			err := t.kubeClient.Get(getCtx, types.NamespacedName{Name: p.Spec.NodeName}, node)
+			err := s.kubeClient.Get(getCtx, types.NamespacedName{Name: p.Spec.NodeName}, node)
 			kubeStop(err)
 			if err != nil {
 				// Pods that cannot be evicted can be leaked in the API Server after
@@ -419,27 +495,26 @@ func (t *Topology) countDomains(ctx context.Context, tg *TopologyGroup) error {
 			previousNodeRequirements = nodeRequirements
 		}
 
-		domain, ok := node.Labels[tg.Key]
-		// Kubelet sets the hostname label, but the node may not be ready yet so there is no label.  We fall back and just
-		// treat the node name as the label.  It probably is in most cases, but even if not we at least count the existence
-		// of the pods in some domain, even if not in the correct one.  This is needed to handle the case of pods with
-		// self-affinity only fulfilling that affinity if all domains are empty.
-		if !ok && tg.Key == corev1.LabelHostname {
-			domain = node.Name
-			ok = true
-		}
+		domain, ok := topologyPodDomain(tg, node, nodeRequirements)
 		if !ok {
-			continue // Don't include pods if node doesn't contain domain https://kubernetes.io/docs/concepts/workloads/pods/pod-topology-spread-constraints/#conventions
-		}
-
-		// nodes may or may not be considered for counting purposes for topology spread constraints depending on if they
-		// are selected by the pod's node selectors and required node affinities.  If these are unset, the node always counts.
-		if !tg.nodeFilter.Matches(node.Spec.Taints, nodeRequirements) {
 			continue
 		}
 		tg.Record(domain)
 	}
 	return nil
+}
+
+// topologyPodDomain is shared by live and prepared sources so pod selection,
+// node filtering, and hostname fallback cannot drift between implementations.
+func topologyPodDomain(group *TopologyGroup, node *corev1.Node, requirements scheduling.Requirements) (string, bool) {
+	if node == nil || !group.nodeFilter.Matches(node.Spec.Taints, requirements) {
+		return "", false
+	}
+	domain, ok := topologyDomain(group.Key, node)
+	if !ok {
+		return "", false
+	}
+	return domain, true
 }
 
 func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
@@ -448,7 +523,7 @@ func (t *Topology) newForTopologies(p *corev1.Pod) []*TopologyGroup {
 
 // newForAffinities returns a list of topology groups that have been constructed based on the input pod and required/preferred affinity terms
 func (t *Topology) newForAffinities(ctx context.Context, p *corev1.Pod) ([]*TopologyGroup, error) {
-	return newForAffinities(ctx, p, t.preferencePolicy, t.domainGroups, t.buildNamespaceList)
+	return newForAffinities(ctx, p, t.preferencePolicy, t.domainGroups, t.source.resolveNamespaces)
 }
 
 func newForTopologies(p *corev1.Pod, preferencePolicy PreferencePolicy, domainGroups map[string]TopologyDomainGroup) []*TopologyGroup {
@@ -547,7 +622,7 @@ func newForInverseAntiAffinity(ctx context.Context, p *corev1.Pod, domainGroups 
 
 // buildNamespaceList constructs a unique list of namespaces consisting of the pod's namespace and the optional list of
 // namespaces and those selected by the namespace selector
-func (t *Topology) buildNamespaceList(ctx context.Context, namespace string, namespaces []string, selector *metav1.LabelSelector) (sets.Set[string], error) {
+func (s *liveTopologySource) resolveNamespaces(ctx context.Context, namespace string, namespaces []string, selector *metav1.LabelSelector) (sets.Set[string], error) {
 	if len(namespaces) == 0 && selector == nil {
 		return sets.New(namespace), nil
 	}
@@ -561,7 +636,7 @@ func (t *Topology) buildNamespaceList(ctx context.Context, namespace string, nam
 	}
 	var kubeStop func(error)
 	listCtx, kubeStop := cxtracing.KubeList(ctx, "Namespace", "")
-	err = t.kubeClient.List(listCtx, &namespaceList, &client.ListOptions{LabelSelector: labelSelector})
+	err = s.kubeClient.List(listCtx, &namespaceList, &client.ListOptions{LabelSelector: labelSelector})
 	kubeStop(err)
 	if err != nil {
 		return nil, fmt.Errorf("listing namespaces, %w", err)

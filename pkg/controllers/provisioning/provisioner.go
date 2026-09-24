@@ -290,8 +290,17 @@ func (f *SchedulerFactory) newScheduler(ctx context.Context, pods []*corev1.Pod,
 	if err != nil {
 		return nil, fmt.Errorf("tracking topology counts, %w", err)
 	}
+	return f.newSchedulerWithTopology(ctx, stateNodes, topology, volumeSource)
+}
+
+// newSchedulerWithTopology constructs one scheduler from a topology that was
+// prepared by the caller. This lets simulation attempts reuse a captured
+// topology without rebuilding it from the API.
+func (f *SchedulerFactory) newSchedulerWithTopology(ctx context.Context, stateNodes []*state.StateNode, topology *scheduler.Topology, volumeSource scheduler.VolumeSource) (*scheduler.Scheduler, error) {
+	p := f.provisioner
+
 	// Pass volumeReqs to scheduler - added to nodeRequirements for NodeClaim zone selection
-	return scheduler.NewSchedulerFromBaseline(ctx, p.kubeClient, f.baseline, p.cluster, stateNodes, topology, p.recorder, p.clock, volumeSource)
+	return scheduler.NewSchedulerFromBaseline(ctx, f.baseline, p.cluster, stateNodes, topology, p.recorder, p.clock, volumeSource)
 }
 
 func (p *Provisioner) NewScheduler(

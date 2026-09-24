@@ -188,13 +188,12 @@ func NewScheduler(
 	opts ...Options,
 ) *Scheduler {
 	baseline := NewSchedulerBaseline(ctx, inputs, daemonSetPods, opts...)
-	return newSchedulerFromBaseline(ctx, kubeClient, baseline, cluster, stateNodes, topology, recorder, clock, NewLiveVolumeSource(kubeClient, volumeReqsByPod))
+	return newSchedulerFromBaseline(ctx, baseline, cluster, stateNodes, topology, recorder, clock, NewLiveVolumeSource(kubeClient, volumeReqsByPod))
 }
 
 // NewSchedulerFromBaseline creates an attempt-local scheduler from a reusable baseline.
 func NewSchedulerFromBaseline(
 	ctx context.Context,
-	kubeClient client.Client,
 	baseline *SchedulerBaseline,
 	cluster *state.Cluster,
 	stateNodes []*state.StateNode,
@@ -209,12 +208,11 @@ func NewSchedulerFromBaseline(
 	if baseline.ignoreDRARequests != karpopts.FromContext(ctx).IgnoreDRARequests {
 		return nil, fmt.Errorf("scheduler baseline was prepared with IgnoreDRARequests=%t but attempt context has IgnoreDRARequests=%t", baseline.ignoreDRARequests, karpopts.FromContext(ctx).IgnoreDRARequests)
 	}
-	return newSchedulerFromBaseline(ctx, kubeClient, baseline, cluster, stateNodes, topology, recorder, clock, volumeSource), nil
+	return newSchedulerFromBaseline(ctx, baseline, cluster, stateNodes, topology, recorder, clock, volumeSource), nil
 }
 
 func newSchedulerFromBaseline(
 	ctx context.Context,
-	kubeClient client.Client,
 	baseline *SchedulerBaseline,
 	cluster *state.Cluster,
 	stateNodes []*state.StateNode,
@@ -226,7 +224,6 @@ func newSchedulerFromBaseline(
 	inputs := baseline.inputs
 	s := &Scheduler{
 		uuid:                uuid.NewUUID(),
-		kubeClient:          kubeClient,
 		nodeClaimTemplates:  inputs.nodeClaimTemplates,
 		topology:            topology,
 		cluster:             cluster,
@@ -300,7 +297,6 @@ type Scheduler struct {
 	topology                *Topology
 	cluster                 *state.Cluster
 	recorder                events.Recorder
-	kubeClient              client.Client
 	clock                   clock.Clock
 	reservationManager      *ReservationManager
 	reservedOfferingMode    ReservedOfferingMode
