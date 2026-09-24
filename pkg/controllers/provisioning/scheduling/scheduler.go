@@ -221,22 +221,36 @@ func newSchedulerFromBaseline(
 	clock clock.Clock,
 	volumeSource VolumeSource,
 ) *Scheduler {
+	s := newSchedulerWithBaseline(baseline, cluster, topology, recorder, clock, volumeSource,
+		nodePoolRemainingResources(baseline.inputs))
+	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseCalculateExistingNodeClaims)
+	s.calculateExistingNodeClaims(phaseCtx, stateNodes, baseline.daemonSetPods)
+	stop()
+	return s
+}
+
+func newSchedulerWithBaseline(
+	baseline *SchedulerBaseline,
+	cluster *state.Cluster,
+	topology *Topology,
+	recorder events.Recorder,
+	clock clock.Clock,
+	volumeSource VolumeSource,
+	remainingResources map[string]corev1.ResourceList,
+) *Scheduler {
 	inputs := baseline.inputs
 	s := &Scheduler{
-		uuid:                uuid.NewUUID(),
-		nodeClaimTemplates:  inputs.nodeClaimTemplates,
-		topology:            topology,
-		cluster:             cluster,
-		daemonOverhead:      cloneDaemonOverhead(baseline.daemonOverhead),
-		daemonHostPortUsage: cloneDaemonHostPortUsage(baseline.daemonHostPortUsage),
-		cachedPodData:       map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
-		volumeSource:        volumeSource,
-		recorder:            recorder,
-		preferences:         &Preferences{ToleratePreferNoSchedule: baseline.toleratePreferNoSchedule},
-		remainingResources: lo.SliceToMap(inputs.nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
-			// The limits are copied so that scheduling never mutates the input
-			return np.Name, corev1.ResourceList(np.Spec.Limits).DeepCopy()
-		}),
+		uuid:                    uuid.NewUUID(),
+		nodeClaimTemplates:      inputs.nodeClaimTemplates,
+		topology:                topology,
+		cluster:                 cluster,
+		daemonOverhead:          cloneDaemonOverhead(baseline.daemonOverhead),
+		daemonHostPortUsage:     cloneDaemonHostPortUsage(baseline.daemonHostPortUsage),
+		cachedPodData:           map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
+		volumeSource:            volumeSource,
+		recorder:                recorder,
+		preferences:             &Preferences{ToleratePreferNoSchedule: baseline.toleratePreferNoSchedule},
+		remainingResources:      remainingResources,
 		clock:                   clock,
 		reservationManager:      newReservationManager(baseline.reservationCapacity),
 		reservedOfferingMode:    baseline.options.reservedOfferingMode,
@@ -244,9 +258,6 @@ func newSchedulerFromBaseline(
 		minValuesPolicy:         baseline.options.minValuesPolicy,
 		numConcurrentReconciles: lo.Ternary(baseline.options.numConcurrentReconciles > 0, baseline.options.numConcurrentReconciles, 1),
 	}
-	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseCalculateExistingNodeClaims)
-	s.calculateExistingNodeClaims(phaseCtx, stateNodes, baseline.daemonSetPods)
-	stop()
 	return s
 }
 
@@ -783,32 +794,7 @@ func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes 
 
 // getCompatibleDaemonPods filters daemon pods that can schedule to the given node
 func (s *Scheduler) getCompatibleDaemonPods(ctx context.Context, node *state.StateNode, taints []corev1.Taint, daemonSetPods []*corev1.Pod) []*corev1.Pod {
-	var daemons []*corev1.Pod
-	for _, p := range daemonSetPods {
-		if s.shouldSkipDaemonPod(ctx, p) {
-			continue
-		}
-		if s.isDaemonPodCompatibleWithNode(p, taints, node.Labels()) {
-			daemons = append(daemons, p)
-		}
-	}
-	return daemons
-}
-
-// shouldSkipDaemonPod checks if a daemon pod should be skipped due to DRA requirements
-func (s *Scheduler) shouldSkipDaemonPod(ctx context.Context, p *corev1.Pod) bool {
-	return pod.HasDRARequirements(p) && karpopts.FromContext(ctx).IgnoreDRARequests
-}
-
-// isDaemonPodCompatibleWithNode checks if a daemon pod is compatible with the node
-func (s *Scheduler) isDaemonPodCompatibleWithNode(p *corev1.Pod, taints []corev1.Taint, nodeLabels map[string]string) bool {
-	if err := scheduling.Taints(taints).ToleratesPod(p); err != nil {
-		return false
-	}
-	if err := scheduling.NewLabelRequirements(nodeLabels).Compatible(scheduling.NewStrictPodRequirements(p)); err != nil {
-		return false
-	}
-	return true
+	return getCompatibleDaemonPods(ctx, node, taints, daemonSetPods)
 }
 
 // updateRemainingResources updates the remaining resources for the node's nodepool
@@ -827,14 +813,18 @@ func (s *Scheduler) sortExistingNodes() {
 	// This is done specifically for consolidation where we want to make sure we schedule to initialized nodes
 	// before we attempt to schedule uninitialized ones
 	sort.SliceStable(s.existingNodes, func(i, j int) bool {
-		if s.existingNodes[i].Initialized() && !s.existingNodes[j].Initialized() {
-			return true
-		}
-		if !s.existingNodes[i].Initialized() && s.existingNodes[j].Initialized() {
-			return false
-		}
-		return s.existingNodes[i].Name() < s.existingNodes[j].Name()
+		return existingNodeLess(s.existingNodes[i].StateNode, s.existingNodes[j].StateNode)
 	})
+}
+
+func existingNodeLess(lhs, rhs *state.StateNode) bool {
+	if lhs.Initialized() && !rhs.Initialized() {
+		return true
+	}
+	if !lhs.Initialized() && rhs.Initialized() {
+		return false
+	}
+	return lhs.Name() < rhs.Name()
 }
 
 // parallelizeUntil is an implementation of workqueue.ParallelizeUntil that modifies the

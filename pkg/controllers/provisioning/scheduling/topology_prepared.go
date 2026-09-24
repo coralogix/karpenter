@@ -435,7 +435,7 @@ func (p *PreparedTopology) newMaterializedTopology(pods []*corev1.Pod, removed s
 	}
 	for _, node := range p.activeNodes {
 		if !removed.Has(node.Name()) {
-			t.stateNodes = append(t.stateNodes, node.DeepCopy())
+			t.stateNodes = append(t.stateNodes, node)
 			// Keep the prepared source's existing node-label semantics here. A
 			// managed NodeClaim label is registered later by ExistingNode.materialize
 			// through StateNode.HostName().
