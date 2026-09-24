@@ -40,6 +40,54 @@ type NodePoolInputs struct {
 	nodeClaimTemplates []*NodeClaimTemplate
 }
 
+// DeepCopy owns the provider-derived node-pool and instance-type snapshot.
+func (i *NodePoolInputs) DeepCopy() *NodePoolInputs {
+	if i == nil {
+		return nil
+	}
+	nodePools := lo.Map(i.nodePools, func(np *v1.NodePool, _ int) *v1.NodePool {
+		if np == nil {
+			return nil
+		}
+		return np.DeepCopy()
+	})
+	instanceTypes := make(map[string][]*cloudprovider.InstanceType, len(i.instanceTypes))
+	for name, types := range i.instanceTypes {
+		instanceTypes[name] = lo.Map(types, func(instanceType *cloudprovider.InstanceType, _ int) *cloudprovider.InstanceType {
+			if instanceType == nil {
+				return nil
+			}
+			return instanceType.DeepCopy()
+		})
+	}
+	domainGroups := make(map[string]TopologyDomainGroup, len(i.domainGroups))
+	for key, group := range i.domainGroups {
+		groupCopy := NewTopologyDomainGroup()
+		for domain, taintGroups := range group {
+			groupCopy[domain] = lo.Map(taintGroups, func(taints []corev1.Taint, _ int) []corev1.Taint {
+				return lo.Map(taints, func(taint corev1.Taint, _ int) corev1.Taint { return taint })
+			})
+		}
+		domainGroups[key] = groupCopy
+	}
+	nodeClaimTemplates := lo.Map(i.nodeClaimTemplates, func(template *NodeClaimTemplate, _ int) *NodeClaimTemplate {
+		if template == nil {
+			return nil
+		}
+		copy := *template
+		copy.NodeClaim = *template.DeepCopy()
+		copy.InstanceTypeOptions = lo.Map(template.InstanceTypeOptions, func(instanceType *cloudprovider.InstanceType, _ int) *cloudprovider.InstanceType {
+			if instanceType == nil {
+				return nil
+			}
+			return instanceType.DeepCopy()
+		})
+		copy.Requirements = cloneRequirements(template.Requirements)
+		return &copy
+	})
+	return &NodePoolInputs{nodePools: nodePools, instanceTypes: instanceTypes, domainGroups: domainGroups, nodeClaimTemplates: nodeClaimTemplates}
+}
+
 // InstanceTypes returns the resolved instance types used to build these inputs.
 func (i *NodePoolInputs) InstanceTypes() map[string][]*cloudprovider.InstanceType {
 	return i.instanceTypes

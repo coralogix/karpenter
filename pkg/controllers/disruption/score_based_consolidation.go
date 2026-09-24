@@ -164,12 +164,12 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 	for i, candidate := range validCandidates {
 		moveSets[i] = moveSet{Nodes: []*Candidate{candidate}}
 	}
-	schedulerFactory, err := newConsolidationSchedulerFactory(ctx, s.provisioner)
+	simulator, err := NewConsolidationSchedulingSimulator(ctx, s.kubeClient, s.cluster, s.provisioner, s.clock, s.recorder, validCandidates...)
 	if err != nil {
 		return nil, 0, err
 	}
 	compute := func(ctx context.Context, candidates ...*Candidate) (Command, error) {
-		return s.computeConsolidation(ctx, schedulerFactory, candidates...)
+		return s.computeConsolidation(ctx, simulator, candidates...)
 	}
 	return evaluateMoveSetsPar(ctx, moveSets, deadline, compute)
 }

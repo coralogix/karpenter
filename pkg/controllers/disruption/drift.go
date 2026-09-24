@@ -73,7 +73,7 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 	// Prioritize empty candidates since we want them to get priority over non-empty candidates if the budget is constrained.
 	// Disrupting empty candidates first also helps reduce the overall churn because if a non-empty candidate is disrupted first,
 	// the pods from that node can reschedule on the empty nodes and will need to move again when those nodes get disrupted.
-	schedulerFactory, err := NewSchedulerFactory(ctx, d.provisioner)
+	simulator, err := NewSchedulingSimulator(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder, candidates...)
 	if err != nil {
 		return []Command{}, err
 	}
@@ -85,7 +85,7 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 			continue
 		}
 		// Check if we need to create any NodeClaims.
-		results, err := simulateSchedulingWithFactory(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder, schedulerFactory, candidate)
+		results, err := simulator.Simulate(ctx, candidate)
 		if err != nil {
 			// if a candidate is now deleting, just retry
 			if errors.Is(err, errCandidateDeleting) {

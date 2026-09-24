@@ -299,11 +299,11 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 	if len(candidates) == 0 {
 		return NewValidationError(fmt.Errorf("no candidates"))
 	}
-	schedulerFactory, err := newConsolidationSchedulerFactory(ctx, v.provisioner)
+	simulator, err := NewConsolidationSchedulingSimulator(ctx, v.kubeClient, v.cluster, v.provisioner, v.clock, v.recorder, candidates...)
 	if err != nil {
 		return err
 	}
-	results, err := simulateSchedulingWithFactory(ctx, v.kubeClient, v.cluster, v.provisioner, v.clock, v.recorder, schedulerFactory, candidates...)
+	results, err := simulator.Simulate(ctx, candidates...)
 	if err != nil {
 		return fmt.Errorf("simluating scheduling, %w", err)
 	}

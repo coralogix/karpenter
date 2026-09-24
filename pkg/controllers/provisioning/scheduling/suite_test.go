@@ -5497,7 +5497,7 @@ var _ = Context("Scheduling", func() {
 			topology1, err := scheduling.NewTopology(ctx1, env.Client, cluster, nil, inputs1, []*corev1.Pod{appPod})
 			Expect(err).ToNot(HaveOccurred())
 			scheduler1 := scheduling.NewScheduler(ctx1, env.Client, inputs1, cluster, nil, topology1,
-				[]*corev1.Pod{draDaemonPod}, events.NewRecorder(&record.FakeRecorder{}), env.Clock, nil, nil)
+				[]*corev1.Pod{draDaemonPod}, events.NewRecorder(&record.FakeRecorder{}), env.Clock, scheduling.NewLiveVolumeSource(env.Client, nil), nil)
 			results1, err := scheduler1.Solve(ctx1, []*corev1.Pod{appPod})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(results1.NewNodeClaims).To(HaveLen(1))
@@ -5510,7 +5510,7 @@ var _ = Context("Scheduling", func() {
 			topology2, err := scheduling.NewTopology(ctx2, env.Client, cluster, nil, inputs2, []*corev1.Pod{appPod})
 			Expect(err).ToNot(HaveOccurred())
 			scheduler2 := scheduling.NewScheduler(ctx2, env.Client, inputs2, cluster, nil, topology2,
-				[]*corev1.Pod{draDaemonPod}, events.NewRecorder(&record.FakeRecorder{}), env.Clock, nil, nil)
+				[]*corev1.Pod{draDaemonPod}, events.NewRecorder(&record.FakeRecorder{}), env.Clock, scheduling.NewLiveVolumeSource(env.Client, nil), nil)
 			results2, err := scheduler2.Solve(ctx2, []*corev1.Pod{appPod})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(results2.NewNodeClaims).To(HaveLen(1))

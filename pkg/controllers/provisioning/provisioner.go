@@ -281,6 +281,7 @@ func (p *Provisioner) NewSchedulerFactory(ctx context.Context, opts ...scheduler
 	if err != nil {
 		return nil, fmt.Errorf("getting daemon pods, %w", err)
 	}
+	inputs = inputs.DeepCopy()
 	baseline := scheduler.NewSchedulerBaseline(ctx, inputs, daemonSetPods, opts...)
 	return &SchedulerFactory{provisioner: p, inputs: inputs, baseline: baseline, opts: opts}, nil
 }
@@ -293,8 +294,12 @@ func (f *SchedulerFactory) NewScheduler(ctx context.Context, pods []*corev1.Pod,
 	if err != nil {
 		return nil, fmt.Errorf("getting volume topology requirements, %w", err)
 	}
+	return f.newScheduler(ctx, pods, stateNodes, scheduler.NewLiveVolumeSource(p.kubeClient, volumeReqs), deletingPodUIDs)
+}
 
-	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseNewTopology)
+func (f *SchedulerFactory) newScheduler(ctx context.Context, pods []*corev1.Pod, stateNodes []*state.StateNode, volumeSource scheduler.VolumeSource, deletingPodUIDs sets.Set[types.UID]) (*scheduler.Scheduler, error) {
+	p := f.provisioner
+	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseNewTopology)
 	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, f.inputs, pods, f.opts...)
 	stop()
 	if err != nil {
@@ -312,7 +317,7 @@ func (f *SchedulerFactory) NewScheduler(ctx context.Context, pods []*corev1.Pod,
 		}
 		allocator = dynamicresources.NewAllocator(inClusterSlices, allocatedDevices, dynamicresources.BuildAttributeBindings(f.inputs.InstanceTypes()), p.kubeClient, deletingPodUIDs)
 	}
-	return scheduler.NewSchedulerFromBaseline(ctx, p.kubeClient, f.baseline, p.cluster, stateNodes, topology, p.recorder, p.clock, volumeReqs, allocator)
+	return scheduler.NewSchedulerFromBaseline(ctx, p.kubeClient, f.baseline, p.cluster, stateNodes, topology, p.recorder, p.clock, volumeSource, allocator)
 }
 
 func (p *Provisioner) NewScheduler(

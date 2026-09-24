@@ -144,7 +144,7 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 	}
 
 	lastSavedCommand := Command{}
-	schedulerFactory, err := newConsolidationSchedulerFactory(ctx, m.provisioner)
+	simulator, err := NewConsolidationSchedulingSimulator(ctx, m.kubeClient, m.cluster, m.provisioner, m.clock, m.recorder, candidates...)
 	if err != nil {
 		return Command{}, nil, err
 	}
@@ -161,7 +161,7 @@ func (m *MultiNodeConsolidation) firstNConsolidationOption(ctx context.Context, 
 		candidatesToConsolidate := candidates[0 : mid+1]
 
 		// Pass the timeout context to ensure sub-operations can be canceled
-		cmd, err := m.computeConsolidation(timeoutCtx, schedulerFactory, candidatesToConsolidate...)
+		cmd, err := m.computeConsolidation(timeoutCtx, simulator, candidatesToConsolidate...)
 		// context deadline exceeded will return to the top of the loop and either return nothing or the last saved command
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
