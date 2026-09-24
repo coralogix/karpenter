@@ -116,11 +116,11 @@ func TestNewSchedulerFromBaselineOwnsAttemptState(t *testing.T) {
 	baseline := NewSchedulerBaseline(testContext, inputs, []*corev1.Pod{daemonPod})
 
 	volumeSource := NewCapturedVolumeSource(nil)
-	first, err := NewSchedulerFromBaseline(testContext, nil, baseline, nil, nil, nil, nil, nil, volumeSource)
+	first, err := NewSchedulerFromBaseline(testContext, baseline, nil, nil, nil, nil, nil, volumeSource)
 	if err != nil {
 		t.Fatalf("creating first scheduler: %v", err)
 	}
-	second, err := NewSchedulerFromBaseline(testContext, nil, baseline, nil, nil, nil, nil, nil, volumeSource)
+	second, err := NewSchedulerFromBaseline(testContext, baseline, nil, nil, nil, nil, nil, volumeSource)
 	if err != nil {
 		t.Fatalf("creating second scheduler: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestNewSchedulerFromBaselineRejectsDRAContextMismatch(t *testing.T) {
 	attemptContext := karpopts.ToContext(context.Background(), &karpopts.Options{IgnoreDRARequests: false})
 	baseline := NewSchedulerBaseline(baselineContext, &NodePoolInputs{}, nil)
 
-	if _, err := NewSchedulerFromBaseline(attemptContext, nil, baseline, nil, nil, nil, nil, nil, NewCapturedVolumeSource(nil)); err == nil {
+	if _, err := NewSchedulerFromBaseline(attemptContext, baseline, nil, nil, nil, nil, nil, NewCapturedVolumeSource(nil)); err == nil {
 		t.Fatal("expected scheduler attempt to reject a mismatched IgnoreDRARequests context")
 	}
 }

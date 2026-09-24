@@ -305,6 +305,14 @@ func (f *SchedulerFactory) newScheduler(ctx context.Context, pods []*corev1.Pod,
 	if err != nil {
 		return nil, fmt.Errorf("tracking topology counts, %w", err)
 	}
+	return f.newSchedulerWithTopology(ctx, stateNodes, topology, volumeSource, deletingPodUIDs)
+}
+
+// newSchedulerWithTopology constructs one scheduler from a topology that was
+// prepared by the caller. This lets simulation attempts reuse a captured
+// topology without rebuilding it from the API.
+func (f *SchedulerFactory) newSchedulerWithTopology(ctx context.Context, stateNodes []*state.StateNode, topology *scheduler.Topology, volumeSource scheduler.VolumeSource, deletingPodUIDs sets.Set[types.UID]) (*scheduler.Scheduler, error) {
+	p := f.provisioner
 	var allocator *dynamicresources.Allocator
 	if !options.FromContext(ctx).IgnoreDRARequests {
 		inClusterSlices, err := p.gatherResourceSlices(ctx, stateNodes)
@@ -317,7 +325,7 @@ func (f *SchedulerFactory) newScheduler(ctx context.Context, pods []*corev1.Pod,
 		}
 		allocator = dynamicresources.NewAllocator(inClusterSlices, allocatedDevices, dynamicresources.BuildAttributeBindings(f.inputs.InstanceTypes()), p.kubeClient, deletingPodUIDs)
 	}
-	return scheduler.NewSchedulerFromBaseline(ctx, p.kubeClient, f.baseline, p.cluster, stateNodes, topology, p.recorder, p.clock, volumeSource, allocator)
+	return scheduler.NewSchedulerFromBaseline(ctx, f.baseline, p.cluster, stateNodes, topology, p.recorder, p.clock, volumeSource, allocator)
 }
 
 func (p *Provisioner) NewScheduler(

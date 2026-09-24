@@ -70,6 +70,9 @@ type TopologyGroup struct {
 	owners       map[types.UID]struct{} // Pods that have this topology as a scheduling rule
 	domains      map[string]int32       // TODO(ellistarn) explore replacing with a minheap
 	emptyDomains sets.Set[string]       // domains for which we know that no pod exists
+	// sparseHostnameDomains means active hostnames are supplied by the
+	// materialized topology instead of this group's dense maps.
+	sparseHostnameDomains bool
 }
 
 func NewTopologyGroup(
@@ -126,6 +129,18 @@ func NewTopologyGroup(
 }
 
 func (t *TopologyGroup) Get(pod *corev1.Pod, podDomains, nodeDomains *scheduling.Requirement) (*scheduling.Requirement, sets.Set[string]) {
+	return t.get(pod, podDomains, nodeDomains, nil)
+}
+
+// GetWithActiveDomains evaluates a prepared inverse hostname group with the
+// active node domains supplied by its materialized topology. Those domains are
+// kept outside the group's dense maps so that each scenario does not copy all
+// node hostnames into every inverse group.
+func (t *TopologyGroup) GetWithActiveDomains(pod *corev1.Pod, podDomains, nodeDomains *scheduling.Requirement, activeDomains sets.Set[string]) (*scheduling.Requirement, sets.Set[string]) {
+	return t.get(pod, podDomains, nodeDomains, activeDomains)
+}
+
+func (t *TopologyGroup) get(pod *corev1.Pod, podDomains, nodeDomains *scheduling.Requirement, activeDomains sets.Set[string]) (*scheduling.Requirement, sets.Set[string]) {
 	switch t.Type {
 	case TopologyTypeSpread:
 		return t.nextDomainTopologySpread(pod, podDomains, nodeDomains)
@@ -133,7 +148,7 @@ func (t *TopologyGroup) Get(pod *corev1.Pod, podDomains, nodeDomains *scheduling
 		req := t.nextDomainAffinity(pod, podDomains, nodeDomains)
 		return req, sets.New[string](req.Values()...)
 	case TopologyTypePodAntiAffinity:
-		req := t.nextDomainAntiAffinity(podDomains, nodeDomains)
+		req := t.nextDomainAntiAffinity(podDomains, nodeDomains, activeDomains)
 		return req, sets.New[string](req.Values()...)
 	default:
 		panic(fmt.Sprintf("Unrecognized topology group type: %s", t.Type))
@@ -144,6 +159,23 @@ func (t *TopologyGroup) Record(domains ...string) {
 	for _, domain := range domains {
 		t.domains[domain]++
 		t.emptyDomains.Delete(domain)
+	}
+}
+
+// Unrecord removes one observed pod contribution while retaining the domain
+// itself when it is still a known scheduling domain.
+func (t *TopologyGroup) Unrecord(domains ...string) {
+	for _, domain := range domains {
+		count, ok := t.domains[domain]
+		if !ok || count == 0 {
+			continue
+		}
+		if count == 1 {
+			t.domains[domain] = 0
+			t.emptyDomains.Insert(domain)
+			continue
+		}
+		t.domains[domain] = count - 1
 	}
 }
 
@@ -401,7 +433,7 @@ func (t *TopologyGroup) anyCompatiblePodDomain(podDomains *scheduling.Requiremen
 }
 
 // nolint:gocyclo
-func (t *TopologyGroup) nextDomainAntiAffinity(podDomains, nodeDomains *scheduling.Requirement) *scheduling.Requirement {
+func (t *TopologyGroup) nextDomainAntiAffinity(podDomains, nodeDomains *scheduling.Requirement, activeDomains sets.Set[string]) *scheduling.Requirement {
 	options := scheduling.NewRequirement(t.Key, corev1.NodeSelectorOpDoesNotExist)
 	// pods with anti-affinity must schedule to a domain where there are currently none of those pods (an empty
 	// domain). If there are none of those domains, then the pod can't schedule and we don't need to walk this
@@ -422,9 +454,15 @@ func (t *TopologyGroup) nextDomainAntiAffinity(podDomains, nodeDomains *scheduli
 	// is less than our empty domains, this is going to be more efficient to iterate through
 	// This is particularly useful when considering the hostname topology key that can have a
 	// lot of t.domains but only a single nodeDomain
-	if nodeDomains.Operator() == corev1.NodeSelectorOpIn && nodeDomains.Len() < len(t.emptyDomains) {
+	if nodeDomains.Operator() == corev1.NodeSelectorOpIn && activeDomains == nil && nodeDomains.Len() < len(t.emptyDomains) {
 		for _, domain := range nodeDomains.Values() {
 			if t.emptyDomains.Has(domain) && podDomains.Has(domain) {
+				options.Insert(domain)
+			}
+		}
+	} else if nodeDomains.Operator() == corev1.NodeSelectorOpIn && activeDomains != nil {
+		for _, domain := range nodeDomains.Values() {
+			if t.isEmptyDomain(domain, activeDomains) && podDomains.Has(domain) {
 				options.Insert(domain)
 			}
 		}
@@ -434,8 +472,23 @@ func (t *TopologyGroup) nextDomainAntiAffinity(podDomains, nodeDomains *scheduli
 				options.Insert(domain)
 			}
 		}
+		for domain := range activeDomains {
+			if !t.emptyDomains.Has(domain) && t.isEmptyDomain(domain, activeDomains) && nodeDomains.Has(domain) && podDomains.Has(domain) {
+				options.Insert(domain)
+			}
+		}
 	}
 	return options
+}
+
+func (t *TopologyGroup) isEmptyDomain(domain string, activeDomains sets.Set[string]) bool {
+	if t.emptyDomains.Has(domain) {
+		return true
+	}
+	if !activeDomains.Has(domain) {
+		return false
+	}
+	return t.domains[domain] == 0
 }
 
 // selects returns true if the given pod is selected by this topology

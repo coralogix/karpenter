@@ -58,10 +58,11 @@ type Scenario struct {
 // mutable pod copies and delegates topology and scheduling construction to the
 // same provisioning path used by ordinary scheduling.
 type PreparedSimulationInputs struct {
-	factory    *SchedulerFactory
-	stateNodes state.StateNodes
-	catalog    *simulationPodCatalog
-	volumeData map[types.UID]scheduling.VolumeData
+	factory          *SchedulerFactory
+	stateNodes       state.StateNodes
+	catalog          *simulationPodCatalog
+	volumeData       map[types.UID]scheduling.VolumeData
+	preparedTopology *scheduling.PreparedTopology
 }
 
 // SimulationRun pairs one scheduler with the exact pod copies it was built
@@ -72,9 +73,8 @@ type SimulationRun struct {
 	pods      []*corev1.Pod
 }
 
-// NewPreparedSimulationInputs captures the scheduler baseline, node snapshot, pod
-// catalog, and volume data needed by repeated scenarios. Topology remains live
-// during NewRun until the prepared topology stage is introduced.
+// NewPreparedSimulationInputs captures the scheduler baseline, node snapshot, pod and
+// namespace snapshots, catalog, and volume data needed by repeated scenarios.
 func (p *Provisioner) NewPreparedSimulationInputs(ctx context.Context, pods []*corev1.Pod, stateNodes []*state.StateNode, opts ...scheduling.Options) (*PreparedSimulationInputs, error) {
 	factory, err := p.NewSchedulerFactory(ctx, opts...)
 	if err != nil {
@@ -89,12 +89,41 @@ func (p *Provisioner) NewPreparedSimulationInputs(ctx context.Context, pods []*c
 	if err != nil {
 		return nil, err
 	}
+	apiPods, namespaces, err := p.captureSimulationTopologyObjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	preparedTopology, err := scheduling.NewPreparedTopology(ctx, factory.inputs, stateNodes, apiPods, namespaces, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("preparing topology snapshot, %w", err)
+	}
 	return &PreparedSimulationInputs{
-		factory:    factory,
-		stateNodes: cloneStateNodes(stateNodes),
-		catalog:    catalog,
-		volumeData: volumeData,
+		factory:          factory,
+		stateNodes:       cloneStateNodes(stateNodes),
+		catalog:          catalog,
+		volumeData:       volumeData,
+		preparedTopology: preparedTopology,
 	}, nil
+}
+
+func (p *Provisioner) captureSimulationTopologyObjects(ctx context.Context) ([]*corev1.Pod, []*corev1.Namespace, error) {
+	var podList corev1.PodList
+	if err := p.kubeClient.List(ctx, &podList); err != nil {
+		return nil, nil, fmt.Errorf("listing pods for topology snapshot, %w", err)
+	}
+	var namespaceList corev1.NamespaceList
+	if err := p.kubeClient.List(ctx, &namespaceList); err != nil {
+		return nil, nil, fmt.Errorf("listing namespaces for topology snapshot, %w", err)
+	}
+	apiPods := make([]*corev1.Pod, len(podList.Items))
+	for i := range podList.Items {
+		apiPods[i] = &podList.Items[i]
+	}
+	namespaces := make([]*corev1.Namespace, len(namespaceList.Items))
+	for i := range namespaceList.Items {
+		namespaces[i] = &namespaceList.Items[i]
+	}
+	return apiPods, namespaces, nil
 }
 
 func newSimulationPodCatalog(pods []*corev1.Pod) (*simulationPodCatalog, error) {
@@ -254,7 +283,7 @@ func (s *PreparedSimulationInputs) NewRun(ctx context.Context, scenario Scenario
 	}
 
 	stateNodes := lo.Filter(s.stateNodes, func(node *state.StateNode, _ int) bool {
-		return !removed.Has(node.Name())
+		return !node.MarkedForDeletion() && !removed.Has(node.Name())
 	})
 	volumeSource := scheduling.NewCapturedVolumeSource(volumeData)
 	releasingPodUIDs := sets.New[types.UID]()
@@ -264,7 +293,11 @@ func (s *PreparedSimulationInputs) NewRun(ctx context.Context, scenario Scenario
 		}
 		releasingPodUIDs.Insert(s.catalog.pods[id.index].UID)
 	}
-	newScheduler, err := s.factory.newScheduler(ctx, topologyPods, cloneStateNodes(stateNodes), volumeSource, releasingPodUIDs)
+	topology, err := s.preparedTopology.Materialize(ctx, topologyPods, scenario.RemovedNodeNames...)
+	if err != nil {
+		return nil, fmt.Errorf("materializing topology, %w", err)
+	}
+	newScheduler, err := s.factory.newSchedulerWithTopology(ctx, cloneStateNodes(stateNodes), topology, volumeSource, releasingPodUIDs)
 	if err != nil {
 		return nil, fmt.Errorf("creating simulation scheduler, %w", err)
 	}

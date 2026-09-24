@@ -181,12 +181,11 @@ func NewScheduler(
 		volumeSource = NewLiveVolumeSource(kubeClient, nil)
 	}
 	baseline := NewSchedulerBaseline(ctx, inputs, daemonSetPods, opts...)
-	return newSchedulerFromBaseline(ctx, kubeClient, baseline, cluster, stateNodes, topology, recorder, clock, volumeSource, allocator)
+	return newSchedulerFromBaseline(ctx, baseline, cluster, stateNodes, topology, recorder, clock, volumeSource, allocator)
 }
 
 func NewSchedulerFromBaseline(
 	ctx context.Context,
-	kubeClient client.Client,
 	baseline *SchedulerBaseline,
 	cluster *state.Cluster,
 	stateNodes []*state.StateNode,
@@ -206,12 +205,11 @@ func NewSchedulerFromBaseline(
 	if len(allocators) > 0 {
 		allocator = allocators[0]
 	}
-	return newSchedulerFromBaseline(ctx, kubeClient, baseline, cluster, stateNodes, topology, recorder, clock, volumeSource, allocator), nil
+	return newSchedulerFromBaseline(ctx, baseline, cluster, stateNodes, topology, recorder, clock, volumeSource, allocator), nil
 }
 
 func newSchedulerFromBaseline(
 	ctx context.Context,
-	kubeClient client.Client,
 	baseline *SchedulerBaseline,
 	cluster *state.Cluster,
 	stateNodes []*state.StateNode,
@@ -224,7 +222,6 @@ func newSchedulerFromBaseline(
 	inputs := baseline.inputs
 	s := &Scheduler{
 		uuid:                 uuid.NewUUID(),
-		kubeClient:           kubeClient,
 		nodeClaimTemplates:   inputs.nodeClaimTemplates,
 		topology:             topology,
 		cluster:              cluster,
@@ -320,7 +317,6 @@ type Scheduler struct {
 	topology                *Topology
 	cluster                 *state.Cluster
 	recorder                events.Recorder
-	kubeClient              client.Client
 	clock                   clock.Clock
 	reservationManager      *ReservationManager
 	reservedOfferingMode    ReservedOfferingMode
