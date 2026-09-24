@@ -24,6 +24,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	karpopts "sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
@@ -46,6 +47,29 @@ func TestNewSchedulerBaselineCopiesDaemonPods(t *testing.T) {
 	baseline.daemonSetPods[0].Labels["app"] = "changed"
 	if inputPod.Labels["app"] != "daemon" {
 		t.Fatalf("expected baseline daemon pod copy to isolate input pod, got %q", inputPod.Labels["app"])
+	}
+}
+
+func TestNodePoolInputsDeepCopyOwnsProviderCatalog(t *testing.T) {
+	nodePool := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "pool", Labels: map[string]string{"source": "original"}}}
+	instanceType := &cloudprovider.InstanceType{
+		Name:         "instance",
+		Requirements: scheduling.NewRequirements(scheduling.NewRequirement("example.com/source", corev1.NodeSelectorOpIn, "original")),
+	}
+	source := &NodePoolInputs{
+		nodePools:     []*v1.NodePool{nodePool},
+		instanceTypes: map[string][]*cloudprovider.InstanceType{"pool": {instanceType}},
+	}
+	snapshot := source.DeepCopy()
+
+	nodePool.Labels["source"] = "mutated"
+	instanceType.Requirements.Add(scheduling.NewRequirement("example.com/mutated", corev1.NodeSelectorOpIn, "true"))
+
+	if snapshot.nodePools[0].Labels["source"] != "original" {
+		t.Fatal("node pool inputs copied the caller's NodePool")
+	}
+	if _, ok := snapshot.instanceTypes["pool"][0].Requirements["example.com/mutated"]; ok {
+		t.Fatal("node pool inputs copied the caller's instance-type requirements")
 	}
 }
 
@@ -90,11 +114,12 @@ func TestNewSchedulerFromBaselineOwnsAttemptState(t *testing.T) {
 	testContext := schedulerBaselineTestContext()
 	baseline := NewSchedulerBaseline(testContext, inputs, []*corev1.Pod{daemonPod})
 
-	first, err := NewSchedulerFromBaseline(testContext, nil, baseline, nil, nil, nil, nil, nil, nil)
+	volumeSource := NewCapturedVolumeSource(nil)
+	first, err := NewSchedulerFromBaseline(testContext, nil, baseline, nil, nil, nil, nil, nil, volumeSource)
 	if err != nil {
 		t.Fatalf("creating first scheduler: %v", err)
 	}
-	second, err := NewSchedulerFromBaseline(testContext, nil, baseline, nil, nil, nil, nil, nil, nil)
+	second, err := NewSchedulerFromBaseline(testContext, nil, baseline, nil, nil, nil, nil, nil, volumeSource)
 	if err != nil {
 		t.Fatalf("creating second scheduler: %v", err)
 	}
@@ -124,7 +149,7 @@ func TestNewSchedulerFromBaselineRejectsDRAContextMismatch(t *testing.T) {
 	attemptContext := karpopts.ToContext(context.Background(), &karpopts.Options{IgnoreDRARequests: false})
 	baseline := NewSchedulerBaseline(baselineContext, &NodePoolInputs{}, nil)
 
-	if _, err := NewSchedulerFromBaseline(attemptContext, nil, baseline, nil, nil, nil, nil, nil, nil); err == nil {
+	if _, err := NewSchedulerFromBaseline(attemptContext, nil, baseline, nil, nil, nil, nil, nil, NewCapturedVolumeSource(nil)); err == nil {
 		t.Fatal("expected scheduler attempt to reject a mismatched IgnoreDRARequests context")
 	}
 }

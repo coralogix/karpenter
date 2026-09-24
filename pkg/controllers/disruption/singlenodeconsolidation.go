@@ -74,7 +74,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 
 	unseenNodePools := sets.New(lo.Map(candidates, func(c *Candidate, _ int) string { return c.NodePool.Name })...)
 
-	schedulerFactory, err := NewSchedulerFactory(ctx, s.provisioner)
+	simulator, err := NewSchedulingSimulator(ctx, s.kubeClient, s.cluster, s.provisioner, candidates...)
 	if err != nil {
 		return []Command{}, err
 	}
@@ -110,7 +110,7 @@ func (s *SingleNodeConsolidation) ComputeCommands(ctx context.Context, disruptio
 		}
 
 		// compute a possible consolidation option
-		cmd, err := s.computeConsolidation(ctx, schedulerFactory, candidate)
+		cmd, err := s.computeConsolidation(ctx, simulator, candidate)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "failed computing consolidation")
 			continue

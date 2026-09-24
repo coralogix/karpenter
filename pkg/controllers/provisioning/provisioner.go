@@ -255,6 +255,10 @@ func (p *Provisioner) NewSchedulerFactory(ctx context.Context, opts ...scheduler
 	if err != nil {
 		return nil, fmt.Errorf("getting daemon pods, %w", err)
 	}
+	// Own the provider-derived inputs at the factory boundary. Simulation
+	// attempts can then reuse this snapshot without observing later mutation of
+	// NodePools or instance-type offerings by the caller/provider.
+	inputs = inputs.DeepCopy()
 	baseline := scheduler.NewSchedulerBaseline(ctx, inputs, daemonSetPods, opts...)
 	return &SchedulerFactory{provisioner: p, inputs: inputs, baseline: baseline, opts: opts}, nil
 }
@@ -271,16 +275,23 @@ func (f *SchedulerFactory) NewScheduler(ctx context.Context, pods []*corev1.Pod,
 	if err != nil {
 		return nil, fmt.Errorf("getting volume topology requirements, %w", err)
 	}
+	return f.newScheduler(ctx, pods, stateNodes, scheduler.NewLiveVolumeSource(p.kubeClient, volumeReqs))
+}
+
+// newScheduler constructs one scheduler attempt from a cohesive volume source.
+// The ordinary path supplies a live source; simulation attempts supply captured data.
+func (f *SchedulerFactory) newScheduler(ctx context.Context, pods []*corev1.Pod, stateNodes []*state.StateNode, volumeSource scheduler.VolumeSource) (*scheduler.Scheduler, error) {
+	p := f.provisioner
 
 	// Calculate cluster topology, if a context error occurs, it is wrapped and returned
-	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseNewTopology)
+	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseNewTopology)
 	topology, err := scheduler.NewTopology(phaseCtx, p.kubeClient, p.cluster, stateNodes, f.inputs, pods, f.opts...)
 	stop()
 	if err != nil {
 		return nil, fmt.Errorf("tracking topology counts, %w", err)
 	}
 	// Pass volumeReqs to scheduler - added to nodeRequirements for NodeClaim zone selection
-	return scheduler.NewSchedulerFromBaseline(ctx, p.kubeClient, f.baseline, p.cluster, stateNodes, topology, p.recorder, p.clock, volumeReqs)
+	return scheduler.NewSchedulerFromBaseline(ctx, p.kubeClient, f.baseline, p.cluster, stateNodes, topology, p.recorder, p.clock, volumeSource)
 }
 
 func (p *Provisioner) NewScheduler(
