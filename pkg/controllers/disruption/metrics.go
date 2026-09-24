@@ -77,6 +77,17 @@ var (
 		},
 		[]string{},
 	)
+	SimulateSchedulingPreparationDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "simulate_scheduling_preparation_duration_seconds",
+			Help:      "Duration of preparing the inputs shared by disruption scheduling simulations.",
+			Buckets:   metrics.DurationBuckets(),
+		},
+		[]string{},
+	)
 	DecisionsPerformedTotal = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,
 		prometheus.CounterOpts{

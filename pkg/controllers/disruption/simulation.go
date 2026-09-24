@@ -64,9 +64,7 @@ type schedulingSimulationSnapshot struct {
 
 func captureSimulationNodesAndPods(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder) (state.StateNodes, []*corev1.Pod, []*corev1.Pod, pdb.Limits, error) {
 	nodes := cluster.DeepCopyNodes()
-	phaseCtx, stop := measureSimulateSchedulingPhase(ctx, phaseGetPendingPods)
-	pendingPods, err := provisioner.GetPendingPods(phaseCtx)
-	stop()
+	pendingPods, err := provisioner.GetPendingPods(ctx)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("determining pending pods, %w", err)
 	}
@@ -156,6 +154,7 @@ func NewConsolidationSchedulingSimulator(ctx context.Context, kubeClient client.
 }
 
 func newSchedulingSimulator(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder, extraOpts []scheduling.Options, candidates ...*Candidate) (*SchedulingSimulator, error) {
+	defer metrics.Measure(SimulateSchedulingPreparationDurationSeconds, map[string]string{})()
 	snapshot, err := buildSchedulingSimulatorSnapshot(ctx, kubeClient, cluster, provisioner, clk, recorder, candidates...)
 	if err != nil {
 		return nil, err

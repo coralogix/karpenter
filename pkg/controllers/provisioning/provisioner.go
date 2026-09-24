@@ -275,9 +275,7 @@ func (p *Provisioner) NewSchedulerFactory(ctx context.Context, opts ...scheduler
 		return nil, err
 	}
 	inputs := scheduler.NewNodePoolInputs(ctx, p.recorder, nodePools, instanceTypes, opts...)
-	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListDaemonSets)
-	daemonSetPods, err := p.getDaemonSetPods(phaseCtx)
-	stop()
+	daemonSetPods, err := p.getDaemonSetPods(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("getting daemon pods, %w", err)
 	}
@@ -361,9 +359,7 @@ func (p *Provisioner) NewScheduler(
 
 //nolint:gocyclo
 func (p *Provisioner) listNodePoolsAndInstanceTypes(ctx context.Context) ([]*v1.NodePool, map[string][]*cloudprovider.InstanceType, error) {
-	phaseCtx, stop := scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseListNodePools)
-	nodePools, err := nodepoolutils.ListManaged(phaseCtx, p.kubeClient, p.cloudProvider)
-	stop()
+	nodePools, err := nodepoolutils.ListManaged(ctx, p.kubeClient, p.cloudProvider)
 	if err != nil {
 		return nil, nil, fmt.Errorf("listing nodepools, %w", err)
 	}
@@ -386,18 +382,24 @@ func (p *Provisioner) listNodePoolsAndInstanceTypes(ctx context.Context) ([]*v1.
 	// will always attempt to schedule on the first nodeTemplate
 	nodepoolutils.OrderByWeight(nodePools)
 
-	phaseCtx, stop = scheduler.MeasureNewSchedulerPhase(ctx, scheduler.PhaseGetInstanceTypes)
+	instanceTypes, err := p.getInstanceTypes(ctx, nodePools)
+	if err != nil {
+		return nil, nil, err
+	}
+	return nodePools, instanceTypes, nil
+}
+
+func (p *Provisioner) getInstanceTypes(ctx context.Context, nodePools []*v1.NodePool) (map[string][]*cloudprovider.InstanceType, error) {
 	instanceTypes := map[string][]*cloudprovider.InstanceType{}
 	for _, np := range nodePools {
-		its, err := p.cloudProvider.GetInstanceTypes(phaseCtx, np)
+		its, err := p.cloudProvider.GetInstanceTypes(ctx, np)
 		if err != nil {
 			if cloudprovider.IsUnevaluatedNodePoolError(err) {
 				log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).V(1).Info("skipping, awaiting nodeoverlay evaluation")
 				continue
 			}
 			if errors.Is(err, context.DeadlineExceeded) {
-				stop()
-				return nil, nil, fmt.Errorf("getting instance types, %w", err)
+				return nil, fmt.Errorf("getting instance types, %w", err)
 			}
 			log.FromContext(ctx).WithValues("NodePool", klog.KObj(np)).Error(err, "skipping, unable to resolve instance types")
 			continue
@@ -408,8 +410,7 @@ func (p *Provisioner) listNodePoolsAndInstanceTypes(ctx context.Context) ([]*v1.
 		}
 		instanceTypes[np.Name] = its
 	}
-	stop()
-	return nodePools, instanceTypes, nil
+	return instanceTypes, nil
 }
 
 func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {

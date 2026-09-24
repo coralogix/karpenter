@@ -308,11 +308,15 @@ func (s *PreparedSimulationInputs) NewRun(ctx context.Context, scenario Scenario
 		}
 		releasingPodUIDs.Insert(s.catalog.pods[id.index].UID)
 	}
-	topology, err := s.preparedTopology.Materialize(ctx, topologyPods, scenario.RemovedNodeNames...)
+	topologyCtx, stop := scheduling.MeasureNewSchedulerPhase(ctx, scheduling.PhaseNewTopology)
+	topology, err := s.preparedTopology.Materialize(topologyCtx, topologyPods, scenario.RemovedNodeNames...)
+	stop()
 	if err != nil {
 		return nil, fmt.Errorf("materializing topology, %w", err)
 	}
-	newScheduler, err := s.factory.newPreparedScheduler(ctx, s.schedulerState, stateNodes, topology, s.volumeSource, removed, releasingPodUIDs)
+	schedulerCtx, stop := scheduling.MeasureNewSchedulerPhase(ctx, scheduling.PhaseCalculateExistingNodeClaims)
+	newScheduler, err := s.factory.newPreparedScheduler(schedulerCtx, s.schedulerState, stateNodes, topology, s.volumeSource, removed, releasingPodUIDs)
+	stop()
 	if err != nil {
 		return nil, fmt.Errorf("creating simulation scheduler, %w", err)
 	}

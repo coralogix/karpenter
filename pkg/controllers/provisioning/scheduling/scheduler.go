@@ -146,12 +146,8 @@ func NewSchedulerBaseline(ctx context.Context, inputs *NodePoolInputs, daemonSet
 			}
 		}
 	}
-	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseDaemonOverhead)
-	daemonOverheadGroups := buildDaemonOverheadGroups(phaseCtx, inputs.nodeClaimTemplates, daemonSetPods)
-	stop()
-	_, stop = MeasureNewSchedulerPhase(ctx, PhaseReservationManager)
+	daemonOverheadGroups := buildDaemonOverheadGroups(ctx, inputs.nodeClaimTemplates, daemonSetPods)
 	reservationCapacity := reservationCapacityForInstanceTypes(inputs.instanceTypes)
-	stop()
 	return &SchedulerBaseline{
 		inputs:                   inputs,
 		daemonSetPods:            daemonSetPods,
