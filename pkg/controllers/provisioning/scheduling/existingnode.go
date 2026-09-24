@@ -31,26 +31,42 @@ import (
 
 type ExistingNode struct {
 	*state.StateNode
-	cachedAvailable v1.ResourceList // Cache so we don't have to re-subtract resources on the StateNode every time
-	cachedTaints    []v1.Taint      // Cache so we don't hae to re-construct the taints each time we attempt to schedule a pod
-
+	cachedAvailable         v1.ResourceList // Cache so we don't have to re-subtract resources on the StateNode every time
+	cachedTaints            []v1.Taint      // Cache so we don't hae to re-construct the taints each time
 	Pods                    []*v1.Pod
 	topology                *Topology
 	remainingResources      v1.ResourceList
 	requirements            scheduling.Requirements
 	isUnderConsolidateAfter bool
-	// instanceType is the resolved cloud provider instance type backing the node, used to source DRA template devices
-	// for uninitialized nodes. It is nil for unmanaged nodes or when the node's instance type is not in the current set.
-	instanceType *cloudprovider.InstanceType
+	instanceType            *cloudprovider.InstanceType
+	hostPortUsage           *scheduling.HostPortUsage
+	volumeUsage             *scheduling.VolumeUsage
 }
 
 func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, daemonResources v1.ResourceList, instanceType *cloudprovider.InstanceType, isUnderConsolidateAfter bool) *ExistingNode {
-	// The state node passed in here must be a deep copy from cluster state as we modify it
-	// the remaining daemonResources to schedule are the total daemonResources minus what has already scheduled
+	return prepareExistingNode(n, taints, daemonResources, instanceType, isUnderConsolidateAfter).materialize(topology)
+}
+
+// preparedExistingNode contains immutable facts used to evaluate an existing node.
+// Each materialized ExistingNode receives its own mutable allocation managers and
+// remaining resources.
+type preparedExistingNode struct {
+	stateNode               *state.StateNode
+	cachedAvailable         v1.ResourceList
+	cachedTaints            []v1.Taint
+	remainingResources      v1.ResourceList
+	requirements            scheduling.Requirements
+	hostPortUsage           *scheduling.HostPortUsage
+	volumeUsage             *scheduling.VolumeUsage
+	instanceType            *cloudprovider.InstanceType
+	isUnderConsolidateAfter bool
+}
+
+func prepareExistingNode(n *state.StateNode, taints []v1.Taint, daemonResources v1.ResourceList, instanceType *cloudprovider.InstanceType, isUnderConsolidateAfter bool) *preparedExistingNode {
+	// Work on a copy since the daemon resource map may be shared by the
+	// baseline or by another node preparation.
+	daemonResources = daemonResources.DeepCopy()
 	resources.SubtractFrom(daemonResources, n.DaemonSetRequests())
-	// If unexpected daemonset pods schedule to the node due to labels appearing on the node which cause the
-	// DS to be able to schedule, we need to ensure that we don't let our remainingDaemonResources go negative as
-	// it will cause us to mis-calculate the amount of remaining resources
 	for k, v := range daemonResources {
 		if v.AsApproximateFloat64() < 0 {
 			v.Set(0)
@@ -58,19 +74,61 @@ func NewExistingNode(n *state.StateNode, topology *Topology, taints []v1.Taint, 
 		}
 	}
 	available := n.Available()
-	node := &ExistingNode{
-		StateNode:               n,
+	requirements := scheduling.NewLabelRequirements(n.Labels())
+	requirements.Add(scheduling.NewRequirement(v1.LabelHostname, v1.NodeSelectorOpIn, n.HostName()))
+	return &preparedExistingNode{
+		stateNode:               n,
 		cachedAvailable:         available,
-		cachedTaints:            taints,
-		topology:                topology,
+		cachedTaints:            append([]v1.Taint(nil), taints...),
 		remainingResources:      resources.Subtract(available, daemonResources),
-		requirements:            scheduling.NewLabelRequirements(n.Labels()),
-		isUnderConsolidateAfter: isUnderConsolidateAfter,
+		requirements:            requirements,
+		hostPortUsage:           cloneHostPortUsage(n.HostPortUsage()),
+		volumeUsage:             cloneVolumeUsage(n.VolumeUsage()),
 		instanceType:            instanceType,
+		isUnderConsolidateAfter: isUnderConsolidateAfter,
 	}
-	node.requirements.Add(scheduling.NewRequirement(v1.LabelHostname, v1.NodeSelectorOpIn, n.HostName()))
-	topology.Register(v1.LabelHostname, n.HostName())
-	return node
+}
+
+func (n *preparedExistingNode) materialize(topology *Topology) *ExistingNode {
+	if topology != nil {
+		topology.Register(v1.LabelHostname, n.stateNode.HostName())
+	}
+	return &ExistingNode{
+		StateNode:               n.stateNode,
+		cachedAvailable:         n.cachedAvailable,
+		cachedTaints:            n.cachedTaints,
+		topology:                topology,
+		remainingResources:      n.remainingResources.DeepCopy(),
+		requirements:            n.requirements,
+		hostPortUsage:           cloneHostPortUsage(n.hostPortUsage),
+		volumeUsage:             cloneVolumeUsage(n.volumeUsage),
+		instanceType:            n.instanceType,
+		isUnderConsolidateAfter: n.isUnderConsolidateAfter,
+	}
+}
+
+func cloneHostPortUsage(usage *scheduling.HostPortUsage) *scheduling.HostPortUsage {
+	if usage == nil {
+		return nil
+	}
+	return usage.DeepCopy()
+}
+
+func cloneVolumeUsage(usage *scheduling.VolumeUsage) *scheduling.VolumeUsage {
+	if usage == nil {
+		return nil
+	}
+	return usage.DeepCopy()
+}
+
+// HostPortUsage returns the allocation state owned by this scheduling attempt.
+func (n *ExistingNode) HostPortUsage() *scheduling.HostPortUsage {
+	return n.hostPortUsage
+}
+
+// VolumeUsage returns the allocation state owned by this scheduling attempt.
+func (n *ExistingNode) VolumeUsage() *scheduling.VolumeUsage {
+	return n.volumeUsage
 }
 
 // CanAdd returns whether the pod can be added to the ExistingNode

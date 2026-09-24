@@ -313,19 +313,36 @@ func (f *SchedulerFactory) newScheduler(ctx context.Context, pods []*corev1.Pod,
 // topology without rebuilding it from the API.
 func (f *SchedulerFactory) newSchedulerWithTopology(ctx context.Context, stateNodes []*state.StateNode, topology *scheduler.Topology, volumeSource scheduler.VolumeSource, deletingPodUIDs sets.Set[types.UID]) (*scheduler.Scheduler, error) {
 	p := f.provisioner
-	var allocator *dynamicresources.Allocator
-	if !options.FromContext(ctx).IgnoreDRARequests {
-		inClusterSlices, err := p.gatherResourceSlices(ctx, stateNodes)
-		if err != nil {
-			return nil, fmt.Errorf("gathering resourceslices, %w", err)
-		}
-		allocatedDevices, err := p.gatherAllocatedDevices(ctx, deletingPodUIDs)
-		if err != nil {
-			return nil, fmt.Errorf("gathering allocated devices, %w", err)
-		}
-		allocator = dynamicresources.NewAllocator(inClusterSlices, allocatedDevices, dynamicresources.BuildAttributeBindings(f.inputs.InstanceTypes()), p.kubeClient, deletingPodUIDs)
+	allocator, err := f.newDynamicResourcesAllocator(ctx, stateNodes, deletingPodUIDs)
+	if err != nil {
+		return nil, err
 	}
 	return scheduler.NewSchedulerFromBaseline(ctx, f.baseline, p.cluster, stateNodes, topology, p.recorder, p.clock, volumeSource, allocator)
+}
+
+func (f *SchedulerFactory) newPreparedScheduler(ctx context.Context, prepared *scheduler.PreparedSchedulerState, stateNodes []*state.StateNode, topology *scheduler.Topology, volumeSource scheduler.VolumeSource, removedNodeNames sets.Set[string], deletingPodUIDs sets.Set[types.UID]) (*scheduler.Scheduler, error) {
+	p := f.provisioner
+	allocator, err := f.newDynamicResourcesAllocator(ctx, stateNodes, deletingPodUIDs)
+	if err != nil {
+		return nil, err
+	}
+	return prepared.NewScheduler(ctx, p.cluster, topology, p.recorder, p.clock, volumeSource, removedNodeNames, allocator)
+}
+
+func (f *SchedulerFactory) newDynamicResourcesAllocator(ctx context.Context, stateNodes []*state.StateNode, deletingPodUIDs sets.Set[types.UID]) (*dynamicresources.Allocator, error) {
+	if options.FromContext(ctx).IgnoreDRARequests {
+		return nil, nil
+	}
+	p := f.provisioner
+	inClusterSlices, err := p.gatherResourceSlices(ctx, stateNodes)
+	if err != nil {
+		return nil, fmt.Errorf("gathering resourceslices, %w", err)
+	}
+	allocatedDevices, err := p.gatherAllocatedDevices(ctx, deletingPodUIDs)
+	if err != nil {
+		return nil, fmt.Errorf("gathering allocated devices, %w", err)
+	}
+	return dynamicresources.NewAllocator(inClusterSlices, allocatedDevices, dynamicresources.BuildAttributeBindings(f.inputs.InstanceTypes()), p.kubeClient, deletingPodUIDs), nil
 }
 
 func (p *Provisioner) NewScheduler(
