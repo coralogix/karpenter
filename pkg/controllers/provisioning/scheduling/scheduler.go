@@ -113,20 +113,27 @@ var MinValuesPolicy = func(policy karpopts.MinValuesPolicy) func(*options) {
 	}
 }
 
-func NewScheduler(
-	ctx context.Context,
-	kubeClient client.Client,
-	inputs *NodePoolInputs,
-	cluster *state.Cluster,
-	stateNodes []*state.StateNode,
-	topology *Topology,
-	daemonSetPods []*corev1.Pod,
-	recorder events.Recorder,
-	clock clock.Clock,
-	volumeReqsByPod map[types.UID]scheduling.Requirements,
-	opts ...Options,
-) *Scheduler {
-	minValuesPolicy := option.Resolve(opts...).minValuesPolicy
+// SchedulerBaseline contains the scheduler inputs that are independent of a scheduling attempt.
+// Its fields are private so callers can only obtain attempt-local schedulers through the constructor
+// below. The daemon pods and all derived maps are owned by the baseline and never mutated by an
+// attempt.
+type SchedulerBaseline struct {
+	inputs                   *NodePoolInputs
+	daemonSetPods            []*corev1.Pod
+	daemonOverhead           map[*NodeClaimTemplate]corev1.ResourceList
+	daemonHostPortUsage      map[*NodeClaimTemplate]*scheduling.HostPortUsage
+	reservationCapacity      map[string]int
+	toleratePreferNoSchedule bool
+	ignoreDRARequests        bool
+	options                  options
+}
+
+// NewSchedulerBaseline prepares the immutable work shared by schedulers that use the same
+// NodePoolInputs and daemon snapshot. Every scheduler created from the baseline gets fresh
+// attempt-owned reservation, host-port, preference, and remaining-resource state.
+func NewSchedulerBaseline(ctx context.Context, inputs *NodePoolInputs, daemonSetPods []*corev1.Pod, opts ...Options) *SchedulerBaseline {
+	resolved := option.Resolve(opts...)
+	daemonSetPods = cloneDaemonSetPods(daemonSetPods)
 
 	// if any of the nodePools add a taint with a prefer no schedule effect, we add a toleration for the taint
 	// during preference relaxation
@@ -141,44 +148,131 @@ func NewScheduler(
 	templates := inputs.nodeClaimTemplates
 
 	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseDaemonOverhead)
-	daemonOverhead := getDaemonOverhead(phaseCtx, templates, daemonSetPods)
+	daemonOverhead := getDaemonOverhead(phaseCtx, templates, cloneDaemonSetPods(daemonSetPods))
 	stop()
 
 	phaseCtx, stop = MeasureNewSchedulerPhase(ctx, PhaseDaemonHostPorts)
-	daemonHostPortUsage := getDaemonHostPortUsage(phaseCtx, templates, daemonSetPods)
+	daemonHostPortUsage := getDaemonHostPortUsage(phaseCtx, templates, cloneDaemonSetPods(daemonSetPods))
 	stop()
 
 	_, stop = MeasureNewSchedulerPhase(ctx, PhaseReservationManager)
-	reservationManager := NewReservationManager(inputs.instanceTypes)
+	reservationCapacity := reservationCapacityForInstanceTypes(inputs.instanceTypes)
 	stop()
 
+	return &SchedulerBaseline{
+		inputs:                   inputs,
+		daemonSetPods:            daemonSetPods,
+		daemonOverhead:           daemonOverhead,
+		daemonHostPortUsage:      daemonHostPortUsage,
+		reservationCapacity:      reservationCapacity,
+		toleratePreferNoSchedule: toleratePreferNoSchedule,
+		ignoreDRARequests:        karpopts.FromContext(ctx).IgnoreDRARequests,
+		options:                  *resolved,
+	}
+}
+
+// NewScheduler creates a scheduler with a one-use baseline. Callers that create multiple
+// schedulers for the same NodePoolInputs should prepare a baseline once and use
+// NewSchedulerFromBaseline instead.
+func NewScheduler(
+	ctx context.Context,
+	kubeClient client.Client,
+	inputs *NodePoolInputs,
+	cluster *state.Cluster,
+	stateNodes []*state.StateNode,
+	topology *Topology,
+	daemonSetPods []*corev1.Pod,
+	recorder events.Recorder,
+	clock clock.Clock,
+	volumeReqsByPod map[types.UID]scheduling.Requirements,
+	opts ...Options,
+) *Scheduler {
+	baseline := NewSchedulerBaseline(ctx, inputs, daemonSetPods, opts...)
+	return newSchedulerFromBaseline(ctx, kubeClient, baseline, cluster, stateNodes, topology, recorder, clock, volumeReqsByPod)
+}
+
+// NewSchedulerFromBaseline creates an attempt-local scheduler from a reusable baseline.
+func NewSchedulerFromBaseline(
+	ctx context.Context,
+	kubeClient client.Client,
+	baseline *SchedulerBaseline,
+	cluster *state.Cluster,
+	stateNodes []*state.StateNode,
+	topology *Topology,
+	recorder events.Recorder,
+	clock clock.Clock,
+	volumeReqsByPod map[types.UID]scheduling.Requirements,
+) (*Scheduler, error) {
+	if baseline.ignoreDRARequests != karpopts.FromContext(ctx).IgnoreDRARequests {
+		return nil, fmt.Errorf("scheduler baseline was prepared with IgnoreDRARequests=%t but attempt context has IgnoreDRARequests=%t", baseline.ignoreDRARequests, karpopts.FromContext(ctx).IgnoreDRARequests)
+	}
+	return newSchedulerFromBaseline(ctx, kubeClient, baseline, cluster, stateNodes, topology, recorder, clock, volumeReqsByPod), nil
+}
+
+func newSchedulerFromBaseline(
+	ctx context.Context,
+	kubeClient client.Client,
+	baseline *SchedulerBaseline,
+	cluster *state.Cluster,
+	stateNodes []*state.StateNode,
+	topology *Topology,
+	recorder events.Recorder,
+	clock clock.Clock,
+	volumeReqsByPod map[types.UID]scheduling.Requirements,
+) *Scheduler {
+	inputs := baseline.inputs
 	s := &Scheduler{
 		uuid:                uuid.NewUUID(),
 		kubeClient:          kubeClient,
-		nodeClaimTemplates:  templates,
+		nodeClaimTemplates:  inputs.nodeClaimTemplates,
 		topology:            topology,
 		cluster:             cluster,
-		daemonOverhead:      daemonOverhead,
-		daemonHostPortUsage: daemonHostPortUsage,
+		daemonOverhead:      cloneDaemonOverhead(baseline.daemonOverhead),
+		daemonHostPortUsage: cloneDaemonHostPortUsage(baseline.daemonHostPortUsage),
 		cachedPodData:       map[types.UID]*PodData{}, // cache pod data to avoid having to continually recompute it
 		volumeReqsByPod:     volumeReqsByPod,          // Volume requirements per pod
 		recorder:            recorder,
-		preferences:         &Preferences{ToleratePreferNoSchedule: toleratePreferNoSchedule},
+		preferences:         &Preferences{ToleratePreferNoSchedule: baseline.toleratePreferNoSchedule},
 		remainingResources: lo.SliceToMap(inputs.nodePools, func(np *v1.NodePool) (string, corev1.ResourceList) {
 			// The limits are copied so that scheduling never mutates the input
 			return np.Name, corev1.ResourceList(np.Spec.Limits).DeepCopy()
 		}),
 		clock:                   clock,
-		reservationManager:      reservationManager,
-		reservedOfferingMode:    option.Resolve(opts...).reservedOfferingMode,
-		preferencePolicy:        option.Resolve(opts...).preferencePolicy,
-		minValuesPolicy:         minValuesPolicy,
-		numConcurrentReconciles: lo.Ternary(option.Resolve(opts...).numConcurrentReconciles > 0, option.Resolve(opts...).numConcurrentReconciles, 1),
+		reservationManager:      newReservationManager(baseline.reservationCapacity),
+		reservedOfferingMode:    baseline.options.reservedOfferingMode,
+		preferencePolicy:        baseline.options.preferencePolicy,
+		minValuesPolicy:         baseline.options.minValuesPolicy,
+		numConcurrentReconciles: lo.Ternary(baseline.options.numConcurrentReconciles > 0, baseline.options.numConcurrentReconciles, 1),
 	}
-	phaseCtx, stop = MeasureNewSchedulerPhase(ctx, PhaseCalculateExistingNodeClaims)
-	s.calculateExistingNodeClaims(phaseCtx, stateNodes, daemonSetPods)
+	phaseCtx, stop := MeasureNewSchedulerPhase(ctx, PhaseCalculateExistingNodeClaims)
+	s.calculateExistingNodeClaims(phaseCtx, stateNodes, baseline.daemonSetPods)
 	stop()
 	return s
+}
+
+func cloneDaemonOverhead(overhead map[*NodeClaimTemplate]corev1.ResourceList) map[*NodeClaimTemplate]corev1.ResourceList {
+	result := make(map[*NodeClaimTemplate]corev1.ResourceList, len(overhead))
+	for template, resources := range overhead {
+		result[template] = resources.DeepCopy()
+	}
+	return result
+}
+
+func cloneDaemonSetPods(pods []*corev1.Pod) []*corev1.Pod {
+	return lo.Map(pods, func(p *corev1.Pod, _ int) *corev1.Pod {
+		if p == nil {
+			return nil
+		}
+		return p.DeepCopy()
+	})
+}
+
+func cloneDaemonHostPortUsage(usage map[*NodeClaimTemplate]*scheduling.HostPortUsage) map[*NodeClaimTemplate]*scheduling.HostPortUsage {
+	result := make(map[*NodeClaimTemplate]*scheduling.HostPortUsage, len(usage))
+	for template, hostPortUsage := range usage {
+		result[template] = hostPortUsage.DeepCopy()
+	}
+	return result
 }
 
 type PodData struct {
@@ -780,7 +874,7 @@ func getDaemonOverhead(ctx context.Context, nodeClaimTemplates []*NodeClaimTempl
 			if pod.HasDRARequirements(p) && karpopts.FromContext(ctx).IgnoreDRARequests {
 				return false
 			}
-			return isDaemonPodCompatible(nct, p)
+			return isDaemonPodCompatible(nct, p.DeepCopy())
 		})...)
 	})
 }
@@ -796,7 +890,7 @@ func getDaemonHostPortUsage(ctx context.Context, nodeClaimTemplates []*NodeClaim
 			if pod.HasDRARequirements(p) && karpopts.FromContext(ctx).IgnoreDRARequests {
 				return false
 			}
-			return isDaemonPodCompatible(nct, p)
+			return isDaemonPodCompatible(nct, p.DeepCopy())
 		}) {
 			hostPortUsage.Add(pod, scheduling.GetHostPorts(pod))
 		}
