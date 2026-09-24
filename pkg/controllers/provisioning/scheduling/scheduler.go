@@ -177,11 +177,12 @@ func NewScheduler(
 		volumeSource = NewLiveVolumeSource(kubeClient, nil)
 	}
 	baseline := NewSchedulerBaseline(ctx, inputs, daemonSetPods, opts...)
-	return newSchedulerFromBaseline(ctx, baseline, cluster, stateNodes, topology, recorder, clock, volumeSource, allocator)
+	return newSchedulerFromBaseline(ctx, kubeClient, baseline, cluster, stateNodes, topology, recorder, clock, volumeSource, allocator)
 }
 
 func NewSchedulerFromBaseline(
 	ctx context.Context,
+	kubeClient client.Client,
 	baseline *SchedulerBaseline,
 	cluster *state.Cluster,
 	stateNodes []*state.StateNode,
@@ -201,11 +202,12 @@ func NewSchedulerFromBaseline(
 	if len(allocators) > 0 {
 		allocator = allocators[0]
 	}
-	return newSchedulerFromBaseline(ctx, baseline, cluster, stateNodes, topology, recorder, clock, volumeSource, allocator), nil
+	return newSchedulerFromBaseline(ctx, kubeClient, baseline, cluster, stateNodes, topology, recorder, clock, volumeSource, allocator), nil
 }
 
 func newSchedulerFromBaseline(
 	ctx context.Context,
+	kubeClient client.Client,
 	baseline *SchedulerBaseline,
 	cluster *state.Cluster,
 	stateNodes []*state.StateNode,
@@ -216,7 +218,7 @@ func newSchedulerFromBaseline(
 	allocator *dynamicresources.Allocator,
 ) *Scheduler {
 	inputs := baseline.inputs
-	s := newSchedulerWithBaseline(baseline, cluster, topology, recorder, clock, volumeSource, nodePoolRemainingResources(inputs))
+	s := newSchedulerWithBaseline(kubeClient, baseline, cluster, topology, recorder, clock, volumeSource, nodePoolRemainingResources(inputs))
 	s.allocator = allocator
 	s.instanceTypes = inputs.instanceTypes
 	s.cachedResourceClaims = map[types.NamespacedName]*resourcev1.ResourceClaim{}
@@ -242,6 +244,7 @@ func newSchedulerFromBaseline(
 }
 
 func newSchedulerWithBaseline(
+	kubeClient client.Client,
 	baseline *SchedulerBaseline,
 	cluster *state.Cluster,
 	topology *Topology,
@@ -253,6 +256,7 @@ func newSchedulerWithBaseline(
 	inputs := baseline.inputs
 	return &Scheduler{
 		uuid:                    uuid.NewUUID(),
+		kubeClient:              kubeClient,
 		nodeClaimTemplates:      inputs.nodeClaimTemplates,
 		topology:                topology,
 		cluster:                 cluster,
@@ -312,6 +316,7 @@ type PodData struct {
 
 type Scheduler struct {
 	uuid                    types.UID // Unique UUID attached to this scheduling loop
+	kubeClient              client.Client
 	newNodeClaims           []*NodeClaim
 	existingNodes           []*ExistingNode
 	nodeClaimTemplates      []*NodeClaimTemplate
@@ -650,7 +655,7 @@ func (s *Scheduler) updateCachedPodData(ctx context.Context, p *corev1.Pod) {
 		Requirements:             requirements,
 		StrictRequirements:       strictRequirements,
 		HasResourceClaimRequests: pod.HasDRARequirements(p),
-		VolumeRequirements:       s.volumeSource.Requirements(p), // Volume requirements
+		VolumeRequirements:       s.volumeSource.Requirements(p), // Volume requirement alternatives
 	}
 	// Resolve the pod's ResourceClaims once, in the sequential path, so the parallel candidate evaluation can reuse them
 	// without per-candidate API lookups. A resolution failure is recorded and surfaced as a scheduling error in add().

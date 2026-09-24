@@ -141,7 +141,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		return evals[i].Score > evals[j].Score
 	})
 
-	remainingValidationDelay := consolidationTTL - s.clock.Since(start)
+	remainingValidationDelay := commandValidationDelay - s.clock.Since(start)
 	if remainingValidationDelay > 0 {
 		select {
 		case <-ctx.Done():

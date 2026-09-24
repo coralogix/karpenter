@@ -87,12 +87,6 @@ func simulateSchedulingWithOptions(ctx context.Context, kubeClient client.Client
 	return simulateScheduling(ctx, kubeClient, cluster, provisioner, clk, recorder, factory, candidates...)
 }
 
-func simulateSchedulingWithFactory(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
-	schedulerFactory *provisioning.SchedulerFactory, candidates ...*Candidate,
-) (scheduling.Results, error) {
-	return simulateScheduling(ctx, kubeClient, cluster, provisioner, clk, recorder, schedulerFactory, candidates...)
-}
-
 //nolint:gocyclo
 func simulateScheduling(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, clk clock.Clock, recorder events.Recorder,
 	schedulerFactory *provisioning.SchedulerFactory, candidates ...*Candidate,

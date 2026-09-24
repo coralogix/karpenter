@@ -128,7 +128,7 @@ func (c *readCache) listCacheKey(list client.ObjectList, opts ...client.ListOpti
 
 func assignObject(dst client.Object, src runtime.Object) error {
 	dstVal := reflect.ValueOf(dst)
-	if dstVal.Kind() != reflect.Ptr || dstVal.IsNil() {
+	if dstVal.Kind() != reflect.Pointer || dstVal.IsNil() {
 		return fmt.Errorf("destination must be a non-nil pointer")
 	}
 	srcCopy := src.DeepCopyObject()

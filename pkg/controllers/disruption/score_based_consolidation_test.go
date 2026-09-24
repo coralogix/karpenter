@@ -71,13 +71,13 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			},
 		}
 
-		c := disruption.MakeConsolidation(fakeClock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)
+		c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)
 		scoreBased = disruption.NewScoreBasedConsolidation(c)
 	})
 
 	AfterEach(func() {
 		disruption.ScoreBasedConsolidationTimeoutDuration = 20 * time.Second
-		fakeClock.SetTime(time.Now())
+		env.Clock.SetTime(time.Now())
 		ExpectCleanedUp(ctx, env.Client)
 	})
 
@@ -111,7 +111,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 				},
 			})
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 			ExpectApplied(ctx, env.Client, nodeClaim)
 			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
@@ -124,7 +124,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 				ctx,
 				env.Client,
 				recorder,
-				fakeClock,
+				env.Clock,
 				stateNode,
 				limits,
 				scoreBasedNodePoolMap,
@@ -141,8 +141,8 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 					cmds, err = scoreBased.ComputeCommands(ctx, budgetMapping, candidate)
 				},
 				func() {
-					Eventually(fakeClock.HasWaiters, time.Second*10).Should(BeTrue())
-					fakeClock.Step(15 * time.Second)
+					Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
+					env.Clock.Step(15 * time.Second)
 				},
 			)
 			Expect(err).To(BeNil())
@@ -155,8 +155,8 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			scoreBasedNodePool.Annotations[v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey] = "1"
 			ExpectApplied(ctx, env.Client, scoreBasedNodePool)
 
-			underutilizedPace := disruption.NewUnderutilizedConsolidationPace(fakeClock)
-			c := disruption.MakeConsolidation(fakeClock, cluster, env.Client, prov, cloudProvider, recorder, queue, underutilizedPace)
+			underutilizedPace := disruption.NewUnderutilizedConsolidationPace(env.Clock)
+			c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, underutilizedPace)
 			scoreBasedWithPace := disruption.NewScoreBasedConsolidation(c)
 
 			nonEmptyCandidates, err := createScoreBasedCandidatesForPool(scoreBasedNodePool, mostExpensiveInstance)
@@ -177,7 +177,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 				},
 			})
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 			ExpectApplied(ctx, env.Client, nodeClaim)
 			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
@@ -190,7 +190,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 				ctx,
 				env.Client,
 				recorder,
-				fakeClock,
+				env.Clock,
 				stateNode,
 				limits,
 				scoreBasedNodePoolMap,
@@ -207,8 +207,8 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 					cmds, err = scoreBasedWithPace.ComputeCommands(ctx, budgetMapping, candidate)
 				},
 				func() {
-					Eventually(fakeClock.HasWaiters, time.Second*10).Should(BeTrue())
-					fakeClock.Step(15 * time.Second)
+					Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
+					env.Clock.Step(15 * time.Second)
 				},
 			)
 			Expect(err).To(BeNil())
@@ -257,14 +257,14 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 			ExpectApplied(ctx, env.Client, rs, pod, node, nodeClaim, scoreBasedNodePool)
 			ExpectManualBinding(ctx, env.Client, pod, node)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-			c := disruption.MakeConsolidation(fakeClock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)
+			c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)
 			scoreBasedConsolidation := disruption.NewScoreBasedConsolidation(c, disruption.WithValidator(NewTestScoreBasedConsolidationValidator(scoreBasedNodePool, validatorOpt)))
-			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, fakeClock, env.Client, cloudProvider, recorder, scoreBasedConsolidation.Reason())
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, env.Clock, env.Client, cloudProvider, recorder, scoreBasedConsolidation.Reason())
 			Expect(err).To(Succeed())
 
-			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, scoreBasedConsolidation.ShouldDisrupt, scoreBasedConsolidation.Class(), queue)
+			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, scoreBasedConsolidation.ShouldDisrupt, scoreBasedConsolidation.Class(), queue)
 			Expect(err).To(Succeed())
 
 			var cmds []disruption.Command
@@ -273,8 +273,8 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 					cmds, err = scoreBasedConsolidation.ComputeCommands(ctx, budgets, candidates...)
 				},
 				func() {
-					Eventually(fakeClock.HasWaiters, time.Second*10).Should(BeTrue())
-					fakeClock.Step(15 * time.Second)
+					Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
+					env.Clock.Step(15 * time.Second)
 				},
 			)
 			Expect(err).To(Succeed())
@@ -291,7 +291,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 })
 
 func NewTestScoreBasedConsolidationValidator(nodePool *v1.NodePool, opts ...TestConsolidationValidatorOption) disruption.Validator {
-	return newTestConsolidationValidator(nodePool, disruption.NewScoreBasedConsolidationValidator(disruption.MakeConsolidation(fakeClock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)), opts...)
+	return newTestConsolidationValidator(nodePool, disruption.NewScoreBasedConsolidationValidator(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)), opts...)
 }
 
 func createScoreBasedCandidatesForPool(np *v1.NodePool, instanceType *cloudprovider.InstanceType) ([]*disruption.Candidate, error) {
@@ -312,7 +312,7 @@ func createScoreBasedCandidatesForPool(np *v1.NodePool, instanceType *cloudprovi
 	pod := test.Pod()
 	ExpectApplied(ctx, env.Client, nodeClaim, node, pod)
 	ExpectManualBinding(ctx, env.Client, pod, node)
-	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 	nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 	ExpectApplied(ctx, env.Client, nodeClaim)
 	ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(node))
@@ -327,7 +327,7 @@ func createScoreBasedCandidatesForPool(np *v1.NodePool, instanceType *cloudprovi
 		ctx,
 		env.Client,
 		recorder,
-		fakeClock,
+		env.Clock,
 		stateNode,
 		limits,
 		map[string]*v1.NodePool{np.Name: np},

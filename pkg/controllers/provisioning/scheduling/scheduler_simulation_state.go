@@ -29,6 +29,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/clock"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -56,24 +58,40 @@ type PreparedSchedulerState struct {
 // a scheduling attempt. stateNodes must be the owned snapshot for the same
 // simulation input that owns baseline.
 func NewPreparedSchedulerState(ctx context.Context, baseline *SchedulerBaseline, stateNodes []*state.StateNode, clocks ...clock.Clock) (*PreparedSchedulerState, error) {
-	if baseline == nil {
-		return nil, errors.New("scheduler baseline is required")
-	}
-	if baseline.ignoreDRARequests != karpopts.FromContext(ctx).IgnoreDRARequests {
-		return nil, fmt.Errorf("scheduler baseline was prepared with IgnoreDRARequests=%t but simulation context has IgnoreDRARequests=%t", baseline.ignoreDRARequests, karpopts.FromContext(ctx).IgnoreDRARequests)
-	}
-	if err := ctx.Err(); err != nil {
+	if err := validatePreparedSchedulerState(ctx, baseline); err != nil {
 		return nil, err
 	}
+	preparedNodes, remainingResources, deletingNodeNames := prepareSchedulerNodes(ctx, baseline, stateNodes, preparedStateClock(clocks))
+	return &PreparedSchedulerState{
+		baseline:           baseline,
+		existingNodes:      preparedNodes,
+		remainingResources: remainingResources,
+		deletingNodeNames:  deletingNodeNames,
+	}, nil
+}
 
+func validatePreparedSchedulerState(ctx context.Context, baseline *SchedulerBaseline) error {
+	if baseline == nil {
+		return errors.New("scheduler baseline is required")
+	}
+	if baseline.ignoreDRARequests != karpopts.FromContext(ctx).IgnoreDRARequests {
+		return fmt.Errorf("scheduler baseline was prepared with IgnoreDRARequests=%t but simulation context has IgnoreDRARequests=%t", baseline.ignoreDRARequests, karpopts.FromContext(ctx).IgnoreDRARequests)
+	}
+	return ctx.Err()
+}
+
+func preparedStateClock(clocks []clock.Clock) clock.Clock {
+	if len(clocks) > 0 && clocks[0] != nil {
+		return clocks[0]
+	}
+	return clock.RealClock{}
+}
+
+func prepareSchedulerNodes(ctx context.Context, baseline *SchedulerBaseline, stateNodes []*state.StateNode, clockSource clock.Clock) ([]*preparedExistingNode, map[string]corev1.ResourceList, sets.Set[string]) {
 	daemonSetPods := baseline.daemonSetPods
 	preparedNodes := make([]*preparedExistingNode, 0, len(stateNodes))
 	remainingResources := nodePoolRemainingResources(baseline.inputs)
 	deletingNodeNames := sets.New[string]()
-	clockSource := clock.Clock(clock.RealClock{})
-	if len(clocks) > 0 && clocks[0] != nil {
-		clockSource = clocks[0]
-	}
 	nodePoolsByName := lo.SliceToMap(baseline.inputs.nodePools, func(nodePool *v1.NodePool) (string, *v1.NodePool) {
 		return nodePool.Name, nodePool
 	})
@@ -101,13 +119,7 @@ func NewPreparedSchedulerState(ctx context.Context, baseline *SchedulerBaseline,
 		}
 	}
 	sortPreparedExistingNodes(preparedNodes)
-
-	return &PreparedSchedulerState{
-		baseline:           baseline,
-		existingNodes:      preparedNodes,
-		remainingResources: remainingResources,
-		deletingNodeNames:  deletingNodeNames,
-	}, nil
+	return preparedNodes, remainingResources, deletingNodeNames
 }
 
 // NewScheduler creates one isolated attempt from the prepared node state.
@@ -116,6 +128,7 @@ func NewPreparedSchedulerState(ctx context.Context, baseline *SchedulerBaseline,
 // this method.
 func (p *PreparedSchedulerState) NewScheduler(
 	ctx context.Context,
+	kubeClient client.Client,
 	cluster *state.Cluster,
 	topology *Topology,
 	recorder events.Recorder,
@@ -137,7 +150,7 @@ func (p *PreparedSchedulerState) NewScheduler(
 		return nil, err
 	}
 
-	s := newSchedulerWithBaseline(p.baseline, cluster, topology, recorder, clock, volumeSource, p.remainingResourcesFor(removedNodeNames))
+	s := newSchedulerWithBaseline(kubeClient, p.baseline, cluster, topology, recorder, clock, volumeSource, p.remainingResourcesFor(removedNodeNames))
 	if len(allocators) > 0 {
 		s.allocator = allocators[0]
 	}

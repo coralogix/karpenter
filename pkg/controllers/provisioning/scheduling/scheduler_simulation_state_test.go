@@ -54,11 +54,11 @@ func TestPreparedSchedulerStateMaterializesIndependentAllocationState(t *testing
 		t.Fatalf("preparing scheduler state: %v", err)
 	}
 
-	first, err := prepared.NewScheduler(ctx, nil, emptyTopology(), nil, clock.RealClock{}, NewCapturedVolumeSource(nil), sets.New[string]())
+	first, err := prepared.NewScheduler(ctx, nil, nil, emptyTopology(), nil, clock.RealClock{}, NewCapturedVolumeSource(nil), sets.New[string]())
 	if err != nil {
 		t.Fatalf("creating first scheduler: %v", err)
 	}
-	second, err := prepared.NewScheduler(ctx, nil, emptyTopology(), nil, clock.RealClock{}, NewCapturedVolumeSource(nil), sets.New[string]())
+	second, err := prepared.NewScheduler(ctx, nil, nil, emptyTopology(), nil, clock.RealClock{}, NewCapturedVolumeSource(nil), sets.New[string]())
 	if err != nil {
 		t.Fatalf("creating second scheduler: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestPreparedSchedulerStateRestoresFiniteNodePoolLimits(t *testing.T) {
 		t.Fatalf("preparing scheduler state: %v", err)
 	}
 	removed := sets.New[string]("node")
-	scheduler, err := prepared.NewScheduler(ctx, nil, emptyTopology(), nil, clock.RealClock{}, NewCapturedVolumeSource(nil), removed)
+	scheduler, err := prepared.NewScheduler(ctx, nil, nil, emptyTopology(), nil, clock.RealClock{}, NewCapturedVolumeSource(nil), removed)
 	if err != nil {
 		t.Fatalf("creating scheduler: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestPreparedSchedulerStateExcludesDeletingNodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("preparing scheduler state: %v", err)
 	}
-	scheduler, err := prepared.NewScheduler(ctx, nil, emptyTopology(), nil, clock.RealClock{}, NewCapturedVolumeSource(nil), sets.New[string]())
+	scheduler, err := prepared.NewScheduler(ctx, nil, nil, emptyTopology(), nil, clock.RealClock{}, NewCapturedVolumeSource(nil), sets.New[string]())
 	if err != nil {
 		t.Fatalf("creating scheduler: %v", err)
 	}
@@ -182,13 +182,13 @@ func TestPreparedSchedulerStatePreservesSortedNodeOrderWhenFiltering(t *testing.
 		t.Fatalf("preparing scheduler state: %v", err)
 	}
 
-	scheduler, err := prepared.NewScheduler(ctx, nil, emptyTopology(), nil, clock.RealClock{}, NewCapturedVolumeSource(nil), sets.New[string]())
+	scheduler, err := prepared.NewScheduler(ctx, nil, nil, emptyTopology(), nil, clock.RealClock{}, NewCapturedVolumeSource(nil), sets.New[string]())
 	if err != nil {
 		t.Fatalf("creating scheduler: %v", err)
 	}
 	assertExistingNodeOrder(t, scheduler, []string{"node-a", "node-c", "node-b"})
 
-	scheduler, err = prepared.NewScheduler(ctx, nil, emptyTopology(), nil, clock.RealClock{}, NewCapturedVolumeSource(nil), sets.New("node-c"))
+	scheduler, err = prepared.NewScheduler(ctx, nil, nil, emptyTopology(), nil, clock.RealClock{}, NewCapturedVolumeSource(nil), sets.New("node-c"))
 	if err != nil {
 		t.Fatalf("creating filtered scheduler: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestPreparedSchedulerStateMaterializesConcurrently(t *testing.T) {
 	for i := 0; i < attempts; i++ {
 		go func() {
 			defer waitGroup.Done()
-			scheduler, err := prepared.NewScheduler(ctx, nil, emptyTopology(), nil, clock.RealClock{}, NewCapturedVolumeSource(nil), sets.New[string]())
+			scheduler, err := prepared.NewScheduler(ctx, nil, nil, emptyTopology(), nil, clock.RealClock{}, NewCapturedVolumeSource(nil), sets.New[string]())
 			if err != nil {
 				errs <- err
 				return

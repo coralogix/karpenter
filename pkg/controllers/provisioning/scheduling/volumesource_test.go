@@ -55,12 +55,12 @@ func TestCapturedVolumeSourceOwnsVolumeData(t *testing.T) {
 	volumes := karpscheduling.Volumes{}
 	volumes.Add("ebs.csi.aws.com", "pvc-1")
 	source := NewCapturedVolumeSource(map[types.UID]VolumeData{
-		pod.UID: {Requirements: requirements, Volumes: volumes},
+		pod.UID: {Requirements: []karpscheduling.Requirements{requirements}, Volumes: volumes},
 	})
 	requirements.Add(karpscheduling.NewRequirement("example.com/mutated", corev1.NodeSelectorOpIn, "true"))
 	volumes.Add("ebs.csi.aws.com", "pvc-2")
 
-	if _, ok := source.Requirements(pod)["example.com/mutated"]; ok {
+	if _, ok := source.Requirements(pod)[0]["example.com/mutated"]; ok {
 		t.Fatal("captured requirements aliased caller data")
 	}
 	got, err := source.Volumes(context.Background(), pod)

@@ -29,9 +29,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/karpenter/pkg/bench/clusterfixture"
+	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/operator/logging"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 	"sigs.k8s.io/karpenter/pkg/test"
 )
 
@@ -104,7 +106,7 @@ func newClusterFixtureBench(dir string) (*clusterFixtureBench, error) {
 		return nil, err
 	}
 
-	env.Provisioner = provisioning.NewProvisioner(env.Client, env.Recorder, env.CloudProvider, env.Cluster, env.Clock)
+	env.Provisioner = provisioning.NewProvisioner(env.Client, env.Recorder, env.CloudProvider, env.Cluster, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client))
 	queue := NewQueue(env.Client, env.Recorder, env.Cluster, env.Clock, env.Provisioner)
 	consolidation := MakeConsolidation(env.Clock, env.Cluster, env.Client, env.Provisioner, env.CloudProvider, env.Recorder, queue, nil)
 	scoreBased := &ScoreBasedConsolidation{consolidation: consolidation}

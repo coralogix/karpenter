@@ -31,7 +31,7 @@ func nodePriorityScore(c *Candidate) float64 {
 	if c == nil || c.StateNode == nil {
 		return 0
 	}
-	nodePrice := getCandidatePrices([]*Candidate{c})
+	nodePrice := c.Price
 	workloadSize := nonDaemonWorkloadSize(c.PodRequests())
 	if workloadSize <= 0 {
 		return nodePrice

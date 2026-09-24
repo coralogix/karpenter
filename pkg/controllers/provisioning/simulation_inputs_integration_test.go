@@ -95,7 +95,7 @@ var _ = It("uses captured volume and topology data across attempts", func() {
 	ExpectApplied(ctx, env.Client, nodePool, pod)
 
 	countingClient := &resourceCountingClient{Client: env.Client, gets: map[reflect.Type]int{}, lists: map[reflect.Type]int{}}
-	countingProvisioner := provisioning.NewProvisioner(countingClient, test.NewEventRecorder(), cloudProvider, cluster, fakeClock)
+	countingProvisioner := provisioning.NewProvisioner(countingClient, test.NewEventRecorder(), cloudProvider, cluster, env.Clock, nil, nil)
 	inputs, err := countingProvisioner.NewPreparedSimulationInputs(ctx, []*corev1.Pod{pod}, nil)
 	Expect(err).To(Succeed())
 	podIDs, err := inputs.PodIDsFor([]*corev1.Pod{pod})

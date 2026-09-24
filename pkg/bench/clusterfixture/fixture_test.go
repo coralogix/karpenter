@@ -357,7 +357,7 @@ func TestLoadAndBuildEnvPreservesStorageSchedulingState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRequirements() error = %v", err)
 	}
-	if !requirements.Get(corev1.LabelTopologyZone).Has("test-zone-1") {
+	if len(requirements) == 0 || !requirements[0].Get(corev1.LabelTopologyZone).Has("test-zone-1") {
 		t.Fatalf("volume topology requirements = %v, want test-zone-1", requirements)
 	}
 }

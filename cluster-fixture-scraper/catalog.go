@@ -36,8 +36,10 @@ import (
 	awscache "github.com/aws/karpenter-provider-aws/pkg/cache"
 	"github.com/aws/karpenter-provider-aws/pkg/fake"
 	awsoptions "github.com/aws/karpenter-provider-aws/pkg/operator/options"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/arczonalshift"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/capacityreservation"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instancetype"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/placementgroup"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/pricing"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/subnet"
 	awstest "github.com/aws/karpenter-provider-aws/pkg/test"
@@ -92,9 +94,10 @@ func exportFromCloudProvider(ctx context.Context, fixture *clusterfixture.Fixtur
 	unavailableOfferingsCache := awscache.NewUnavailableOfferings()
 	pricingAPI := &fake.PricingAPI{}
 	pricingProvider := pricing.NewDefaultProvider(pricingAPI, ec2Client, cfg.Region, false)
-	subnetProvider := subnet.NewDefaultProvider(ec2Client, cache.New(awscache.DefaultTTL, awscache.DefaultCleanupInterval), cache.New(awscache.AvailableIPAddressTTL, awscache.DefaultCleanupInterval), cache.New(awscache.AssociatePublicIPAddressTTL, awscache.DefaultCleanupInterval))
+	subnetProvider := subnet.NewDefaultProvider(ec2Client, cache.New(awscache.DefaultTTL, awscache.DefaultCleanupInterval), cache.New(awscache.AvailableIPAddressTTL, awscache.DefaultCleanupInterval))
 	capacityReservationProvider := capacityreservation.NewProvider(ec2Client, &clock.RealClock{}, cache.New(awscache.DefaultTTL, awscache.DefaultCleanupInterval), cache.New(24*time.Hour, awscache.DefaultCleanupInterval))
 	instanceTypesResolver := instancetype.NewDefaultResolver(cfg.Region)
+	placementGroupProvider := placementgroup.NewProvider(ec2Client, cache.New(awscache.DefaultTTL, awscache.DefaultCleanupInterval), cache.New(awscache.PlacementGroupAvailabilityTTL, awscache.DefaultCleanupInterval))
 	itProvider := instancetype.NewDefaultProvider(
 		instanceTypeCache,
 		offeringCache,
@@ -103,8 +106,11 @@ func exportFromCloudProvider(ctx context.Context, fixture *clusterfixture.Fixtur
 		subnetProvider,
 		pricingProvider,
 		capacityReservationProvider,
+		placementGroupProvider,
 		unavailableOfferingsCache,
 		instanceTypesResolver,
+		arczonalshift.NewNoopProvider(),
+		kubeClient,
 	)
 	if err := itProvider.UpdateInstanceTypes(ctx); err != nil {
 		return nil, fmt.Errorf("updating instance types: %w", err)

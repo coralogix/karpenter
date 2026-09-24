@@ -31,22 +31,22 @@ import (
 // to a scheduling attempt. Live and captured sources implement the same contract,
 // so the scheduler does not need an optional volume map or a second construction path.
 type VolumeSource interface {
-	Requirements(*corev1.Pod) scheduling.Requirements
+	Requirements(*corev1.Pod) []scheduling.Requirements
 	Volumes(context.Context, *corev1.Pod) (scheduling.Volumes, error)
 }
 
 type liveVolumeSource struct {
 	kubeClient   client.Client
-	requirements map[types.UID]scheduling.Requirements
+	requirements map[types.UID][]scheduling.Requirements
 }
 
 // NewLiveVolumeSource adapts the existing API-backed volume lookup to VolumeSource.
-func NewLiveVolumeSource(kubeClient client.Client, requirements map[types.UID]scheduling.Requirements) VolumeSource {
+func NewLiveVolumeSource(kubeClient client.Client, requirements map[types.UID][]scheduling.Requirements) VolumeSource {
 	return &liveVolumeSource{kubeClient: kubeClient, requirements: requirements}
 }
 
-func (s *liveVolumeSource) Requirements(pod *corev1.Pod) scheduling.Requirements {
-	return cloneRequirements(s.requirements[pod.UID])
+func (s *liveVolumeSource) Requirements(pod *corev1.Pod) []scheduling.Requirements {
+	return cloneRequirementAlternatives(s.requirements[pod.UID])
 }
 
 func (s *liveVolumeSource) Volumes(ctx context.Context, pod *corev1.Pod) (scheduling.Volumes, error) {
@@ -63,7 +63,7 @@ type capturedVolumeSource struct {
 // exclude pods whose topology requirements could not be resolved while still
 // retaining usage errors for the scheduler's existing-node path.
 type VolumeData struct {
-	Requirements     scheduling.Requirements
+	Requirements     []scheduling.Requirements
 	RequirementError error
 	Volumes          scheduling.Volumes
 	UsageError       error
@@ -74,7 +74,7 @@ func NewCapturedVolumeSource(data map[types.UID]VolumeData) VolumeSource {
 	dataCopy := make(map[types.UID]VolumeData, len(data))
 	for uid, value := range data {
 		dataCopy[uid] = VolumeData{
-			Requirements:     cloneRequirements(value.Requirements),
+			Requirements:     cloneRequirementAlternatives(value.Requirements),
 			RequirementError: value.RequirementError,
 			Volumes:          value.Volumes.DeepCopy(),
 			UsageError:       value.UsageError,
@@ -83,8 +83,8 @@ func NewCapturedVolumeSource(data map[types.UID]VolumeData) VolumeSource {
 	return &capturedVolumeSource{data: dataCopy}
 }
 
-func (s *capturedVolumeSource) Requirements(pod *corev1.Pod) scheduling.Requirements {
-	return cloneRequirements(s.data[pod.UID].Requirements)
+func (s *capturedVolumeSource) Requirements(pod *corev1.Pod) []scheduling.Requirements {
+	return cloneRequirementAlternatives(s.data[pod.UID].Requirements)
 }
 
 func (s *capturedVolumeSource) Volumes(_ context.Context, pod *corev1.Pod) (scheduling.Volumes, error) {
@@ -103,4 +103,15 @@ func cloneRequirements(requirements scheduling.Requirements) scheduling.Requirem
 		return nil
 	}
 	return scheduling.NewNodeSelectorRequirementsWithMinValues(requirements.NodeSelectorRequirements()...)
+}
+
+func cloneRequirementAlternatives(alternatives []scheduling.Requirements) []scheduling.Requirements {
+	if alternatives == nil {
+		return nil
+	}
+	result := make([]scheduling.Requirements, len(alternatives))
+	for i, requirements := range alternatives {
+		result[i] = cloneRequirements(requirements)
+	}
+	return result
 }

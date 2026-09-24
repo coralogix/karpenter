@@ -34,8 +34,8 @@ func TestNewNodeClaimAnnotationsAreIsolated(t *testing.T) {
 		},
 	}
 
-	claim1 := scheduling.NewNodeClaim(template, nil, nil, nil, nil, nil, scheduling.ReservedOfferingModeFallback)
-	claim2 := scheduling.NewNodeClaim(template, nil, nil, nil, nil, nil, scheduling.ReservedOfferingModeFallback)
+	claim1 := scheduling.NewNodeClaim(template, nil, nil, nil, nil, scheduling.ReservedOfferingModeFallback)
+	claim2 := scheduling.NewNodeClaim(template, nil, nil, nil, nil, scheduling.ReservedOfferingModeFallback)
 
 	claim1.Annotations["claim1"] = "true"
 	claim2.Annotations["claim2"] = "true"

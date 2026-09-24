@@ -315,7 +315,7 @@ func (f *SchedulerFactory) newSchedulerWithTopology(ctx context.Context, stateNo
 	if err != nil {
 		return nil, err
 	}
-	return scheduler.NewSchedulerFromBaseline(ctx, f.baseline, p.cluster, stateNodes, topology, p.recorder, p.clock, volumeSource, allocator)
+	return scheduler.NewSchedulerFromBaseline(ctx, p.kubeClient, f.baseline, p.cluster, stateNodes, topology, p.recorder, p.clock, volumeSource, allocator)
 }
 
 func (f *SchedulerFactory) newPreparedScheduler(ctx context.Context, prepared *scheduler.PreparedSchedulerState, stateNodes []*state.StateNode, topology *scheduler.Topology, volumeSource scheduler.VolumeSource, removedNodeNames sets.Set[string], deletingPodUIDs sets.Set[types.UID]) (*scheduler.Scheduler, error) {
@@ -324,7 +324,7 @@ func (f *SchedulerFactory) newPreparedScheduler(ctx context.Context, prepared *s
 	if err != nil {
 		return nil, err
 	}
-	return prepared.NewScheduler(ctx, p.cluster, topology, p.recorder, p.clock, volumeSource, removedNodeNames, allocator)
+	return prepared.NewScheduler(ctx, p.kubeClient, p.cluster, topology, p.recorder, p.clock, volumeSource, removedNodeNames, allocator)
 }
 
 func (f *SchedulerFactory) newDynamicResourcesAllocator(ctx context.Context, stateNodes []*state.StateNode, deletingPodUIDs sets.Set[types.UID]) (*dynamicresources.Allocator, error) {

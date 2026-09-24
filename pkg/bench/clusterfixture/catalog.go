@@ -322,14 +322,13 @@ func (c *Catalog) applyLegacyEntriesToCloudProvider(cp *fakecloudprovider.CloudP
 	for _, entry := range c.InstanceTypes {
 		it, ok := byName[entry.Name]
 		if !ok {
-			it = fakecloudprovider.NewInstanceType(fakecloudprovider.InstanceTypeOptions{
-				Name: entry.Name,
-				Resources: corev1.ResourceList{
+			it = fakecloudprovider.NewInstanceType(entry.Name,
+				fakecloudprovider.WithResources(corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse(entry.CPU),
 					corev1.ResourceMemory: resource.MustParse(entry.Memory),
-				},
-				Architecture: entry.Architecture,
-			})
+				}),
+				fakecloudprovider.WithArchitecture(entry.Architecture),
+			)
 			byName[entry.Name] = it
 		}
 		reqs := map[string]string{

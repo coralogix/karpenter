@@ -89,14 +89,11 @@ func paceReplicaSetPods(rs *appsv1.ReplicaSet, count int) []*corev1.Pod {
 }
 
 func paceOnDemandInstanceType(name string, price float64) *cloudprovider.InstanceType {
-	return fake.NewInstanceType(fake.InstanceTypeOptions{
-		Name: name,
-		Offerings: []*cloudprovider.Offering{{
-			Available:    true,
-			Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"}),
-			Price:        price,
-		}},
-	})
+	return fake.NewInstanceType(name, fake.WithOfferings(cloudprovider.Offering{
+		Available:    true,
+		Requirements: scheduling.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelTopologyZone: "test-zone-1a"}),
+		Price:        price,
+	}))
 }
 
 func asObjects[T client.Object](in []T) []client.Object {
@@ -131,26 +128,26 @@ var _ = Describe("Underutilized consolidation pace", func() {
 		ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
 		ExpectManualBinding(ctx, env.Client, pods[1], nodes[0])
 		ExpectManualBinding(ctx, env.Client, pods[2], nodes[1])
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 		ExpectSingletonReconciled(ctx, disruptionController)
 		Expect(queue.GetCommands()).To(HaveLen(1))
 
-		*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, fakeClock, prov))
+		*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov))
 		nodeClaims, nodes = paceConsolidatableNodes(nodePool, 2)
 		pods = paceReplicaSetPods(rs, 3)
 		ExpectApplied(ctx, env.Client, pods[0], pods[1], pods[2], nodeClaims[0], nodes[0], nodeClaims[1], nodes[1], nodePool)
 		ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
 		ExpectManualBinding(ctx, env.Client, pods[1], nodes[0])
 		ExpectManualBinding(ctx, env.Client, pods[2], nodes[1])
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 
 		cluster.MarkUnconsolidated()
-		fakeClock.Step(30 * time.Second)
+		env.Clock.Step(30 * time.Second)
 		ExpectSingletonReconciled(ctx, disruptionController)
 		Expect(queue.GetCommands()).To(HaveLen(0))
 
 		cluster.MarkUnconsolidated()
-		fakeClock.Step(31 * time.Second)
+		env.Clock.Step(31 * time.Second)
 		ExpectSingletonReconciled(ctx, disruptionController)
 		Expect(queue.GetCommands()).To(HaveLen(1))
 	})
@@ -168,7 +165,7 @@ var _ = Describe("Underutilized consolidation pace", func() {
 		ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
 		ExpectManualBinding(ctx, env.Client, pods[1], nodes[1])
 		ExpectManualBinding(ctx, env.Client, pods[2], nodes[2])
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 		ExpectSingletonReconciled(ctx, disruptionController)
 
 		cmds := queue.GetCommands()
@@ -176,7 +173,7 @@ var _ = Describe("Underutilized consolidation pace", func() {
 		Expect(cmds[0].ConsolidationType()).To(Equal(disruption.MultiNodeConsolidationType))
 		Expect(cmds[0].Candidates).To(HaveLen(2))
 
-		*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, fakeClock, prov))
+		*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov))
 		nodeClaims, nodes = paceConsolidatableNodes(nodePool, 3)
 		pods = paceReplicaSetPods(rs, 4)
 		ExpectApplied(ctx, env.Client, pods[0], pods[1], pods[2], pods[3])
@@ -185,15 +182,15 @@ var _ = Describe("Underutilized consolidation pace", func() {
 		ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
 		ExpectManualBinding(ctx, env.Client, pods[1], nodes[1])
 		ExpectManualBinding(ctx, env.Client, pods[2], nodes[2])
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 
 		cluster.MarkUnconsolidated()
-		fakeClock.Step(90 * time.Second)
+		env.Clock.Step(90 * time.Second)
 		ExpectSingletonReconciled(ctx, disruptionController)
 		Expect(queue.GetCommands()).To(HaveLen(0))
 
 		cluster.MarkUnconsolidated()
-		fakeClock.Step(31 * time.Second)
+		env.Clock.Step(31 * time.Second)
 		ExpectSingletonReconciled(ctx, disruptionController)
 		Expect(queue.GetCommands()).To(HaveLen(1))
 	})
@@ -236,7 +233,7 @@ var _ = Describe("Underutilized consolidation pace", func() {
 		ExpectManualBinding(ctx, env.Client, pods[1], nodes[1])
 		ExpectManualBinding(ctx, env.Client, pods[2], nodes[2])
 		ExpectManualBinding(ctx, env.Client, pods[3], nodes[2])
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 		ExpectSingletonReconciled(ctx, disruptionController)
 
 		cmds := queue.GetCommands()
