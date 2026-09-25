@@ -121,8 +121,8 @@ func TestScoreBasedConsolidationValidatorFilter(t *testing.T) {
 	if !scoreValidator.filter(ctx, candidate) {
 		t.Fatal("score-based validator filter must accept score-based pools")
 	}
-	if defaultValidator.filter(ctx, candidate) != scoreBased.ShouldDisrupt(ctx, candidate) {
-		t.Fatal("score-based consolidation must wire ScoreBasedConsolidation.ShouldDisrupt into its validator")
+	if defaultValidator.filter(ctx, candidate) != scoreBased.shouldCompact(ctx, candidate) {
+		t.Fatal("score-based consolidation must wire its compaction-only predicate into its validator")
 	}
 }
 
@@ -485,6 +485,7 @@ func scoreBasedTestCandidate(scoreBasedConsolidation bool) *Candidate {
 				},
 			},
 		},
-		instanceType: &cloudprovider.InstanceType{Name: "m5.large"},
+		instanceType:      &cloudprovider.InstanceType{Name: "m5.large"},
+		reschedulablePods: []*corev1.Pod{{}},
 	}
 }

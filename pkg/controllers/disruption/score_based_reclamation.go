@@ -36,12 +36,12 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-const defaultScoreBasedReclamationInterval = 2 * time.Minute
+const defaultScoreBasedReclamationInterval = time.Minute
 
-// computeReclamationCommand chooses a pool-wide half-batch of empty candidates, respecting each pool's
-// disruption budget. It returns the pools whose due empty capacity takes precedence, including when
-// their budget currently prevents any removal.
-func (s *ScoreBasedConsolidation) computeReclamationCommand(ctx context.Context, budgetMapping map[string]int, candidates []*Candidate) (*Command, map[string]bool, error) {
+// computeReclamationCommand chooses a pool-wide half-batch of empty candidates without applying
+// NodePool disruption budgets. It returns pools whose due empty capacity takes precedence over
+// compaction, including when no candidates are currently eligible for removal.
+func (s *ScoreBasedConsolidation) computeReclamationCommand(ctx context.Context, candidates []*Candidate) (*Command, map[string]bool, error) {
 	emptyCounts, err := s.emptyReclamationNodeCounts(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -53,7 +53,7 @@ func (s *ScoreBasedConsolidation) computeReclamationCommand(ctx context.Context,
 		return nil, reclamationPools, nil
 	}
 
-	selected := selectReclamationCandidates(byPool, emptyCounts, budgetMapping)
+	selected := selectReclamationCandidates(byPool, emptyCounts)
 	if len(selected) == 0 {
 		return nil, reclamationPools, nil
 	}
@@ -128,7 +128,7 @@ func (s *ScoreBasedConsolidation) reclamationCandidatesByPool(ctx context.Contex
 	return byPool
 }
 
-func selectReclamationCandidates(byPool map[string][]*Candidate, emptyCounts, budgetMapping map[string]int) []*Candidate {
+func selectReclamationCandidates(byPool map[string][]*Candidate, emptyCounts map[string]int) []*Candidate {
 	poolNames := make([]string, 0, len(byPool))
 	for name := range byPool {
 		poolNames = append(poolNames, name)
@@ -142,14 +142,14 @@ func selectReclamationCandidates(byPool map[string][]*Candidate, emptyCounts, bu
 		if removalCount > len(emptyCandidates) {
 			removalCount = len(emptyCandidates)
 		}
-		selected = append(selected, reclamationBudgetSelection(emptyCandidates[:removalCount], budgetMapping[name])...)
+		selected = append(selected, emptyCandidates[:removalCount]...)
 	}
 	return selected
 }
 
 func (s *ScoreBasedConsolidation) validateReclamationCommand(ctx context.Context, cmd Command, reclamationPools map[string]bool, started time.Time) (*Command, map[string]bool, error) {
-	// Re-fetch candidates after the usual consolidation TTL. This validates the empty state and
-	// disruption budget once more before this reclamation decision enters the queue.
+	// Re-fetch candidates after the usual consolidation TTL. Reclamation does not consume the
+	// NodePool disruption budget, but it still validates eligibility and current emptiness.
 	remainingValidationDelay := consolidationTTL - s.clock.Since(started)
 	if remainingValidationDelay > 0 {
 		select {
@@ -158,7 +158,7 @@ func (s *ScoreBasedConsolidation) validateReclamationCommand(ctx context.Context
 		case <-s.clock.After(remainingValidationDelay):
 		}
 	}
-	validated, err := selectFirstStillValidCommand(ctx, s.validator, s.recorder, []*moveSetEvaluation{{Command: cmd, Score: 1}})
+	validated, err := selectFirstStillValidCommand(ctx, s.reclamationValidator(), s.recorder, []*moveSetEvaluation{{Command: cmd, Score: 1}})
 	if err != nil {
 		return nil, reclamationPools, err
 	}
@@ -405,21 +405,34 @@ func sortReclamationCandidates(candidates []*Candidate) {
 	})
 }
 
-func reclamationBudgetSelection(candidates []*Candidate, limit int) []*Candidate {
-	if limit <= 0 {
-		return nil
-	}
-	if limit > len(candidates) {
-		limit = len(candidates)
-	}
-	return candidates[:limit]
-}
-
 // isReclamationCandidateAvailable filters candidates that have become unsafe to remove since candidate collection.
 func (s *ScoreBasedConsolidation) isReclamationCandidateAvailable(ctx context.Context, candidate *Candidate) bool {
-	if candidate == nil || candidate.NodeClaim == nil || candidate.Node == nil || standby.IsNodeClaimActivating(candidate.NodeClaim) {
+	if !s.reclamationCandidateEligible(candidate) {
+		return false
+	}
+	currentNodeClaim, exists, err := s.reclamationCandidateNodeClaim(ctx, candidate)
+	if err != nil || !exists {
+		return false
+	}
+	if standby.IsNodeClaimActivating(currentNodeClaim) {
+		return false
+	}
+	if currentNodeClaim.Labels[v1.NodePoolLabelKey] != candidate.NodePool.Name {
 		return false
 	}
 	empty, err := reclamationEmpty(ctx, s.kubeClient, candidate.Node)
 	return err == nil && empty
+}
+
+func (s *ScoreBasedConsolidation) reclamationCandidateEligible(candidate *Candidate) bool {
+	if candidate == nil || candidate.NodePool == nil || candidate.NodeClaim == nil || candidate.Node == nil {
+		return false
+	}
+	if standby.IsNodeClaimActivating(candidate.NodeClaim) {
+		return false
+	}
+	if !scoreBasedReclamationConfigured(candidate.NodePool) {
+		return false
+	}
+	return scoreBasedReclamationDue(candidate.NodePool, s.clock.Now())
 }

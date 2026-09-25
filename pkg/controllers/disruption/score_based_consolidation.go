@@ -86,30 +86,62 @@ func NewScoreBasedConsolidationValidator(c consolidation) *ConsolidationValidato
 			queue:         c.queue,
 			reason:        v1.DisruptionReasonUnderutilized,
 		},
-		filter:         s.ShouldDisrupt,
+		filter:         s.shouldCompact,
 		validationType: s.ConsolidationType(),
 	}
 }
 
 func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
-	if !NodePoolUsesScoreBasedConsolidation(cn.NodePool) {
+	if cn == nil || !NodePoolUsesScoreBasedConsolidation(cn.NodePool) {
 		return false
 	}
 	if standby.IsNodeClaimActivating(cn.NodeClaim) {
 		return false
 	}
 	if standby.IsNodeClaimStandby(cn.NodeClaim) || standby.HasNodeTaint(cn.Node) {
-		return scoreBasedReclamationDue(cn.NodePool, s.clock.Now()) && s.isReclamationCandidateAvailable(ctx, cn)
+		return s.ShouldReclaim(ctx, cn)
 	}
-	if s.consolidation.ShouldDisrupt(ctx, cn) {
+	if s.shouldCompact(ctx, cn) {
 		return true
 	}
-	return scoreBasedReclamationDue(cn.NodePool, s.clock.Now()) && s.isReclamationCandidateAvailable(ctx, cn)
+	return s.ShouldReclaim(ctx, cn)
+}
+
+// shouldCompact admits only eligible, non-empty active nodes into normal compaction.
+// It deliberately excludes empty nodes even when the combined method admits them for reclamation.
+func (s *ScoreBasedConsolidation) shouldCompact(ctx context.Context, cn *Candidate) bool {
+	if !s.compactionCandidateEligible(ctx, cn) {
+		return false
+	}
+	return s.compactionCandidateNonEmpty(ctx, cn)
+}
+
+func (s *ScoreBasedConsolidation) compactionCandidateEligible(ctx context.Context, cn *Candidate) bool {
+	if cn == nil || cn.Node == nil || cn.NodeClaim == nil || cn.NodePool == nil {
+		return false
+	}
+	if !NodePoolUsesScoreBasedConsolidation(cn.NodePool) {
+		return false
+	}
+	if standby.IsNodeClaimActivating(cn.NodeClaim) || standby.IsNodeClaimStandby(cn.NodeClaim) || standby.HasNodeTaint(cn.Node) {
+		return false
+	}
+	return s.consolidation.ShouldDisrupt(ctx, cn)
+}
+
+func (s *ScoreBasedConsolidation) compactionCandidateNonEmpty(ctx context.Context, cn *Candidate) bool {
+	// A reschedulable non-daemon pod proves the node is non-empty. Check the API when the
+	// candidate has no reschedulable pods to include terminal and terminating bound pods.
+	if len(cn.reschedulablePods) > 0 {
+		return true
+	}
+	empty, err := reclamationEmpty(ctx, s.kubeClient, cn.Node)
+	return err == nil && !empty
 }
 
 //nolint:gocyclo
 func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
-	reclamationCommand, reclamationPools, err := s.computeReclamationCommand(ctx, disruptionBudgetMapping, candidates)
+	reclamationCommand, reclamationPools, err := s.computeReclamationCommand(ctx, candidates)
 	if err != nil {
 		return []Command{}, err
 	}
@@ -117,7 +149,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	if reclamationCommand != nil {
 		reclamationCommands = append(reclamationCommands, *reclamationCommand)
 	}
-	if s.IsConsolidated() {
+	if s.IsConsolidated() && len(reclamationPools) == 0 {
 		return reclamationCommands, nil
 	}
 
@@ -125,10 +157,10 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	// Keep normal compaction available for other pools.
 	normalCandidates := make([]*Candidate, 0, len(candidates))
 	for _, candidate := range candidates {
-		if reclamationPools[candidate.NodePool.Name] || standby.IsNodeClaimActivating(candidate.NodeClaim) || standby.IsNodeClaimStandby(candidate.NodeClaim) || standby.HasNodeTaint(candidate.Node) {
+		if candidate == nil || candidate.NodePool == nil || reclamationPools[candidate.NodePool.Name] || standby.IsNodeClaimActivating(candidate.NodeClaim) || standby.IsNodeClaimStandby(candidate.NodeClaim) || standby.HasNodeTaint(candidate.Node) {
 			continue
 		}
-		if s.consolidation.ShouldDisrupt(ctx, candidate) {
+		if s.shouldCompact(ctx, candidate) {
 			normalCandidates = append(normalCandidates, candidate)
 		}
 	}

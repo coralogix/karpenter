@@ -34,7 +34,9 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/test"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
@@ -58,14 +60,30 @@ func TestScoreBasedReclamationDueUsesConfiguredInterval(t *testing.T) {
 	if scoreBasedReclamationDue(nodePool, now) {
 		t.Fatal("reclamation should become due only after the interval has elapsed")
 	}
-	nodePool.Annotations[v1.ScoreBasedReclamationIntervalAnnotationKey] = "0s"
-	nodePool.Annotations[v1.ScoreBasedLastReclamationAnnotationKey] = now.Add(-defaultScoreBasedReclamationInterval).Format(time.RFC3339Nano)
-	if scoreBasedReclamationDue(nodePool, now) {
-		t.Fatal("invalid zero interval should safely use the default interval")
+	if defaultScoreBasedReclamationInterval != time.Minute {
+		t.Fatalf("default reclamation interval = %s, want 1m", defaultScoreBasedReclamationInterval)
 	}
-	nodePool.Annotations[v1.ScoreBasedLastReclamationAnnotationKey] = now.Add(-defaultScoreBasedReclamationInterval - time.Nanosecond).Format(time.RFC3339Nano)
+	for _, intervalValue := range []string{"", "invalid", "0s", "-1s"} {
+		t.Run("default fallback for "+intervalValue, func(t *testing.T) {
+			nodePool.Annotations[v1.ScoreBasedReclamationIntervalAnnotationKey] = intervalValue
+			nodePool.Annotations[v1.ScoreBasedLastReclamationAnnotationKey] = now.Add(-time.Minute).Format(time.RFC3339Nano)
+			if scoreBasedReclamationDue(nodePool, now) {
+				t.Fatal("default interval should not be due at exactly one minute")
+			}
+			nodePool.Annotations[v1.ScoreBasedLastReclamationAnnotationKey] = now.Add(-time.Minute - time.Nanosecond).Format(time.RFC3339Nano)
+			if !scoreBasedReclamationDue(nodePool, now) {
+				t.Fatal("default interval should be due just after one minute")
+			}
+		})
+	}
+	nodePool.Annotations[v1.ScoreBasedReclamationIntervalAnnotationKey] = "2m"
+	nodePool.Annotations[v1.ScoreBasedLastReclamationAnnotationKey] = now.Add(-2 * time.Minute).Format(time.RFC3339Nano)
+	if scoreBasedReclamationDue(nodePool, now) {
+		t.Fatal("explicit 2m override should not be due at exactly two minutes")
+	}
+	nodePool.Annotations[v1.ScoreBasedLastReclamationAnnotationKey] = now.Add(-2*time.Minute - time.Nanosecond).Format(time.RFC3339Nano)
 	if !scoreBasedReclamationDue(nodePool, now) {
-		t.Fatal("expected default interval to become due after it elapsed")
+		t.Fatal("explicit 2m override should be due just after two minutes")
 	}
 }
 
@@ -156,9 +174,14 @@ func TestReclamationEmptyCountsBoundNonDaemonPodsUntilRemoved(t *testing.T) {
 		},
 		Spec: corev1.PodSpec{NodeName: node.Name},
 	}
+	terminal := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "terminal", Namespace: "default"},
+		Spec:       corev1.PodSpec{NodeName: node.Name},
+		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+	}
 	kubeClient := fake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
-		WithObjects(node, daemon, terminating).
+		WithObjects(node, daemon, terminating, terminal).
 		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
 			pod := obj.(*corev1.Pod)
 			if pod.Spec.NodeName == "" {
@@ -177,8 +200,41 @@ func TestReclamationEmptyCountsBoundNonDaemonPodsUntilRemoved(t *testing.T) {
 	if err := kubeClient.Update(ctx, terminating); err != nil {
 		t.Fatal(err)
 	}
+	if empty, err := reclamationEmpty(ctx, kubeClient, node); err != nil || empty {
+		t.Fatalf("reclamationEmpty() = (%v, %v), want (false, nil) while a terminal non-daemon pod remains bound", empty, err)
+	}
+	if err := kubeClient.Delete(ctx, terminal); err != nil {
+		t.Fatal(err)
+	}
 	if empty, err := reclamationEmpty(ctx, kubeClient, node); err != nil || !empty {
 		t.Fatalf("reclamationEmpty() = (%v, %v), want (true, nil) after non-daemon pod is gone", empty, err)
+	}
+}
+
+func TestReclamationEmptyDoesNotUseResourceRequests(t *testing.T) {
+	ctx := context.Background()
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}
+	zeroRequestPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "zero-request", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			NodeName: node.Name,
+			Containers: []corev1.Container{{
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")}},
+			}},
+		},
+	}
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(node, zeroRequestPod).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
+			pod := obj.(*corev1.Pod)
+			if pod.Spec.NodeName == "" {
+				return nil
+			}
+			return []string{pod.Spec.NodeName}
+		}).Build()
+	if empty, err := reclamationEmpty(ctx, kubeClient, node); err != nil || empty {
+		t.Fatalf("reclamationEmpty() = (%v, %v), want (false, nil) for a bound zero-request workload pod", empty, err)
 	}
 }
 
@@ -204,7 +260,7 @@ func TestReclamationDeleteSuccessPersistsNodePoolTimestamp(t *testing.T) {
 }
 
 func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
-	ctx := context.Background()
+	ctx := options.ToContext(context.Background(), test.Options())
 	now := time.Date(2026, time.September, 25, 13, 0, 0, 0, time.UTC)
 	nodePool := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{
 		Name:        "score-pool",
@@ -257,6 +313,15 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 	if err := kubeClient.Delete(ctx, workload); err != nil {
 		t.Fatal(err)
 	}
+	cluster.UpdateNodeClaim(nodeClaim)
+	if err := cluster.UpdateNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	cluster.NominateNodeForPod(ctx, candidate.ProviderID())
+	if err := beforeDelete(ctx); !IsUnrecoverableError(err) {
+		t.Fatalf("BeforeDelete() error for a nominated node = %v, want unrecoverable", err)
+	}
+	candidate.ClearNomination()
 
 	storedNodeClaim := &v1.NodeClaim{}
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(nodeClaim), storedNodeClaim); err != nil {

@@ -1,6 +1,6 @@
 # Separating compaction from capacity reclamation
 
-Status: Implemented for score-based consolidation on annotated dynamic NodePools. This document summarizes the initial design; see [Score-based consolidation](score-based-consolidation.md) for the current behavior and configuration.
+Status: Implemented for score-based consolidation on annotated dynamic NodePools. See [Score-based consolidation](score-based-consolidation.md) for current behavior and configuration.
 
 This mechanism applies only to NodePools that use score-based consolidation. Other NodePools retain their existing behavior.
 
@@ -12,27 +12,27 @@ The intended benefits are clearer compaction objectives, reuse of already runnin
 
 ## Responsibilities
 
-**Compaction** decides whether evacuating nodes is worth the workload disruption, aiming to pack workloads onto cheaper or otherwise preferable capacity. Karpenter controls disruption and simulates placement; the Kubernetes scheduler determines actual pod placement. Compaction can activate suitable standby nodes as destinations instead of creating new nodes, including when cheap standby capacity can replace expensive active capacity. It may arrange replacement capacity before eviction when needed.
+**Compaction** considers only non-empty active nodes and decides whether evacuating them is worth the workload disruption, aiming to pack workloads onto cheaper or otherwise preferable capacity. A node is empty when it has no bound non-DaemonSet pods; terminating and terminal pods still count while bound. Karpenter controls disruption and simulates placement; the Kubernetes scheduler determines actual pod placement. Compaction can activate suitable standby nodes as destinations instead of creating new nodes, including when cheap standby capacity can replace expensive active capacity. It may arrange replacement capacity before eviction when needed. Compaction honors NodePool disruption budgets and pacing.
 
 Compaction completes by handing over an empty, tainted node. It does not decide whether that node should subsequently be removed, reactivated, or retained.
 
-**Reclamation** decides only whether to keep empty nodes or remove them. It runs as part of score-based consolidation, taking precedence over normal compaction when a reclamation removal is due. Reclamation never activates nodes.
+**Reclamation** decides only whether to keep empty nodes or remove them. It runs as part of score-based consolidation, taking precedence over normal compaction in a pool with due empty capacity. Reclamation is exempt from NodePool disruption budgets, but preserves candidate eligibility checks and rechecks live emptiness and activation before deletion. Reclamation never activates nodes.
 
 **Provisioning and compaction** own activation. When they need capacity, they can untaint suitable standby nodes instead of launching new instances. Provisioning's scheduling simulation should consider standby capacity so activation and new capacity creation form one coordinated decision. Compatibility with pod requirements still matters.
 
-## Initial reclamation policy
+## Reclamation policy
 
 For each score-based NodePool:
 
-1. Check whether more than the configured interval has elapsed since its last reclamation removal. The default interval is two minutes. Configure it with the NodePool annotation `karpenter.coralogix.net/reclamation-interval`, using Go duration syntax such as `90s` or `5m`; missing, invalid, and non-positive values use the two-minute default.
+1. Check whether more than the configured interval has elapsed since its last successful reclamation. The default interval is one minute. Configure it with the NodePool annotation `karpenter.coralogix.net/reclamation-interval`, using Go duration syntax such as `90s` or `5m`; missing, invalid, and non-positive values use the one-minute default. The elapsed-time comparison is strict, so exactly one minute is not yet due.
 2. If reclamation is due and there are currently empty nodes, perform reclamation instead of normal score-based compaction for that pool in this pass.
-3. Count all currently empty nodes, including tainted standby nodes and naturally empty active nodes. Select `ceil(emptyNodeCount / 2)` for removal.
-4. Prioritize nodes with the highest cost per vCPU. The removal quantity is based on node count, not summed CPU or memory capacity.
-5. Persist the last successful reclamation-removal timestamp per NodePool in `karpenter.coralogix.net/last-reclamation` as RFC3339Nano so restarts do not accelerate removal.
+3. Count all currently empty nodes, including tainted standby nodes and naturally empty active nodes. Reclaim `ceil(emptyNodeCount / 2)` eligible candidates without clipping the batch to the NodePool disruption budget.
+4. Prioritize nodes with the highest cost per vCPU. The reclamation quantity is based on node count, not summed CPU or memory capacity.
+5. Persist the last successful reclamation timestamp per NodePool in `karpenter.coralogix.net/last-reclamation` as RFC3339Nano so restarts do not accelerate reclamation.
 
 If reclamation is not due, proceed with normal score-based compaction. If there are no empty nodes, proceed with normal compaction without resetting the reclamation timestamp.
 
-Rounding is upward: three empty nodes means removing two; a solitary empty node is removed on the next eligible pass. This is a periodic pool-wide decision, not a minimum standby lifetime for each node, so recently emptied nodes are eligible too. More sophisticated capacity accounting is deferred.
+Rounding is upward: three empty nodes means reclaiming two; a solitary empty node is reclaimed on the next eligible pass. This is a periodic pool-wide decision, not a minimum standby lifetime for each node, so recently emptied nodes are eligible too. More sophisticated capacity accounting is deferred.
 
 ## Lifecycle and ownership
 
@@ -46,9 +46,9 @@ Active --compaction--> Evacuating --compaction completes--> Standby
                                                           Deleting
 ```
 
-Evacuating and standby nodes remain tainted against ordinary scheduling. Standby nodes are running capacity, not stopped instances. Provisioning and compaction own reactivation; reclamation owns removal. A standby node must be activated before serving as a scheduling destination.
+Evacuating and standby nodes remain tainted against ordinary scheduling. Standby nodes are running capacity, not stopped instances. Provisioning and compaction own reactivation; reclamation owns empty-node reclamation. A standby node must be activated before serving as a scheduling destination.
 
-Naturally empty active nodes are included in reclamation's removal candidates. Whether and when to taint those nodes into standby remains to be specified.
+Naturally empty active nodes and empty standby nodes are eligible for reclamation. Standby nodes reserved for activation are excluded.
 
 “Empty” means no non-daemon pods remain, including terminating non-daemon pods. Evacuation completes only once those pods are gone; accepting eviction requests is insufficient. Daemon pods may remain, so evacuation should not blindly reuse full termination drain behavior.
 
@@ -65,11 +65,11 @@ A durable command resource is not required by this design. Standby, however, is 
 
 The handoff persists standby state while the node remains tainted, before forgetting the evacuation command. A restart before that persistence may abandon the evacuation; a restart afterward preserves standby and lets reclamation reconcile it. Stale-state cleanup must respect this distinction.
 
-Cancellation within a running process must also stop queued eviction work before restoring scheduling. Successful evacuation that retains a node must clear any internal deletion bookkeeping. The per-NodePool reclamation-removal timestamp survives restarts.
+Cancellation within a running process must also stop queued eviction work before restoring scheduling. Successful evacuation that retains a node must clear any internal deletion bookkeeping. The per-NodePool reclamation timestamp survives restarts.
 
 ## Integration with the current implementation
 
-The existing consolidation method framework appears suitable for both compaction and removal decisions. Reclamation is part of the score-based consolidation path, with a due reclamation removal taking precedence over normal compaction for the affected pool. Execution needs an explicit evacuation action that does not delete the source NodeClaim afterward. Other consolidation paths must preserve their existing behavior.
+The existing consolidation method framework supports both compaction and reclamation decisions. Reclamation is part of the score-based consolidation path, with due reclamation taking precedence over normal compaction for the affected pool. Execution uses an explicit evacuation action that does not delete the source NodeClaim afterward. Other consolidation paths preserve their existing behavior.
 
 Relevant areas are:
 
@@ -77,20 +77,19 @@ Relevant areas are:
 - `pkg/controllers/disruption/queue.go`: orchestration currently waits for replacement initialization, then deletes source NodeClaims; source deletion bookkeeping also needs adjustment.
 - `pkg/controllers/disruption/controller.go`: stale disruption cleanup needs to preserve intentional standby state.
 - `pkg/controllers/disruption/score_based_consolidation.go`: reclamation timing, empty-node selection, and precedence over normal compaction for score-based pools.
-- `pkg/controllers/disruption/emptiness.go`: existing empty-node removal behavior for other pools remains unchanged.
+- `pkg/controllers/disruption/emptiness.go`: existing empty-node reclamation behavior for other pools remains unchanged.
 - `pkg/controllers/node/termination/terminator/`: reusable eviction machinery, with evacuation semantics separated from full termination.
 - Provisioning and scheduling state: recognize standby capacity and coordinate its activation with new capacity creation.
 
-## Policy and coordination questions
+## Policy and coordination
 
 - Prevent provisioning from launching duplicate capacity while standby activation is in progress.
 - Protect newly activated nodes from immediate re-evacuation, using demand nominations, cooldowns, or another mechanism.
-- Preserve workload disruption safeguards and define budget accounting for evacuation separately from subsequent empty-node removal.
-- Recheck emptiness before committing removal; taints do not replace this check.
-- Define initialization of the reclamation timestamp and how partial or budget-blocked removal batches update it.
-- Define the vCPU denominator used for cost ranking (instance vCPU count versus allocatable CPU), missing-price handling, and tie-breaking.
-- Keep compaction scores independent of individual reclamation decisions while evaluating the combined economic behavior. Evacuating a node creates an opportunity to save money; savings are realized when capacity is actually removed.
-- Define precedence with drift, expiration, interruption, and other termination paths. The separation discussed here concerns consolidation, not a requirement that all node removal wait for compaction.
+- Preserve workload disruption safeguards for compaction. Reclamation does not consume NodePool disruption budgets, but retains candidate eligibility checks and rechecks emptiness and activation before deleting a NodeClaim.
+- Persist the reclamation timestamp after each successful individual deletion. A partial batch therefore records progress; empty passes and failed deletions do not reset the timestamp.
+- Rank reclamation candidates by instance price per vCPU, with a stable node-name tie-breaker and ineligible nodes excluded from the batch.
+- Keep compaction scores independent of individual reclamation decisions while evaluating the combined economic behavior. Evacuating a node creates an opportunity to save money; savings are realized when capacity is reclaimed.
+- Preserve precedence with drift, expiration, interruption, and other termination paths. The separation discussed here concerns consolidation, not a requirement that every node reclamation wait for compaction.
 
 ## Scope and AWS provider implications
 
