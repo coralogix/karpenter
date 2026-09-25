@@ -60,6 +60,7 @@ import (
 type Controller struct {
 	queue             *Queue
 	kubeClient        client.Client
+	apiReader         client.Reader
 	cluster           *state.Cluster
 	provisioner       *provisioning.Provisioner
 	recorder          events.Recorder
@@ -106,6 +107,7 @@ func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provi
 		queue:             queue,
 		clock:             clk,
 		kubeClient:        kubeClient,
+		apiReader:         kubeClient,
 		cluster:           cluster,
 		provisioner:       provisioner,
 		recorder:          recorder,
@@ -144,6 +146,7 @@ func (c *Controller) Name() string {
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
+	c.apiReader = m.GetAPIReader()
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).
@@ -217,23 +220,44 @@ func (c *Controller) cleanupStaleDisruptionState(ctx context.Context) error {
 
 func (c *Controller) ensureStandbyTaints(ctx context.Context, nodes ...*state.StateNode) error {
 	for _, stateNode := range nodes {
-		if stateNode.Node == nil {
-			continue
-		}
-		node := &corev1.Node{}
-		if err := c.kubeClient.Get(ctx, client.ObjectKeyFromObject(stateNode.Node), node); err != nil {
-			return client.IgnoreNotFound(err)
-		}
-		stored := node.DeepCopy()
-		standby.SetNodeTaint(node, true)
-		if equality.Semantic.DeepEqual(stored, node) {
-			continue
-		}
-		if err := c.kubeClient.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
+		if err := c.ensureStandbyTaint(ctx, stateNode); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (c *Controller) ensureStandbyTaint(ctx context.Context, stateNode *state.StateNode) error {
+	if stateNode.Node == nil || stateNode.NodeClaim == nil {
+		return nil
+	}
+	// Cluster state is informer-backed and may still report a standby marker
+	// after provisioning has activated this node. Read the live Node first so
+	// its optimistic-lock version protects against activation starting after
+	// this snapshot, then check the live NodeClaim marker.
+	node := &corev1.Node{}
+	if err := c.apiReader.Get(ctx, client.ObjectKeyFromObject(stateNode.Node), node); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	// Activation marks the live Node before removing the standby taint. The
+	// optimistic-lock patch below makes a concurrent marker update conflict,
+	// so the next reconciliation can observe activation.
+	if node.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" {
+		return nil
+	}
+	nodeClaim := &v1.NodeClaim{}
+	if err := c.apiReader.Get(ctx, client.ObjectKeyFromObject(stateNode.NodeClaim), nodeClaim); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !standby.IsNodeClaimStandby(nodeClaim) || standby.IsNodeClaimActivating(nodeClaim) {
+		return nil
+	}
+	stored := node.DeepCopy()
+	standby.SetNodeTaint(node, true)
+	if equality.Semantic.DeepEqual(stored, node) {
+		return nil
+	}
+	return c.kubeClient.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
 }
 
 func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {
@@ -262,17 +286,34 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		return false, fmt.Errorf("building disruption budgets, %w", err)
 	}
 	// Determine the disruption action
-	cmds, err := disruption.ComputeCommands(ctx, disruptionBudgetMapping, candidates...)
-	if err != nil {
-		return false, fmt.Errorf("computing disruption decision, %w", err)
-	}
+	cmds, computeErr := disruption.ComputeCommands(ctx, disruptionBudgetMapping, candidates...)
 	cmds = lo.Filter(cmds, func(c Command, _ int) bool { return c.Decision() != NoOpDecision })
 	if len(cmds) == 0 {
+		if computeErr != nil {
+			return false, fmt.Errorf("computing disruption decision, %w", computeErr)
+		}
 		return false, nil
 	}
 
+	// A method may return commands selected before a later part of the decision failed.
+	// Start those commands, then report the decision error so the controller still retries.
+	started, startErr := c.startCommands(ctx, disruption, cmds)
+	if computeErr != nil {
+		computeErr = fmt.Errorf("computing disruption decision, %w", computeErr)
+	}
+	if startErr != nil {
+		startErr = fmt.Errorf("disrupting candidates, %w", startErr)
+	}
+	if err := multierr.Combine(computeErr, startErr); err != nil {
+		return started > 0, err
+	}
+	return started > 0, nil
+}
+
+func (c *Controller) startCommands(ctx context.Context, disruption Method, cmds []Command) (int, error) {
 	var started atomic.Int64
 	errs := make([]error, len(cmds))
+	paced := disruption.Reason() == v1.DisruptionReasonUnderutilized
 	workqueue.ParallelizeUntil(ctx, len(cmds), len(cmds), func(i int) {
 		cmd := cmds[i]
 
@@ -286,15 +327,12 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 			errs[i] = fmt.Errorf("disrupting candidates, %w", err)
 			return
 		}
-		if disruption.Reason() == v1.DisruptionReasonUnderutilized {
+		if paced {
 			c.underutilizedPace.Charge(&cmd)
 		}
 		started.Add(1)
 	})
-	if err = multierr.Combine(errs...); err != nil {
-		return false, fmt.Errorf("disrupting candidates, %w", err)
-	}
-	return started.Load() > 0, nil
+	return int(started.Load()), multierr.Combine(errs...)
 }
 
 func (c *Controller) recordRun(s string) {

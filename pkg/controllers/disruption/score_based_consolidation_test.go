@@ -17,6 +17,7 @@ limitations under the License.
 package disruption_test
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -236,6 +237,23 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Entry("nominated", "nominated"),
 			Entry("activating", "activating"),
 		)
+	})
+
+	Context("Controller", func() {
+		It("starts returned commands and reports a later decision error", func() {
+			candidates, err := createScoreBasedCandidatesForPool(scoreBasedNodePool, mostExpensiveInstance)
+			Expect(err).To(Succeed())
+
+			computeErr := fmt.Errorf("compaction simulation failed")
+			method := partialCommandMethod{computeErr: computeErr}
+			controller := disruption.NewController(fakeClock, env.Client, prov, cloudProvider, recorder, cluster, queue, disruption.WithMethods(method))
+			defer queue.CompleteCommand(&disruption.Command{Candidates: candidates})
+
+			_, err = controller.Reconcile(ctx)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring(computeErr.Error()))
+			Expect(queue.HasAny(candidates[0].ProviderID())).To(BeTrue(), "the valid partial command should be queued despite the decision error")
+		})
 	})
 
 	Context("Budgets", func() {
@@ -554,6 +572,27 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 		)
 	})
 })
+
+type partialCommandMethod struct {
+	computeErr error
+}
+
+func (m partialCommandMethod) ShouldDisrupt(context.Context, *disruption.Candidate) bool {
+	return true
+}
+
+func (m partialCommandMethod) ComputeCommands(_ context.Context, _ map[string]int, candidates ...*disruption.Candidate) ([]disruption.Command, error) {
+	return []disruption.Command{{
+		Action:     disruption.DeleteAction,
+		Candidates: []*disruption.Candidate{candidates[0]},
+	}}, m.computeErr
+}
+
+func (partialCommandMethod) Reason() v1.DisruptionReason { return v1.DisruptionReasonUnderutilized }
+
+func (partialCommandMethod) Class() string { return disruption.GracefulDisruptionClass }
+
+func (partialCommandMethod) ConsolidationType() string { return "partial-command-test" }
 
 func NewTestScoreBasedConsolidationValidator(nodePool *v1.NodePool, opts ...TestConsolidationValidatorOption) disruption.Validator {
 	return newTestConsolidationValidator(nodePool, disruption.NewScoreBasedConsolidationValidator(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)), opts...)
