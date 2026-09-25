@@ -25,7 +25,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 func TestSimulationPodCatalogReservesRealUIDsForSyntheticIDs(t *testing.T) {
@@ -60,6 +62,43 @@ func TestCloneStateNodesOwnsNodeCopies(t *testing.T) {
 	node.Node.Labels["source"] = "mutated"
 	if got := cloned[0].Node.Labels["source"]; got != "original" {
 		t.Fatalf("cloned node label = %q, want original", got)
+	}
+}
+
+func TestCloneStateNodesMakesStandbyAvailableOnlyForSimulation(t *testing.T) {
+	standbyNode := &state.StateNode{
+		Node: &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "standby"},
+			Spec:       corev1.NodeSpec{Taints: []corev1.Taint{standby.NodeTaint()}},
+		},
+		NodeClaim: &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name:        "standby",
+			Annotations: map[string]string{standby.NodeClaimAnnotationKey: "true"},
+		}},
+	}
+	activatingNode := &state.StateNode{
+		Node: &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "activating"},
+			Spec:       corev1.NodeSpec{Taints: []corev1.Taint{standby.NodeTaint()}},
+		},
+		NodeClaim: &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name:        "activating",
+			Annotations: map[string]string{standby.NodeClaimAnnotationKey: "true", standby.NodeClaimActivatingAnnotationKey: "true"},
+		}},
+	}
+
+	cloned := cloneStateNodes([]*state.StateNode{standbyNode, activatingNode})
+	if standby.HasNodeTaint(cloned[0].Node) {
+		t.Fatal("standby taint remained on the simulation copy")
+	}
+	if !standby.IsNodeClaimStandby(cloned[0].NodeClaim) {
+		t.Fatal("simulation copy lost the persistent standby marker")
+	}
+	if !standby.HasNodeTaint(standbyNode.Node) {
+		t.Fatal("simulation preparation mutated the source node")
+	}
+	if !standby.HasNodeTaint(cloned[1].Node) {
+		t.Fatal("activation in progress was exposed as simulation capacity")
 	}
 }
 

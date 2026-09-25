@@ -103,6 +103,12 @@ var _ = Describe("Eviction/Queue", func() {
 	})
 
 	Context("Eviction API", func() {
+		It("should cancel queued evictions", func() {
+			queue.Add(pod)
+			Expect(queue.Has(pod)).To(BeTrue())
+			queue.Cancel(pod)
+			Expect(queue.Has(pod)).To(BeFalse())
+		})
 		It("should succeed with no event when the pod is not found", func() {
 			ExpectObjectReconciled(ctx, env.Client, queue, pod)
 			Expect(recorder.Events()).To(HaveLen(0))

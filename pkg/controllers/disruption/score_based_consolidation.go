@@ -30,6 +30,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 var ScoreBasedConsolidationTimeoutDuration = 20 * time.Second
@@ -94,13 +95,46 @@ func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candida
 	if !NodePoolUsesScoreBasedConsolidation(cn.NodePool) {
 		return false
 	}
-	return s.consolidation.ShouldDisrupt(ctx, cn)
+	if standby.IsNodeClaimActivating(cn.NodeClaim) {
+		return false
+	}
+	if standby.IsNodeClaimStandby(cn.NodeClaim) || standby.HasNodeTaint(cn.Node) {
+		return scoreBasedReclamationDue(cn.NodePool, s.clock.Now()) && s.isReclamationCandidateAvailable(ctx, cn)
+	}
+	if s.consolidation.ShouldDisrupt(ctx, cn) {
+		return true
+	}
+	return scoreBasedReclamationDue(cn.NodePool, s.clock.Now()) && s.isReclamationCandidateAvailable(ctx, cn)
 }
 
 //nolint:gocyclo
 func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+	reclamationCommand, reclamationPools, err := s.computeReclamationCommand(ctx, disruptionBudgetMapping, candidates)
+	if err != nil {
+		return []Command{}, err
+	}
+	reclamationCommands := []Command{}
+	if reclamationCommand != nil {
+		reclamationCommands = append(reclamationCommands, *reclamationCommand)
+	}
 	if s.IsConsolidated() {
-		return []Command{}, nil
+		return reclamationCommands, nil
+	}
+
+	// A pool with due, empty capacity is handled only by reclamation in this pass.
+	// Keep normal compaction available for other pools.
+	normalCandidates := make([]*Candidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if reclamationPools[candidate.NodePool.Name] || standby.IsNodeClaimActivating(candidate.NodeClaim) || standby.IsNodeClaimStandby(candidate.NodeClaim) || standby.HasNodeTaint(candidate.Node) {
+			continue
+		}
+		if s.consolidation.ShouldDisrupt(ctx, candidate) {
+			normalCandidates = append(normalCandidates, candidate)
+		}
+	}
+	candidates = normalCandidates
+	if len(candidates) == 0 {
+		return reclamationCommands, nil
 	}
 
 	start := s.clock.Now()
@@ -124,7 +158,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 
 	evals, evaluated, err := s.searchForMoveSets(ctx, validCandidates, deadline)
 	if err != nil {
-		return []Command{}, err
+		return reclamationCommands, err
 	}
 	if len(evals) == 0 {
 		timedOut := evaluated < len(validCandidates)
@@ -134,7 +168,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		if !timedOut && !constrainedByBudgets && !constrainedByPace {
 			s.markConsolidated()
 		}
-		return []Command{}, nil
+		return reclamationCommands, nil
 	}
 
 	sort.Slice(evals, func(i, j int) bool {
@@ -145,18 +179,19 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	if remainingValidationDelay > 0 {
 		select {
 		case <-ctx.Done():
-			return []Command{}, ctx.Err()
+			return reclamationCommands, ctx.Err()
 		case <-s.clock.After(remainingValidationDelay):
 		}
 	}
 	cmd, err := selectFirstStillValidCommand(ctx, s.validator, s.recorder, evals)
 	if err != nil {
-		return []Command{}, err
+		return reclamationCommands, err
 	}
 	if len(cmd.Candidates) == 0 {
-		return []Command{}, nil
+		return reclamationCommands, nil
 	}
-	return []Command{cmd}, nil
+	cmd.Action = EvacuateAction
+	return append(reclamationCommands, cmd), nil
 }
 
 func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCandidates []*Candidate, deadline time.Time) ([]*moveSetEvaluation, int, error) {
@@ -238,7 +273,6 @@ func evaluateMoveSet(ctx context.Context, moveSet moveSet, compute consolidation
 	default:
 	}
 	if err != nil {
-		log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
 		return nil
 	}
 	if cmd.Decision() == NoOpDecision {

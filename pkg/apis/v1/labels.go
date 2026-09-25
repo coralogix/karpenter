@@ -60,6 +60,11 @@ const (
 	MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey = "karpenter.coralogix.net/max-underutilized-node-disruptions-per-minute"
 	MaxUnderutilizedNodesPerConsolidationAnnotationKey    = "karpenter.coralogix.net/max-underutilized-nodes-per-consolidation"
 	ScoreBasedConsolidationAnnotationKey                  = "karpenter.coralogix.net/score-based-consolidation"
+	// ScoreBasedReclamationIntervalAnnotationKey configures how often score-based NodePools remove empty nodes.
+	// Values use Go duration syntax; invalid or non-positive values use the two-minute default.
+	ScoreBasedReclamationIntervalAnnotationKey = "karpenter.coralogix.net/reclamation-interval"
+	// ScoreBasedLastReclamationAnnotationKey stores the RFC3339Nano time of the last successful empty-node reclamation.
+	ScoreBasedLastReclamationAnnotationKey = "karpenter.coralogix.net/last-reclamation"
 )
 
 // Karpenter specific finalizers

@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	karpscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 // SimulationPodID identifies a pod in one PreparedSimulationInputs catalog. The catalog
@@ -96,11 +97,11 @@ func (p *Provisioner) NewPreparedSimulationInputs(ctx context.Context, pods []*c
 	if err != nil {
 		return nil, err
 	}
-	preparedTopology, err := scheduling.NewPreparedTopology(ctx, factory.inputs, stateNodes, apiPods, namespaces, opts...)
+	ownedStateNodes := cloneStateNodes(stateNodes)
+	preparedTopology, err := scheduling.NewPreparedTopology(ctx, factory.inputs, ownedStateNodes, apiPods, namespaces, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("preparing topology snapshot, %w", err)
 	}
-	ownedStateNodes := cloneStateNodes(stateNodes)
 	schedulerState, err := scheduling.NewPreparedSchedulerState(ctx, factory.baseline, ownedStateNodes, p.clock)
 	if err != nil {
 		return nil, fmt.Errorf("preparing scheduler state snapshot, %w", err)
@@ -197,7 +198,19 @@ func cloneStateNodes(nodes []*state.StateNode) state.StateNodes {
 		if node == nil {
 			return nil
 		}
-		return node.DeepCopy()
+		copy := node.DeepCopy()
+		// Standby nodes are valid capacity for a simulation because provisioning
+		// or compaction can activate them before pods are nominated. Keep the
+		// persistent marker on the copied NodeClaim so callers can identify which
+		// existing nodes need activation after solving.
+		if copy.Node != nil && standby.IsNodeClaimActivating(copy.NodeClaim) {
+			// An activation in progress is reserved from both scheduling and
+			// reclamation until the activation transaction finishes.
+			standby.SetNodeTaint(copy.Node, true)
+		} else if copy.Node != nil && standby.IsNodeClaimStandby(copy.NodeClaim) {
+			standby.SetNodeTaint(copy.Node, false)
+		}
+		return copy
 	})
 }
 

@@ -21,15 +21,44 @@ import (
 	"sync"
 	"time"
 
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"sigs.k8s.io/karpenter/pkg/metrics"
+)
+
+var (
+	ScoreBasedMoveSetEvaluationErrorsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "score_based_move_set_evaluation_errors_total",
+			Help:      "Number of score-based consolidation move set evaluations that failed.",
+		},
+		[]string{},
+	)
+	ScoreBasedReclamationNodeRemovalsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "score_based_reclamation_node_removals_total",
+			Help:      "Number of NodeClaim deletion requests successfully processed by score-based reclamation.",
+		},
+		[]string{},
+	)
 )
 
 type moveSetSearchStats struct {
-	mu     sync.Mutex
-	count  int
-	sum    time.Duration
-	max    time.Duration
-	errors int
+	mu         sync.Mutex
+	count      int
+	sum        time.Duration
+	max        time.Duration
+	errors     int
+	firstError string
 }
 
 func (s *moveSetSearchStats) record(d time.Duration, err error) {
@@ -42,6 +71,10 @@ func (s *moveSetSearchStats) record(d time.Duration, err error) {
 	}
 	if err != nil {
 		s.errors++
+		if s.firstError == "" {
+			s.firstError = err.Error()
+		}
+		ScoreBasedMoveSetEvaluationErrorsTotal.Inc(nil)
 	}
 }
 
@@ -66,6 +99,12 @@ func (s *moveSetSearchStats) errorCount() int {
 	return s.errors
 }
 
+func (s *moveSetSearchStats) firstErrorMessage() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.firstError
+}
+
 func logMoveSetSearchComplete(
 	ctx context.Context,
 	moveSets int,
@@ -75,7 +114,7 @@ func logMoveSetSearchComplete(
 	searchDuration time.Duration,
 	stats *moveSetSearchStats,
 ) {
-	log.FromContext(ctx).Info("score-based consolidation move set search complete",
+	log.FromContext(ctx).V(1).Info("score-based consolidation move set search complete",
 		"moveSets", moveSets,
 		"evaluated", evaluated,
 		"valid", valid,
@@ -84,5 +123,6 @@ func logMoveSetSearchComplete(
 		"avgMoveSetEvalDuration", stats.avg(),
 		"maxMoveSetEvalDuration", stats.maxDuration(),
 		"computeErrors", stats.errorCount(),
+		"firstComputeError", stats.firstErrorMessage(),
 	)
 }

@@ -22,17 +22,21 @@ import (
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"sigs.k8s.io/karpenter/pkg/apis"
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
+	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 const (
@@ -108,12 +112,11 @@ func (c *NodeController) Reconcile(ctx context.Context, n *corev1.Node) (reconci
 	//nolint:ineffassign
 	ctx = injection.WithControllerName(ctx, c.Name()) //nolint:ineffassign,staticcheck
 
-	// If the disruption taint doesn't exist and the deletion timestamp isn't set, it's not being disrupted.
-	// We don't check the deletion timestamp here, as we expect the termination controller to eventually set
-	// the taint when it picks up the node from being deleted.
-	if !lo.ContainsBy(n.Spec.Taints, func(taint corev1.Taint) bool {
-		return taint.MatchTaint(&v1.DisruptedNoScheduleTaint)
-	}) {
+	shouldTrigger, err := c.shouldTriggerProvisioning(ctx, n)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if !shouldTrigger {
 		return reconcile.Result{}, nil
 	}
 	c.provisioner.Trigger(n.UID)
@@ -122,6 +125,41 @@ func (c *NodeController) Reconcile(ctx context.Context, n *corev1.Node) (reconci
 	// coming online. Even if a provisioning loop is successful, the pod may
 	// require another provisioning loop to become schedulable.
 	return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+func (c *NodeController) shouldTriggerProvisioning(ctx context.Context, n *corev1.Node) (bool, error) {
+	// If the disruption taint exists, pods are being rescheduled from this node.
+	if lo.ContainsBy(n.Spec.Taints, func(taint corev1.Taint) bool {
+		return taint.MatchTaint(&v1.DisruptedNoScheduleTaint)
+	}) {
+		return true, nil
+	}
+	if n.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" {
+		return true, nil
+	}
+	if !standby.HasNodeTaint(n) {
+		return false, nil
+	}
+	// Resolve the owning NodeClaim while the standby taint is still present.
+	// This covers a restart after the claim marker is persisted but before its
+	// activation marker is mirrored onto the Node.
+	owner, ok := lo.Find(n.OwnerReferences, func(owner metav1.OwnerReference) bool {
+		return owner.Kind == "NodeClaim" && owner.APIVersion == apis.Group+"/v1"
+	})
+	if !ok {
+		return false, nil
+	}
+	nodeClaim := &v1.NodeClaim{}
+	if err := c.kubeClient.Get(ctx, client.ObjectKey{Name: owner.Name}, nodeClaim); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if owner.UID != nodeClaim.UID {
+		return false, nil
+	}
+	return standby.IsNodeClaimActivating(nodeClaim), nil
 }
 
 func (c *NodeController) Register(ctx context.Context, m manager.Manager) error {

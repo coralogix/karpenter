@@ -20,6 +20,7 @@ profiles/
 .DS_Store
 .kiro*
 .claude*
+/AGENTS.override.md
 
 # Vim swap files
 *.swp

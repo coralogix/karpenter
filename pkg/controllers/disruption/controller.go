@@ -34,6 +34,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
@@ -52,6 +54,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
+	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 type Controller struct {
@@ -166,23 +169,11 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{RequeueAfter: time.Second}, nil
 	}
 
-	// Karpenter taints nodes with a karpenter.sh/disruption taint as part of the disruption process while it progresses in memory.
-	// If Karpenter restarts or fails with an error during a disruption action, some nodes can be left tainted.
-	// Idempotently remove this taint from candidates that are not in the orchestration queue before continuing.
-	outdatedNodes := lo.Reject(c.cluster.DeepCopyNodes(), func(s *state.StateNode, _ int) bool {
-		return c.queue.HasAny(s.ProviderID()) || s.MarkedForDeletion()
-	})
-	if err := state.RequireNoScheduleTaint(ctx, c.kubeClient, false, outdatedNodes...); err != nil {
+	if err := c.cleanupStaleDisruptionState(ctx); err != nil {
 		if errors.IsConflict(err) {
 			return reconciler.Result{Requeue: true}, nil
 		}
-		return reconciler.Result{}, serrors.Wrap(fmt.Errorf("removing taint from nodes, %w", err), "taint", pretty.Taint(v1.DisruptedNoScheduleTaint))
-	}
-	if err := state.ClearNodeClaimsCondition(ctx, c.kubeClient, c.clock, v1.ConditionTypeDisruptionReason, outdatedNodes...); err != nil {
-		if errors.IsConflict(err) {
-			return reconciler.Result{Requeue: true}, nil
-		}
-		return reconciler.Result{}, serrors.Wrap(fmt.Errorf("removing condition from nodeclaims, %w", err), "condition", v1.ConditionTypeDisruptionReason)
+		return reconciler.Result{}, err
 	}
 
 	// Attempt different disruption methods. We'll only let one method perform an action
@@ -202,6 +193,47 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 
 	// All methods did nothing, so return nothing to do
 	return reconciler.Result{RequeueAfter: pollingPeriod}, nil
+}
+
+func (c *Controller) cleanupStaleDisruptionState(ctx context.Context) error {
+	// Karpenter taints nodes with a karpenter.sh/disruption taint as part of the disruption process while it progresses in memory.
+	// If Karpenter restarts or fails with an error during a disruption action, some nodes can be left tainted.
+	// Idempotently remove this taint from candidates that are not in the orchestration queue before continuing.
+	outdatedNodes := lo.Reject(c.cluster.DeepCopyNodes(), func(s *state.StateNode, _ int) bool {
+		return c.queue.HasAny(s.ProviderID()) || s.MarkedForDeletion() || standby.IsNodeClaimActivating(s.NodeClaim)
+	})
+	standbyNodes := lo.Filter(outdatedNodes, func(s *state.StateNode, _ int) bool { return standby.IsNodeClaimStandby(s.NodeClaim) })
+	if err := c.ensureStandbyTaints(ctx, standbyNodes...); err != nil {
+		return serrors.Wrap(fmt.Errorf("restoring standby taint, %w", err), "taint", standby.NodeTaintKey)
+	}
+	if err := state.RequireNoScheduleTaint(ctx, c.kubeClient, false, outdatedNodes...); err != nil {
+		return serrors.Wrap(fmt.Errorf("removing taint from nodes, %w", err), "taint", pretty.Taint(v1.DisruptedNoScheduleTaint))
+	}
+	if err := state.ClearNodeClaimsCondition(ctx, c.kubeClient, c.clock, v1.ConditionTypeDisruptionReason, outdatedNodes...); err != nil {
+		return serrors.Wrap(fmt.Errorf("removing condition from nodeclaims, %w", err), "condition", v1.ConditionTypeDisruptionReason)
+	}
+	return nil
+}
+
+func (c *Controller) ensureStandbyTaints(ctx context.Context, nodes ...*state.StateNode) error {
+	for _, stateNode := range nodes {
+		if stateNode.Node == nil {
+			continue
+		}
+		node := &corev1.Node{}
+		if err := c.kubeClient.Get(ctx, client.ObjectKeyFromObject(stateNode.Node), node); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		stored := node.DeepCopy()
+		standby.SetNodeTaint(node, true)
+		if equality.Semantic.DeepEqual(stored, node) {
+			continue
+		}
+		if err := c.kubeClient.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {

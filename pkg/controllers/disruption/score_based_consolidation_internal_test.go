@@ -142,6 +142,9 @@ func TestMoveSetSearchStats(t *testing.T) {
 	if got := stats.errorCount(); got != 1 {
 		t.Fatalf("errors = %d, want 1", got)
 	}
+	if got := stats.firstErrorMessage(); got != "compute failed" {
+		t.Fatalf("first error = %q, want %q", got, "compute failed")
+	}
 
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {

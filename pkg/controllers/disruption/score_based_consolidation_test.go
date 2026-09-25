@@ -17,6 +17,7 @@ limitations under the License.
 package disruption_test
 
 import (
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -92,6 +93,57 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Expect(sorted).To(HaveLen(2))
 			Expect(sorted[0].Labels()[corev1.LabelInstanceTypeStable]).To(Equal(mostExpensiveInstance.Name))
 			Expect(sorted[1].Labels()[corev1.LabelInstanceTypeStable]).To(Equal(leastExpensiveInstance.Name))
+		})
+	})
+
+	Context("Reclamation", func() {
+		It("should remove the rounded-up half of currently empty nodes for a due pool", func() {
+			var nodeClaims []*v1.NodeClaim
+			var nodes []*corev1.Node
+			objects := []client.Object{scoreBasedNodePool}
+			for i := 0; i < 3; i++ {
+				offering := leastExpensiveInstance.Offerings[0]
+				nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: fmt.Sprintf("reclamation-nodeclaim-%d", i),
+						Labels: map[string]string{
+							v1.NodePoolLabelKey:            scoreBasedNodePool.Name,
+							corev1.LabelInstanceTypeStable: leastExpensiveInstance.Name,
+							v1.CapacityTypeLabelKey:        offering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+							corev1.LabelTopologyZone:       offering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+						},
+					},
+					Status: v1.NodeClaimStatus{
+						Allocatable: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("32")},
+					},
+				})
+				node.Name = fmt.Sprintf("reclamation-node-%d", i)
+				nodeClaims = append(nodeClaims, nodeClaim)
+				nodes = append(nodes, node)
+				objects = append(objects, nodeClaim, node)
+			}
+			ExpectApplied(ctx, env.Client, objects...)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+
+			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, scoreBased.ShouldDisrupt, scoreBased.Class(), queue)
+			Expect(err).To(Succeed())
+			Expect(candidates).To(HaveLen(3), "empty nodes should be reclamation candidates even before the Consolidatable condition is set")
+
+			var commands []disruption.Command
+			ExpectParallelized(
+				func() {
+					commands, err = scoreBased.ComputeCommands(ctx, map[string]int{scoreBasedNodePool.Name: 2}, candidates...)
+				},
+				func() {
+					Eventually(fakeClock.HasWaiters, time.Second*10).Should(BeTrue())
+					fakeClock.Step(15 * time.Second)
+				},
+			)
+			Expect(err).To(Succeed())
+			Expect(commands).To(HaveLen(1))
+			Expect(commands[0].Decision()).To(Equal(disruption.DeleteDecision))
+			Expect(commands[0].Action).To(Equal(disruption.DeleteAction))
+			Expect(commands[0].Candidates).To(HaveLen(2))
 		})
 	})
 
