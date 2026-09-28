@@ -297,11 +297,12 @@ func TestEvaluateMoveSetsPar_stopsOnDeadline(t *testing.T) {
 	}
 }
 
-func TestEvaluateMoveSetsPar_stopsAfterNValidEvaluations(t *testing.T) {
+func TestEvaluateMoveSetsPar_returnsTopResultsAfterSearch(t *testing.T) {
 	ctx := context.Background()
 	moveSets := make([]moveSet, 12)
 	for i := range moveSets {
-		candidate := candidateWithPrice(t, 0.10)
+		price := 0.10 + float64(i)*0.01
+		candidate := candidateWithPrice(t, price)
 		candidate.NodePool = &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: strconv.Itoa(i)}}
 		moveSets[i] = moveSet{Nodes: []*Candidate{candidate}}
 	}
@@ -314,17 +315,17 @@ func TestEvaluateMoveSetsPar_stopsAfterNValidEvaluations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
 	}
-	if len(evals) != scoreBasedValidEvaluationsTarget {
-		t.Fatalf("evaluations = %d, want %d", len(evals), scoreBasedValidEvaluationsTarget)
+	if len(evals) != scoreBasedMoveSetResultLimit {
+		t.Fatalf("evaluations = %d, want %d", len(evals), scoreBasedMoveSetResultLimit)
+	}
+	if evaluated != len(moveSets) {
+		t.Fatalf("evaluated = %d, want %d", evaluated, len(moveSets))
 	}
 	for i, eval := range evals {
-		want := strconv.Itoa(i)
+		want := strconv.Itoa(len(moveSets) - 1 - i)
 		if eval.Command.Candidates[0].NodePool.Name != want {
 			t.Fatalf("evaluation[%d] index = %q, want %q", i, eval.Command.Candidates[0].NodePool.Name, want)
 		}
-	}
-	if evaluated < scoreBasedValidEvaluationsTarget {
-		t.Fatalf("evaluated = %d, want at least %d", evaluated, scoreBasedValidEvaluationsTarget)
 	}
 }
 

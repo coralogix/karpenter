@@ -37,7 +37,6 @@ import (
 
 const (
 	scoreBasedConsolidationSpan              = "karpenter.disruption.score_based_consolidation"
-	scoreBasedConsolidationReclamationSpan   = "karpenter.disruption.score_based_consolidation.reclamation"
 	scoreBasedConsolidationPrepareSpan       = "karpenter.disruption.score_based_consolidation.prepare_compaction_candidates"
 	scoreBasedConsolidationFilterSpan        = "karpenter.disruption.score_based_consolidation.filter_valid_candidates"
 	scoreBasedConsolidationMoveSetSearchSpan = "karpenter.disruption.score_based_consolidation.move_set_search"
@@ -46,9 +45,10 @@ const (
 	scoreBasedConsolidationValidateSpan      = "karpenter.disruption.score_based_consolidation.validate_command"
 )
 
-var ScoreBasedConsolidationTimeoutDuration = 20 * time.Second
+var ScoreBasedConsolidationTimeoutDuration = 15 * time.Second
 
-var scoreBasedValidEvaluationsTarget = 10
+// scoreBasedMoveSetResultLimit is the number of highest-scoring move sets returned after search completes.
+var scoreBasedMoveSetResultLimit = 10
 
 var scoreBasedMoveSetParallelism = runtime.GOMAXPROCS(0)
 
@@ -105,19 +105,7 @@ func NewScoreBasedConsolidationValidator(c consolidation) *ConsolidationValidato
 }
 
 func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
-	if cn == nil || !NodePoolUsesScoreBasedConsolidation(cn.NodePool) {
-		return false
-	}
-	if standby.IsNodeClaimActivating(cn.NodeClaim) {
-		return false
-	}
-	if standby.IsNodeClaimStandby(cn.NodeClaim) || standby.HasNodeTaint(cn.Node) {
-		return s.ShouldReclaim(ctx, cn)
-	}
-	if s.shouldCompact(ctx, cn) {
-		return true
-	}
-	return s.ShouldReclaim(ctx, cn)
+	return s.shouldCompact(ctx, cn)
 }
 
 // shouldCompact admits only eligible, non-empty active nodes into normal compaction.
@@ -159,26 +147,14 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	)
 	defer endConsolidation()
 
-	reclamationCtx, stopReclamation := cxtracing.Measure(ctx, nil, scoreBasedConsolidationReclamationSpan)
-	reclamationCommand, reclamationPools, err := s.computeReclamationCommand(reclamationCtx, candidates)
-	stopReclamation()
-	if err != nil {
-		return []Command{}, err
-	}
-	reclamationCommands := []Command{}
-	if reclamationCommand != nil {
-		reclamationCommands = append(reclamationCommands, *reclamationCommand)
-	}
-	if s.IsConsolidated() && len(reclamationPools) == 0 {
-		return reclamationCommands, nil
+	if s.IsConsolidated() {
+		return []Command{}, nil
 	}
 
 	prepareCtx, stopPrepare := cxtracing.Measure(ctx, nil, scoreBasedConsolidationPrepareSpan)
-	// A pool with due, empty capacity is handled only by reclamation in this pass.
-	// Keep normal compaction available for other pools.
 	normalCandidates := make([]*Candidate, 0, len(candidates))
 	for _, candidate := range candidates {
-		if candidate == nil || candidate.NodePool == nil || reclamationPools[candidate.NodePool.Name] || standby.IsNodeClaimActivating(candidate.NodeClaim) || standby.IsNodeClaimStandby(candidate.NodeClaim) || standby.HasNodeTaint(candidate.Node) {
+		if candidate == nil || candidate.NodePool == nil || standby.IsNodeClaimActivating(candidate.NodeClaim) || standby.IsNodeClaimStandby(candidate.NodeClaim) || standby.HasNodeTaint(candidate.Node) {
 			continue
 		}
 		if s.shouldCompact(prepareCtx, candidate) {
@@ -188,7 +164,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	stopPrepare()
 	candidates = normalCandidates
 	if len(candidates) == 0 {
-		return reclamationCommands, nil
+		return []Command{}, nil
 	}
 
 	start := s.clock.Now()
@@ -220,7 +196,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	evals, evaluated, err := s.searchForMoveSets(searchCtx, validCandidates, deadline)
 	stopSearch()
 	if err != nil {
-		return reclamationCommands, err
+		return []Command{}, err
 	}
 	if len(evals) == 0 {
 		timedOut := evaluated < len(validCandidates)
@@ -230,7 +206,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		if !timedOut && !constrainedByBudgets && !constrainedByPace {
 			s.markConsolidated()
 		}
-		return reclamationCommands, nil
+		return []Command{}, nil
 	}
 
 	sort.Slice(evals, func(i, j int) bool {
@@ -245,7 +221,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		select {
 		case <-ctx.Done():
 			stopTTLWait()
-			return reclamationCommands, ctx.Err()
+			return []Command{}, ctx.Err()
 		case <-s.clock.After(remainingValidationDelay):
 		}
 		stopTTLWait()
@@ -256,14 +232,14 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	cmd, selectedEvalIdx, err := selectFirstStillValidCommand(validateCtx, s.validator, s.recorder, evals)
 	stopValidate()
 	if err != nil {
-		return reclamationCommands, err
+		return []Command{}, err
 	}
 	if len(cmd.Candidates) == 0 {
-		return reclamationCommands, nil
+		return []Command{}, nil
 	}
 	logScoreBasedCompactionMoveSelected(ctx, evals, selectedEvalIdx, evaluated, len(validCandidates))
 	cmd.Action = EvacuateAction
-	return append(reclamationCommands, cmd), nil
+	return []Command{cmd}, nil
 }
 
 func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCandidates []*Candidate, deadline time.Time) ([]*moveSetEvaluation, int, error) {
@@ -319,7 +295,7 @@ func evaluateMoveSetsPar(
 		return nil, false, nil
 	})
 
-	evals, err := collectMoveSetEvaluations(valid, scoreBasedValidEvaluationsTarget)
+	evals, err := collectMoveSetEvaluations(valid, scoreBasedMoveSetResultLimit)
 	timedOut := ctx.Err() != nil && len(evals) == 0
 	logMoveSetSearchComplete(ctx, len(moveSets), int(evaluated.Load()), len(evals), timedOut, time.Since(searchStart), stats)
 	if err != nil {
@@ -367,15 +343,18 @@ func evaluateMoveSet(ctx context.Context, moveSet moveSet, compute consolidation
 func collectMoveSetEvaluations(valid <-chan rill.Try[*moveSetEvaluation], limit int) ([]*moveSetEvaluation, error) {
 	defer rill.Discard(valid)
 
-	evals := make([]*moveSetEvaluation, 0, limit)
+	var evals []*moveSetEvaluation
 	for a := range valid {
 		if a.Error != nil {
 			return nil, a.Error
 		}
 		evals = append(evals, a.Value)
-		if len(evals) >= limit {
-			break
-		}
+	}
+	sort.Slice(evals, func(i, j int) bool {
+		return evals[i].Score > evals[j].Score
+	})
+	if len(evals) > limit {
+		evals = evals[:limit]
 	}
 	return evals, nil
 }

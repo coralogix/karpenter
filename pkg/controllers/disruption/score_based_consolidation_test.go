@@ -40,6 +40,7 @@ import (
 
 var _ = Describe("ScoreBasedConsolidation", func() {
 	var scoreBased *disruption.ScoreBasedConsolidation
+	var scoreBasedReclamation *disruption.ScoreBasedReclamation
 	var scoreBasedNodePool *v1.NodePool
 	var scoreBasedNodePoolMap map[string]*v1.NodePool
 	var scoreBasedInstanceTypeMap map[string]map[string]*cloudprovider.InstanceType
@@ -76,6 +77,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 
 		c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)
 		scoreBased = disruption.NewScoreBasedConsolidation(c)
+		scoreBasedReclamation = disruption.NewScoreBasedReclamation(c)
 	})
 
 	AfterEach(func() {
@@ -100,6 +102,8 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 
 	Context("Reclamation", func() {
 		It("should reclaim all empty nodes despite zero or one NodePool budget", func() {
+			Expect(scoreBasedReclamation.Reason()).To(Equal(v1.DisruptionReasonEmpty))
+			Expect(scoreBasedReclamation.ConsolidationType()).To(Equal(disruption.ScoreBasedReclamationType))
 			scoreBasedNodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
 			budgetOneNodePool := test.NodePool(v1.NodePool{
 				ObjectMeta: metav1.ObjectMeta{
@@ -148,14 +152,17 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			ExpectApplied(ctx, env.Client, objects...)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 
-			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, scoreBased.ShouldDisrupt, scoreBased.Class(), queue)
+			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, scoreBasedReclamation.ShouldDisrupt, scoreBasedReclamation.Class(), queue)
 			Expect(err).To(Succeed())
 			Expect(candidates).To(HaveLen(6), "empty nodes should be reclamation candidates even before the Consolidatable condition is set")
+			compactionCandidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, scoreBased.ShouldDisrupt, scoreBased.Class(), queue)
+			Expect(err).To(Succeed())
+			Expect(compactionCandidates).To(BeEmpty(), "empty nodes should not be compaction candidates")
 
 			var commands []disruption.Command
 			ExpectParallelized(
 				func() {
-					commands, err = scoreBased.ComputeCommands(ctx, map[string]int{
+					commands, err = scoreBasedReclamation.ComputeCommands(ctx, map[string]int{
 						scoreBasedNodePool.Name: 0,
 						budgetOneNodePool.Name:  1,
 					}, candidates...)
@@ -184,8 +191,10 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			if leastExpensiveCostPerVCPU > mostExpensiveCostPerVCPU {
 				expectedHigherCostPerVCPU = leastExpensiveInstance
 			}
-			for _, candidate := range commands[0].Candidates {
-				Expect(candidate.Labels()[corev1.LabelInstanceTypeStable]).To(Equal(expectedHigherCostPerVCPU.Name), "each pool should select its highest cost-per-vCPU empty nodes")
+			for _, selected := range selectedByPool {
+				Expect(selected[0].Labels()[corev1.LabelInstanceTypeStable]).To(Equal(expectedHigherCostPerVCPU.Name))
+				Expect(selected[1].Labels()[corev1.LabelInstanceTypeStable]).To(Equal(expectedHigherCostPerVCPU.Name))
+				Expect(selected[2].Labels()[corev1.LabelInstanceTypeStable]).NotTo(Equal(expectedHigherCostPerVCPU.Name), "the experimental all-empty policy also selects the lower-cost node")
 			}
 		})
 
@@ -208,14 +217,14 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			})
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
-			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, scoreBased.ShouldDisrupt, scoreBased.Class(), queue)
+			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, scoreBasedReclamation.ShouldDisrupt, scoreBasedReclamation.Class(), queue)
 			Expect(err).To(Succeed())
 			Expect(candidates).To(HaveLen(1))
 
 			var commands []disruption.Command
 			ExpectParallelized(
 				func() {
-					commands, err = scoreBased.ComputeCommands(ctx, map[string]int{scoreBasedNodePool.Name: 0}, candidates...)
+					commands, err = scoreBasedReclamation.ComputeCommands(ctx, map[string]int{scoreBasedNodePool.Name: 0}, candidates...)
 				},
 				func() {
 					Eventually(fakeClock.HasWaiters, time.Second*10).Should(BeTrue())
@@ -240,6 +249,35 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 	})
 
 	Context("Controller", func() {
+		It("places score-based reclamation immediately after empty consolidation", func() {
+			methods := NewMethodsWithRealValidator()
+			Expect(methods).To(HaveLen(7))
+			Expect(methods[0]).To(BeAssignableToTypeOf(&disruption.Emptiness{}))
+			Expect(methods[1]).To(BeAssignableToTypeOf(&disruption.ScoreBasedReclamation{}))
+			Expect(methods[2]).To(BeAssignableToTypeOf(&disruption.StaticDrift{}))
+		})
+
+		It("retries later methods on the next pass after reclamation starts a command", func() {
+			_, err := createScoreBasedCandidatesForPool(scoreBasedNodePool, mostExpensiveInstance)
+			Expect(err).To(Succeed())
+			reclamation := &controllerBoundaryMethod{reason: v1.DisruptionReasonEmpty, typeLabel: disruption.ScoreBasedReclamationType, commandFirst: true}
+			compaction := &controllerBoundaryMethod{reason: v1.DisruptionReasonUnderutilized, typeLabel: disruption.ScoreBasedConsolidationType}
+			controller := disruption.NewController(fakeClock, env.Client, prov, cloudProvider, recorder, cluster, queue, disruption.WithMethods(reclamation, compaction))
+
+			result, err := controller.Reconcile(ctx)
+			Expect(err).To(Succeed())
+			Expect(result.RequeueAfter).To(BeNumerically("<", time.Second))
+			Expect(reclamation.computeCalls).To(Equal(1))
+			Expect(compaction.computeCalls).To(BeZero(), "the controller should stop after reclamation starts a command")
+			Expect(queue.GetCommands()).To(HaveLen(1))
+			queue.CompleteCommand(queue.GetCommands()[0])
+
+			_, err = controller.Reconcile(ctx)
+			Expect(err).To(Succeed())
+			Expect(reclamation.computeCalls).To(Equal(2))
+			Expect(compaction.computeCalls).To(Equal(1), "compaction should run on the retry pass")
+		})
+
 		It("starts returned commands and reports a later decision error", func() {
 			candidates, err := createScoreBasedCandidatesForPool(scoreBasedNodePool, mostExpensiveInstance)
 			Expect(err).To(Succeed())
@@ -316,7 +354,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			var cmds []disruption.Command
 			ExpectParallelized(
 				func() {
-					cmds, err = scoreBased.ComputeCommands(ctx, budgetMapping, candidate)
+					cmds, err = scoreBasedReclamation.ComputeCommands(ctx, budgetMapping, candidate)
 				},
 				func() {
 					Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
@@ -329,12 +367,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Expect(cmds[0].Candidates[0].Name()).To(Equal(node.Name))
 		})
 
-		It("should compact only a feasible non-empty node when reclamation is not due", func() {
-			if disruption.ExperimentalReclamationRemoveAllEmptyImmediately {
-				Skip("interval gating is disabled while experimental immediate reclamation is enabled")
-			}
-			scoreBasedNodePool.Annotations[v1.ScoreBasedLastReclamationAnnotationKey] = fakeClock.Now().Add(-30 * time.Second).Format(time.RFC3339Nano)
-			ExpectApplied(ctx, env.Client, scoreBasedNodePool)
+		It("should only return non-empty nodes to compaction", func() {
 
 			var emptyNodeClaims []*v1.NodeClaim
 			var emptyNodes []*corev1.Node
@@ -384,6 +417,9 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Expect(err).To(Succeed())
 			Expect(candidates).To(HaveLen(1))
 			Expect(candidates[0].Name()).To(Equal(expectedCandidate.Name()))
+			reclamationCandidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, scoreBasedReclamation.ShouldDisrupt, scoreBasedReclamation.Class(), queue)
+			Expect(err).To(Succeed())
+			Expect(reclamationCandidates).To(HaveLen(2), "reclamation should consider the two empty nodes and exclude the non-empty compaction candidate")
 
 			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, fakeClock, env.Client, cloudProvider, recorder, scoreBased.Reason())
 			Expect(err).To(Succeed())
@@ -410,7 +446,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 
 			underutilizedPace := disruption.NewUnderutilizedConsolidationPace(env.Clock)
 			c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, underutilizedPace)
-			scoreBasedWithPace := disruption.NewScoreBasedConsolidation(c)
+			scoreBasedWithPace := disruption.NewScoreBasedReclamation(c)
 
 			nonEmptyCandidates, err := createScoreBasedCandidatesForPool(scoreBasedNodePool, mostExpensiveInstance)
 			Expect(err).To(BeNil())
@@ -453,7 +489,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			)
 			Expect(err).To(BeNil())
 
-			budgetMapping := map[string]int{scoreBasedNodePool.Name: 1}
+			budgetMapping := map[string]int{scoreBasedNodePool.Name: 0}
 			var cmds []disruption.Command
 			ExpectParallelized(
 				func() {
@@ -579,6 +615,31 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 type partialCommandMethod struct {
 	computeErr error
 }
+
+type controllerBoundaryMethod struct {
+	reason       v1.DisruptionReason
+	typeLabel    string
+	commandFirst bool
+	computeCalls int
+}
+
+func (*controllerBoundaryMethod) ShouldDisrupt(context.Context, *disruption.Candidate) bool {
+	return true
+}
+
+func (m *controllerBoundaryMethod) ComputeCommands(_ context.Context, _ map[string]int, candidates ...*disruption.Candidate) ([]disruption.Command, error) {
+	m.computeCalls++
+	if m.commandFirst && m.computeCalls == 1 {
+		return []disruption.Command{{Action: disruption.DeleteAction, Candidates: []*disruption.Candidate{candidates[0]}}}, nil
+	}
+	return nil, nil
+}
+
+func (m *controllerBoundaryMethod) Reason() v1.DisruptionReason { return m.reason }
+
+func (*controllerBoundaryMethod) Class() string { return disruption.GracefulDisruptionClass }
+
+func (m *controllerBoundaryMethod) ConsolidationType() string { return m.typeLabel }
 
 func (m partialCommandMethod) ShouldDisrupt(context.Context, *disruption.Candidate) bool {
 	return true

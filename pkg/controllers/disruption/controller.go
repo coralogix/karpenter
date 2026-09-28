@@ -128,13 +128,15 @@ func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Clien
 	return []Method{
 		// Delete empty nodes across all consolidation policies (WhenEmpty, WhenEmptyOrUnderutilized, Balanced).
 		NewEmptiness(c),
+		// Reclaim empty capacity in NodePools that opt in to score-based consolidation.
+		NewScoreBasedReclamation(c),
 		// Terminate and create replacement for drifted NodeClaims in Static NodePool
 		NewStaticDrift(cluster, provisioner, cp),
 		// Terminate any NodeClaims that have drifted from provisioning specifications, allowing the pods to reschedule.
 		NewDrift(kubeClient, cluster, provisioner, recorder, clk),
 		// Attempt to identify multiple NodeClaims that we can consolidate simultaneously to reduce pod churn
 		NewMultiNodeConsolidation(c),
-		// Score-based consolidation for NodePools that opt in via annotation.
+		// Compact non-empty nodes in NodePools that opt in via annotation.
 		NewScoreBasedConsolidation(c),
 		// And finally fall back our single NodeClaim consolidation to further reduce cluster cost.
 		NewSingleNodeConsolidation(c),
@@ -275,10 +277,10 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 
 	// If there are no candidates, move to the next disruption
 	if len(candidates) == 0 {
-		// The score-based method normally refreshes its inventory while computing reclamation.
+		// Reclamation normally refreshes its inventory while computing commands.
 		// Refresh here as well because this controller skips ComputeCommands when there are no
 		// candidates, but configured pools must still publish zero-valued inventory series.
-		if scoreBased, ok := disruption.(*ScoreBasedConsolidation); ok {
+		if scoreBased, ok := disruption.(*ScoreBasedReclamation); ok {
 			if _, err := scoreBased.emptyReclamationNodeCounts(ctx); err != nil {
 				return false, fmt.Errorf("updating score-based reclamation inventory, %w", err)
 			}
@@ -289,7 +291,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 	if setter, ok := disruption.(NodePoolTotalsSetter); ok {
 		setter.SetNodePoolTotals(nodePoolTotals)
 	}
-	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, c.recorder, disruption.Reason())
+	disruptionBudgetMapping, err := c.budgetMappingForMethod(ctx, disruption)
 	if err != nil {
 		return false, fmt.Errorf("building disruption budgets, %w", err)
 	}
@@ -316,6 +318,13 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		return started > 0, err
 	}
 	return started > 0, nil
+}
+
+func (c *Controller) budgetMappingForMethod(ctx context.Context, disruption Method) (map[string]int, error) {
+	if _, budgetExempt := disruption.(*ScoreBasedReclamation); budgetExempt {
+		return map[string]int{}, nil
+	}
+	return BuildDisruptionBudgetMapping(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, c.recorder, disruption.Reason())
 }
 
 func (c *Controller) startCommands(ctx context.Context, disruption Method, cmds []Command) (int, error) {

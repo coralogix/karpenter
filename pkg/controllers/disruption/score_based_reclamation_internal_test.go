@@ -80,9 +80,9 @@ func TestScoreBasedReclamationEmptyNodeMetricsIncludeAllConfiguredPools(t *testi
 		}
 	}
 	consolidation := MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
-	scoreBased := &ScoreBasedConsolidation{consolidation: consolidation}
+	reclamation := NewScoreBasedReclamation(consolidation)
 
-	dueCounts, err := scoreBased.emptyReclamationNodeCounts(ctx)
+	dueCounts, err := reclamation.emptyReclamationNodeCounts(ctx)
 	if err != nil {
 		t.Fatalf("emptyReclamationNodeCounts() error = %v", err)
 	}
@@ -129,8 +129,8 @@ func TestScoreBasedReclamationEmptyNodeMetricsKeepLastCompleteScanAndRemoveOutOf
 		t.Fatal(err)
 	}
 	consolidation := MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
-	scoreBased := &ScoreBasedConsolidation{consolidation: consolidation}
-	if _, err := scoreBased.emptyReclamationNodeCounts(ctx); err != nil {
+	reclamation := NewScoreBasedReclamation(consolidation)
+	if _, err := reclamation.emptyReclamationNodeCounts(ctx); err != nil {
 		t.Fatalf("initial emptyReclamationNodeCounts() error = %v", err)
 	}
 	assertScoreBasedEmptyNodeMetric(t, "old-pool", scoreBasedEmptyNodeStateOther, 1, true)
@@ -154,15 +154,15 @@ func TestScoreBasedReclamationEmptyNodeMetricsKeepLastCompleteScanAndRemoveOutOf
 		t.Fatal(err)
 	}
 
-	scoreBased.kubeClient = errorOnPodListClient{Client: kubeClient, err: errors.New("pod list failed")}
-	if _, err := scoreBased.emptyReclamationNodeCounts(ctx); err == nil {
+	reclamation.kubeClient = errorOnPodListClient{Client: kubeClient, err: errors.New("pod list failed")}
+	if _, err := reclamation.emptyReclamationNodeCounts(ctx); err == nil {
 		t.Fatal("emptyReclamationNodeCounts() error = nil, want pod-list error")
 	}
 	assertScoreBasedEmptyNodeMetric(t, "old-pool", scoreBasedEmptyNodeStateOther, 1, true)
 	assertScoreBasedEmptyNodeMetric(t, "new-pool", scoreBasedEmptyNodeStateOther, 0, false)
 
-	scoreBased.kubeClient = kubeClient
-	if _, err := scoreBased.emptyReclamationNodeCounts(ctx); err != nil {
+	reclamation.kubeClient = kubeClient
+	if _, err := reclamation.emptyReclamationNodeCounts(ctx); err != nil {
 		t.Fatalf("complete emptyReclamationNodeCounts() error = %v", err)
 	}
 	assertScoreBasedEmptyNodeMetric(t, "old-pool", scoreBasedEmptyNodeStateOther, 0, false)
@@ -497,9 +497,9 @@ func TestReclamationDeleteSuccessPersistsNodePoolTimestamp(t *testing.T) {
 	nodePool := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "score-pool"}}
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(nodePool).Build()
 	consolidation := MakeConsolidation(clocktesting.NewFakeClock(now), nil, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
-	scoreBased := &ScoreBasedConsolidation{consolidation: consolidation}
+	reclamation := NewScoreBasedReclamation(consolidation)
 	candidate := &Candidate{NodePool: nodePool}
-	if err := scoreBased.reclamationDeleteSucceeded(ctx, candidate); err != nil {
+	if err := reclamation.reclamationDeleteSucceeded(ctx, candidate); err != nil {
 		t.Fatalf("reclamationDeleteSucceeded() error = %v", err)
 	}
 	stored := &v1.NodePool{}
@@ -546,12 +546,12 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 	clk := clocktesting.NewFakeClock(now)
 	cluster := state.NewCluster(clk, kubeClient, nil)
 	consolidation := MakeConsolidation(clk, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
-	scoreBased := &ScoreBasedConsolidation{consolidation: consolidation}
+	reclamation := NewScoreBasedReclamation(consolidation)
 	stateNode := state.NewNode()
 	stateNode.Node = node
 	stateNode.NodeClaim = nodeClaim
 	candidate := &Candidate{StateNode: stateNode, NodePool: nodePool}
-	beforeDelete := scoreBased.reclamationBeforeDelete([]*Candidate{candidate})
+	beforeDelete := reclamation.reclamationBeforeDelete([]*Candidate{candidate})
 	if err := beforeDelete(ctx); err != nil {
 		t.Fatalf("BeforeDelete() error for an empty node = %v", err)
 	}

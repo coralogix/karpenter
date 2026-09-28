@@ -18,7 +18,7 @@ The intended benefits are clearer compaction objectives, reuse of already runnin
 
 Compaction completes by handing over an empty, tainted node. It does not decide whether that node should subsequently be removed, reactivated, or retained.
 
-**Reclamation** decides only whether to keep empty nodes or remove them. It runs as part of score-based consolidation, taking precedence over normal compaction in a pool with due empty capacity. Reclamation is exempt from NodePool disruption budgets, but preserves candidate eligibility checks and rechecks live emptiness and activation before deletion. Reclamation never activates nodes.
+**Reclamation** decides only whether to keep empty nodes or remove them. For opted-in NodePools, a standalone `ScoreBasedReclamation` method runs immediately after upstream `Emptiness`, before drift and multi-node consolidation. It reports reason `Empty` and is exempt from NodePool disruption budgets, while preserving candidate eligibility checks and rechecking live emptiness and activation before deletion. Reclamation never activates nodes.
 
 **Provisioning and compaction** own activation. When they need capacity, they can untaint suitable standby nodes instead of launching new instances. Provisioning's scheduling simulation should consider standby capacity so activation and new capacity creation form one coordinated decision. Compatibility with pod requirements still matters.
 
@@ -27,12 +27,12 @@ Compaction completes by handing over an empty, tainted node. It does not decide 
 For each score-based NodePool:
 
 1. Check whether more than the configured interval has elapsed since its last successful reclamation. The default interval is one minute. Configure it with the NodePool annotation `karpenter.coralogix.net/reclamation-interval`, using Go duration syntax such as `90s` or `5m`; missing, invalid, and non-positive values use the one-minute default. The elapsed-time comparison is strict, so exactly one minute is not yet due.
-2. If reclamation is due and there are currently empty nodes, perform reclamation instead of normal score-based compaction for that pool in this pass.
+2. If reclamation is due and there are currently empty nodes, the reclamation method returns a command. The controller starts it and requeues at the normal method boundary, then retries from the top; score-based compaction can run on a later pass. The reclamation decision does not wait for drift or multi-node consolidation calculations.
 3. Count all currently empty nodes, including tainted standby nodes and naturally empty active nodes. Reclaim `ceil(emptyNodeCount / 2)` eligible candidates without clipping the batch to the NodePool disruption budget.
 4. Prioritize nodes with the highest cost per vCPU. The reclamation quantity is based on node count, not summed CPU or memory capacity.
 5. Persist the last successful reclamation timestamp per NodePool in `karpenter.coralogix.net/last-reclamation` as RFC3339Nano so restarts do not accelerate reclamation.
 
-If reclamation is not due, proceed with normal score-based compaction. If there are no empty nodes, proceed with normal compaction without resetting the reclamation timestamp.
+If reclamation returns no command, the controller proceeds through its remaining methods in the same pass. Score-based compaction remains after multi-node consolidation. If there are no empty nodes, reclamation does not reset its timestamp.
 
 Rounding is upward: three empty nodes means reclaiming two; a solitary empty node is reclaimed on the next eligible pass. This is a periodic pool-wide decision, not a minimum standby lifetime for each node, so recently emptied nodes are eligible too. More sophisticated capacity accounting is deferred.
 
@@ -71,14 +71,15 @@ Cancellation within a running process must also stop queued eviction work before
 
 ## Integration with the current implementation
 
-The existing consolidation method framework supports both compaction and reclamation decisions. Reclamation is part of the score-based consolidation path, with due reclamation taking precedence over normal compaction for the affected pool. Execution uses an explicit evacuation action that does not delete the source NodeClaim afterward. Other consolidation paths preserve their existing behavior.
+The consolidation method framework runs `ScoreBasedReclamation` immediately after upstream `Emptiness`; `ScoreBasedConsolidation` later handles only non-empty compaction. A reclamation command uses disruption reason `Empty` and a validation path exempt from NodePool disruption budgets. Compaction continues to use reason `Underutilized`, with its existing budget and pacing checks. Execution uses an explicit evacuation action that does not delete the source NodeClaim afterward. Other consolidation paths preserve their existing behavior.
 
 Relevant areas are:
 
 - `pkg/controllers/disruption/types.go`: command actions currently infer deletion or replacement from candidates and replacements.
 - `pkg/controllers/disruption/queue.go`: orchestration currently waits for replacement initialization, then deletes source NodeClaims; source deletion bookkeeping also needs adjustment.
 - `pkg/controllers/disruption/controller.go`: stale disruption cleanup needs to preserve intentional standby state.
-- `pkg/controllers/disruption/score_based_consolidation.go`: reclamation timing, empty-node selection, and precedence over normal compaction for score-based pools.
+- `pkg/controllers/disruption/score_based_reclamation.go`: reclamation timing, empty-node selection, and budget-exempt validation for score-based pools.
+- `pkg/controllers/disruption/score_based_consolidation.go`: score-guided compaction of non-empty nodes.
 - `pkg/controllers/disruption/emptiness.go`: existing empty-node reclamation behavior for other pools remains unchanged.
 - `pkg/controllers/node/termination/terminator/`: reusable eviction machinery, with evacuation semantics separated from full termination.
 - Provisioning and scheduling state: recognize standby capacity and coordinate its activation with new capacity creation.
@@ -91,7 +92,7 @@ Relevant areas are:
 - Persist the reclamation timestamp after each successful individual deletion. A partial batch therefore records progress; empty passes and failed deletions do not reset the timestamp.
 - Rank reclamation candidates by instance price per vCPU, with a stable node-name tie-breaker and ineligible nodes excluded from the batch.
 - Keep compaction scores independent of individual reclamation decisions while evaluating the combined economic behavior. Evacuating a node creates an opportunity to save money; savings are realized when capacity is reclaimed.
-- Preserve precedence with drift, expiration, interruption, and other termination paths. The separation discussed here concerns consolidation, not a requirement that every node reclamation wait for compaction.
+- Run score-based reclamation before drift and multi-node consolidation calculations. Once a reclamation command starts, the controller requeues at the normal method boundary; score-based compaction is reconsidered on a later pass. Drift, expiration, interruption, and other termination paths retain their own method semantics.
 
 ## Scope and AWS provider implications
 

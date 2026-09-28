@@ -22,6 +22,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/awslabs/operatorpkg/option"
+	"go.opentelemetry.io/otel/attribute"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -31,6 +33,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
@@ -40,29 +43,95 @@ import (
 
 const defaultScoreBasedReclamationInterval = time.Minute
 
+const (
+	scoreBasedReclamationSpan = "karpenter.disruption.score_based_reclamation"
+	ScoreBasedReclamationType = "score-based-reclamation"
+)
+
 // ExperimentalReclamationRemoveAllEmptyImmediately is a temporary policy until reclamation pacing
 // is finalized. When true, every configured pool with empty capacity is eligible on each pass and
 // all eligible empty nodes are reclaimed (no half-batch or interval gate).
 const ExperimentalReclamationRemoveAllEmptyImmediately = true
 
+type ScoreBasedReclamation struct {
+	consolidation
+	validator Validator
+}
+
+func NewScoreBasedReclamation(c consolidation, opts ...option.Function[MethodOptions]) *ScoreBasedReclamation {
+	o := option.Resolve(append([]option.Function[MethodOptions]{WithValidator(NewScoreBasedReclamationValidator(c))}, opts...)...)
+	return &ScoreBasedReclamation{
+		consolidation: c,
+		validator:     o.validator,
+	}
+}
+
+func NewScoreBasedReclamationValidator(c consolidation) *scoreBasedReclamationValidator {
+	s := &ScoreBasedReclamation{consolidation: c}
+	return &scoreBasedReclamationValidator{
+		validation: validation{
+			clock:         c.clock,
+			cluster:       c.cluster,
+			kubeClient:    c.kubeClient,
+			provisioner:   c.provisioner,
+			cloudProvider: c.cloudProvider,
+			recorder:      c.recorder,
+			queue:         c.queue,
+			reason:        v1.DisruptionReasonEmpty,
+		},
+		filter:         s.ShouldDisrupt,
+		validationType: ScoreBasedReclamationType,
+	}
+}
+
+func (s *ScoreBasedReclamation) ShouldDisrupt(ctx context.Context, candidate *Candidate) bool {
+	return s.isReclamationCandidateAvailable(ctx, candidate)
+}
+
+func (s *ScoreBasedReclamation) ComputeCommands(ctx context.Context, _ map[string]int, candidates ...*Candidate) ([]Command, error) {
+	ctx, end := cxtracing.Start(ctx, scoreBasedReclamationSpan,
+		attribute.Int("candidate_count", len(candidates)),
+	)
+	defer end()
+
+	cmd, err := s.computeReclamationCommand(ctx, candidates)
+	if err != nil {
+		return []Command{}, err
+	}
+	if cmd == nil {
+		return []Command{}, nil
+	}
+	return []Command{*cmd}, nil
+}
+
+func (s *ScoreBasedReclamation) Reason() v1.DisruptionReason {
+	return v1.DisruptionReasonEmpty
+}
+
+func (s *ScoreBasedReclamation) Class() string {
+	return GracefulDisruptionClass
+}
+
+func (s *ScoreBasedReclamation) ConsolidationType() string {
+	return ScoreBasedReclamationType
+}
+
 // computeReclamationCommand chooses empty candidates for removal without applying NodePool
-// disruption budgets. It returns pools whose due empty capacity takes precedence over compaction,
-// including when no candidates are currently eligible for removal.
-func (s *ScoreBasedConsolidation) computeReclamationCommand(ctx context.Context, candidates []*Candidate) (*Command, map[string]bool, error) {
+// disruption budgets. Reclamation runs as its own method before score-based compaction.
+func (s *ScoreBasedReclamation) computeReclamationCommand(ctx context.Context, candidates []*Candidate) (*Command, error) {
 	emptyCounts, err := s.emptyReclamationNodeCounts(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	now := s.clock.Now()
-	reclamationPools := reclamationPoolsWithEmptyNodes(emptyCounts)
 	byPool := s.reclamationCandidatesByPool(ctx, candidates, now)
 	if len(byPool) == 0 {
-		return nil, reclamationPools, nil
+		return nil, nil
 	}
 
 	selected := selectReclamationCandidates(byPool, emptyCounts)
 	if len(selected) == 0 {
-		return nil, reclamationPools, nil
+		return nil, nil
 	}
 
 	cmd := Command{
@@ -73,13 +142,13 @@ func (s *ScoreBasedConsolidation) computeReclamationCommand(ctx context.Context,
 	cmd.BeforeDelete = s.reclamationBeforeDelete(selected)
 	cmd.OnDeleteSuccess = s.reclamationDeleteSucceeded
 
-	validated, pools, err := s.validateReclamationCommand(ctx, cmd, reclamationPools, now)
+	validated, err := s.validateReclamationCommand(ctx, cmd, now)
 	if err != nil || validated == nil {
-		return validated, pools, err
+		return validated, err
 	}
 	validated.OnSuccess = reclamationBatchSucceeded(validated.Candidates)
 	logReclamationBatchSelected(ctx, validated.Candidates)
-	return validated, pools, nil
+	return validated, nil
 }
 
 func reclamationBatchSucceeded(candidates []*Candidate) func(context.Context) error {
@@ -110,17 +179,7 @@ func reclamationCandidateCounts(candidates []*Candidate) map[string]int {
 	return counts
 }
 
-func reclamationPoolsWithEmptyNodes(emptyCounts map[string]int) map[string]bool {
-	reclamationPools := map[string]bool{}
-	for name, count := range emptyCounts {
-		if count > 0 {
-			reclamationPools[name] = true
-		}
-	}
-	return reclamationPools
-}
-
-func (s *ScoreBasedConsolidation) reclamationCandidatesByPool(ctx context.Context, candidates []*Candidate, now time.Time) map[string][]*Candidate {
+func (s *ScoreBasedReclamation) reclamationCandidatesByPool(ctx context.Context, candidates []*Candidate, now time.Time) map[string][]*Candidate {
 	byPool := map[string][]*Candidate{}
 	for _, candidate := range candidates {
 		if candidate == nil || candidate.NodePool == nil || !scoreBasedReclamationDue(candidate.NodePool, now) {
@@ -154,31 +213,31 @@ func selectReclamationCandidates(byPool map[string][]*Candidate, emptyCounts map
 	return selected
 }
 
-func (s *ScoreBasedConsolidation) validateReclamationCommand(ctx context.Context, cmd Command, reclamationPools map[string]bool, started time.Time) (*Command, map[string]bool, error) {
+func (s *ScoreBasedReclamation) validateReclamationCommand(ctx context.Context, cmd Command, started time.Time) (*Command, error) {
 	// Re-fetch candidates after the usual consolidation TTL. Reclamation does not consume the
 	// NodePool disruption budget, but it still validates eligibility and current emptiness.
 	remainingValidationDelay := consolidationTTL - s.clock.Since(started)
 	if remainingValidationDelay > 0 {
 		select {
 		case <-ctx.Done():
-			return nil, reclamationPools, ctx.Err()
+			return nil, ctx.Err()
 		case <-s.clock.After(remainingValidationDelay):
 		}
 	}
-	validated, _, err := selectFirstStillValidCommand(ctx, s.reclamationValidator(), s.recorder, []*moveSetEvaluation{{Command: cmd, Score: 1}})
+	validated, _, err := selectFirstStillValidCommand(ctx, s.validator, s.recorder, []*moveSetEvaluation{{Command: cmd, Score: 1}})
 	if err != nil {
-		return nil, reclamationPools, err
+		return nil, err
 	}
 	if len(validated.Candidates) == 0 {
-		return nil, reclamationPools, nil
+		return nil, nil
 	}
-	return &validated, reclamationPools, nil
+	return &validated, nil
 }
 
 // emptyReclamationNodeCounts counts managed, non-terminating empty nodes in configured score-based
 // pools. It returns due-pool counts for reclamation selection and publishes inventory counts for all
 // configured pools, regardless of reclamation cadence.
-func (s *ScoreBasedConsolidation) emptyReclamationNodeCounts(ctx context.Context) (map[string]int, error) {
+func (s *ScoreBasedReclamation) emptyReclamationNodeCounts(ctx context.Context) (map[string]int, error) {
 	nodePools, inventoryCounts, err := s.scoreBasedReclamationPools(ctx)
 	if err != nil {
 		return nil, err
@@ -203,7 +262,7 @@ func (s *ScoreBasedConsolidation) emptyReclamationNodeCounts(ctx context.Context
 	return dueCounts, nil
 }
 
-func (s *ScoreBasedConsolidation) scoreBasedReclamationPools(ctx context.Context) (map[string]*v1.NodePool, map[string]scoreBasedEmptyNodeCounts, error) {
+func (s *ScoreBasedReclamation) scoreBasedReclamationPools(ctx context.Context) (map[string]*v1.NodePool, map[string]scoreBasedEmptyNodeCounts, error) {
 	var nodePoolList v1.NodePoolList
 	if err := s.kubeClient.List(ctx, &nodePoolList); err != nil {
 		return nil, nil, fmt.Errorf("listing NodePools for reclamation, %w", err)
@@ -221,7 +280,7 @@ func (s *ScoreBasedConsolidation) scoreBasedReclamationPools(ctx context.Context
 	return nodePools, inventoryCounts, nil
 }
 
-func (s *ScoreBasedConsolidation) emptyReclamationNodeInventory(ctx context.Context, node *state.StateNode, nodePools map[string]*v1.NodePool) (*v1.NodePool, string, bool, bool, error) {
+func (s *ScoreBasedReclamation) emptyReclamationNodeInventory(ctx context.Context, node *state.StateNode, nodePools map[string]*v1.NodePool) (*v1.NodePool, string, bool, bool, error) {
 	if node.NodeClaim == nil || node.Node == nil || node.MarkedForDeletion() {
 		return nil, "", false, false, nil
 	}
@@ -238,7 +297,7 @@ func (s *ScoreBasedConsolidation) emptyReclamationNodeInventory(ctx context.Cont
 	return nodePool, poolName, isStandby, empty, nil
 }
 
-func (s *ScoreBasedConsolidation) reclamationBeforeDelete(candidates []*Candidate) func(context.Context) error {
+func (s *ScoreBasedReclamation) reclamationBeforeDelete(candidates []*Candidate) func(context.Context) error {
 	return func(ctx context.Context) error {
 		for _, candidate := range candidates {
 			if err := s.reclamationCandidateBeforeDelete(ctx, candidate); err != nil {
@@ -249,7 +308,7 @@ func (s *ScoreBasedConsolidation) reclamationBeforeDelete(candidates []*Candidat
 	}
 }
 
-func (s *ScoreBasedConsolidation) reclamationCandidateBeforeDelete(ctx context.Context, candidate *Candidate) error {
+func (s *ScoreBasedReclamation) reclamationCandidateBeforeDelete(ctx context.Context, candidate *Candidate) error {
 	nodeClaim, exists, err := s.reclamationCandidateNodeClaim(ctx, candidate)
 	if err != nil || !exists {
 		return err
@@ -266,7 +325,7 @@ func (s *ScoreBasedConsolidation) reclamationCandidateBeforeDelete(ctx context.C
 	return s.reclamationNodeStillEmpty(ctx, candidate)
 }
 
-func (s *ScoreBasedConsolidation) reclamationCandidateNodeClaim(ctx context.Context, candidate *Candidate) (*v1.NodeClaim, bool, error) {
+func (s *ScoreBasedReclamation) reclamationCandidateNodeClaim(ctx context.Context, candidate *Candidate) (*v1.NodeClaim, bool, error) {
 	nodeClaim := &v1.NodeClaim{}
 	if err := s.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -280,7 +339,7 @@ func (s *ScoreBasedConsolidation) reclamationCandidateNodeClaim(ctx context.Cont
 	return nodeClaim, true, nil
 }
 
-func (s *ScoreBasedConsolidation) reclamationNodePoolStillManaged(ctx context.Context, nodePoolName string) error {
+func (s *ScoreBasedReclamation) reclamationNodePoolStillManaged(ctx context.Context, nodePoolName string) error {
 	nodePool := &v1.NodePool{}
 	if err := s.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -294,7 +353,7 @@ func (s *ScoreBasedConsolidation) reclamationNodePoolStillManaged(ctx context.Co
 	return nil
 }
 
-func (s *ScoreBasedConsolidation) reclamationNodeStillEmpty(ctx context.Context, candidate *Candidate) error {
+func (s *ScoreBasedReclamation) reclamationNodeStillEmpty(ctx context.Context, candidate *Candidate) error {
 	node := &corev1.Node{}
 	if err := s.kubeClient.Get(ctx, types.NamespacedName{Name: candidate.Node.Name}, node); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -318,7 +377,7 @@ func (s *ScoreBasedConsolidation) reclamationNodeStillEmpty(ctx context.Context,
 	return nil
 }
 
-func (s *ScoreBasedConsolidation) reclamationDeleteSucceeded(ctx context.Context, candidate *Candidate) error {
+func (s *ScoreBasedReclamation) reclamationDeleteSucceeded(ctx context.Context, candidate *Candidate) error {
 	if candidate == nil || candidate.NodePool == nil {
 		return fmt.Errorf("reclamation candidate is missing its NodePool")
 	}
@@ -329,7 +388,7 @@ func (s *ScoreBasedConsolidation) reclamationDeleteSucceeded(ctx context.Context
 	return nil
 }
 
-func (s *ScoreBasedConsolidation) updateLastReclamationRemoval(ctx context.Context, nodePoolName string) error {
+func (s *ScoreBasedReclamation) updateLastReclamationRemoval(ctx context.Context, nodePoolName string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		nodePool := &v1.NodePool{}
 		if err := s.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
@@ -451,7 +510,7 @@ func sortReclamationCandidates(candidates []*Candidate) {
 }
 
 // isReclamationCandidateAvailable filters candidates that have become unsafe to remove since candidate collection.
-func (s *ScoreBasedConsolidation) isReclamationCandidateAvailable(ctx context.Context, candidate *Candidate) bool {
+func (s *ScoreBasedReclamation) isReclamationCandidateAvailable(ctx context.Context, candidate *Candidate) bool {
 	if !s.reclamationCandidateEligible(candidate) {
 		return false
 	}
@@ -469,7 +528,7 @@ func (s *ScoreBasedConsolidation) isReclamationCandidateAvailable(ctx context.Co
 	return err == nil && empty
 }
 
-func (s *ScoreBasedConsolidation) reclamationCandidateEligible(candidate *Candidate) bool {
+func (s *ScoreBasedReclamation) reclamationCandidateEligible(candidate *Candidate) bool {
 	if candidate == nil || candidate.NodePool == nil || candidate.NodeClaim == nil || candidate.Node == nil {
 		return false
 	}

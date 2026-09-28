@@ -21,8 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"time"
-
-	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
 // scoreBasedReclamationValidator refreshes and rechecks empty-node candidates without applying
@@ -32,23 +30,6 @@ type scoreBasedReclamationValidator struct {
 	validation
 	filter         CandidateFilter
 	validationType string
-}
-
-func (s *ScoreBasedConsolidation) reclamationValidator() *scoreBasedReclamationValidator {
-	return &scoreBasedReclamationValidator{
-		validation: validation{
-			clock:         s.clock,
-			cluster:       s.cluster,
-			kubeClient:    s.kubeClient,
-			provisioner:   s.provisioner,
-			cloudProvider: s.cloudProvider,
-			recorder:      s.recorder,
-			queue:         s.queue,
-			reason:        v1.DisruptionReasonUnderutilized,
-		},
-		filter:         s.ShouldReclaim,
-		validationType: s.ConsolidationType(),
-	}
 }
 
 func (s *scoreBasedReclamationValidator) Validate(ctx context.Context, cmd Command, validationPeriod time.Duration) (Command, error) {
@@ -89,10 +70,4 @@ func (s *scoreBasedReclamationValidator) validateCandidates(ctx context.Context,
 		}
 	}
 	return validatedCandidates, nil
-}
-
-// ShouldReclaim is deliberately separate from the combined score-based candidate predicate.
-// It admits only currently due, empty, eligible candidates and never consults disruption budgets.
-func (s *ScoreBasedConsolidation) ShouldReclaim(ctx context.Context, candidate *Candidate) bool {
-	return s.isReclamationCandidateAvailable(ctx, candidate)
 }
