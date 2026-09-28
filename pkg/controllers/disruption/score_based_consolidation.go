@@ -336,7 +336,7 @@ func evaluateMoveSet(ctx context.Context, moveSet moveSet, compute consolidation
 	}
 	return &moveSetEvaluation{
 		Command: cmd,
-		Score:   moveSetPriorityScore(moveSet),
+		Score:   moveSetPriorityScore(cmd),
 	}
 }
 
@@ -357,16 +357,6 @@ func collectMoveSetEvaluations(valid <-chan rill.Try[*moveSetEvaluation], limit 
 		evals = evals[:limit]
 	}
 	return evals, nil
-}
-
-func moveSetPriorityScore(moveSet moveSet) float64 {
-	var maxScore float64
-	for _, node := range moveSet.Nodes {
-		if score := nodePriorityScore(node); score > maxScore {
-			maxScore = score
-		}
-	}
-	return maxScore
 }
 
 func selectFirstStillValidCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation) (Command, int, error) {

@@ -144,3 +144,55 @@ func TestNodePriorityScore(t *testing.T) {
 		t.Fatalf("loaded workload: nodePriorityScore() = %v, want %v", got, want)
 	}
 }
+
+func TestScoreBasedUtilisationWeight(t *testing.T) {
+	if got := scoreBasedUtilisationWeight(nil); got != defaultScoreBasedUtilisationWeightMilliPerVCPUHour {
+		t.Fatalf("nil NodePool weight = %v, want %v", got, defaultScoreBasedUtilisationWeightMilliPerVCPUHour)
+	}
+	np := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+		v1.ScoreBasedUtilisationWeightAnnotationKey: "2.5",
+	}}}
+	if got := scoreBasedUtilisationWeight(np); got != 2.5 {
+		t.Fatalf("custom weight = %v, want 2.5", got)
+	}
+	np.Annotations[v1.ScoreBasedUtilisationWeightAnnotationKey] = "bad"
+	if got := scoreBasedUtilisationWeight(np); got != defaultScoreBasedUtilisationWeightMilliPerVCPUHour {
+		t.Fatalf("invalid weight = %v, want default %v", got, defaultScoreBasedUtilisationWeightMilliPerVCPUHour)
+	}
+}
+
+func TestMoveSetCostEfficiencyMilliPerVCPUHour(t *testing.T) {
+	offering := &cloudprovider.Offering{
+		Price: 0.12,
+		Requirements: scheduling.NewLabelRequirements(map[string]string{
+			v1.CapacityTypeLabelKey:  v1.CapacityTypeOnDemand,
+			corev1.LabelTopologyZone: "us-east-1a",
+		}),
+	}
+	instanceType := &cloudprovider.InstanceType{
+		Name: "m5.large",
+		Capacity: corev1.ResourceList{
+			corev1.ResourceCPU: resource.MustParse("4"),
+		},
+		Offerings: cloudprovider.Offerings{offering},
+	}
+	node := state.NewNode()
+	node.Node = &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-1",
+			Labels: map[string]string{
+				corev1.LabelInstanceTypeStable: instanceType.Name,
+				v1.CapacityTypeLabelKey:        offering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+				corev1.LabelTopologyZone:       offering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+			},
+		},
+	}
+	candidate := &Candidate{
+		StateNode:    node,
+		instanceType: instanceType,
+	}
+	cmd := Command{Candidates: []*Candidate{candidate}}
+	if got := moveSetCostEfficiencyMilliPerVCPUHour(cmd); got != 30 {
+		t.Fatalf("cost efficiency = %v, want 30 m$/vCPU/h", got)
+	}
+}

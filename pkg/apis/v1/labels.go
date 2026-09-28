@@ -65,6 +65,9 @@ const (
 	ScoreBasedReclamationIntervalAnnotationKey = "karpenter.coralogix.net/reclamation-interval"
 	// ScoreBasedLastReclamationAnnotationKey stores the RFC3339Nano time of the last successful empty-node reclamation.
 	ScoreBasedLastReclamationAnnotationKey = "karpenter.coralogix.net/last-reclamation"
+	// ScoreBasedUtilisationWeightAnnotationKey weights the CPU slack term in move-set priority scoring.
+	// Values are in millidollars per vCPU-hour (m$/vCPU/h); invalid or non-positive values use the default of 1.
+	ScoreBasedUtilisationWeightAnnotationKey = "karpenter.coralogix.net/utilisation-weight"
 )
 
 // Karpenter specific finalizers

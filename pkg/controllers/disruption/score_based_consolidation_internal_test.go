@@ -26,6 +26,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 
@@ -222,11 +223,13 @@ func TestMoveSetPriorityScore(t *testing.T) {
 	lowPriceCandidate := candidateWithPrice(t, 0.10)
 	highPriceCandidate := candidateWithPrice(t, 0.50)
 
-	if got := moveSetPriorityScore(moveSet{Nodes: []*Candidate{lowPriceCandidate}}); got != 0.10 {
-		t.Fatalf("single-node move set score = %v, want 0.10", got)
+	lowCmd := Command{Candidates: []*Candidate{lowPriceCandidate}}
+	if got := moveSetPriorityScore(lowCmd); got != 51 {
+		t.Fatalf("single-node move set score = %v, want 51", got)
 	}
-	if got := moveSetPriorityScore(moveSet{Nodes: []*Candidate{lowPriceCandidate, highPriceCandidate}}); got != 0.50 {
-		t.Fatalf("multi-node move set score = %v, want 0.50", got)
+	multiCmd := Command{Candidates: []*Candidate{lowPriceCandidate, highPriceCandidate}}
+	if got := moveSetPriorityScore(multiCmd); got != 152 {
+		t.Fatalf("multi-node move set score = %v, want 152", got)
 	}
 }
 
@@ -481,7 +484,10 @@ func candidateWithPrice(t *testing.T, price float64) *Candidate {
 		}),
 	}
 	instanceType := &cloudprovider.InstanceType{
-		Name:      "m5.large",
+		Name: "m5.large",
+		Capacity: corev1.ResourceList{
+			corev1.ResourceCPU: resource.MustParse("2"),
+		},
 		Offerings: cloudprovider.Offerings{offering},
 	}
 	node := state.NewNode()
