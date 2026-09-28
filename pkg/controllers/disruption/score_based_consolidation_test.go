@@ -99,7 +99,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 	})
 
 	Context("Reclamation", func() {
-		It("should reclaim the rounded-up half despite zero or one NodePool budget", func() {
+		It("should reclaim all empty nodes despite zero or one NodePool budget", func() {
 			scoreBasedNodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
 			budgetOneNodePool := test.NodePool(v1.NodePool{
 				ObjectMeta: metav1.ObjectMeta{
@@ -169,13 +169,13 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Expect(commands).To(HaveLen(1))
 			Expect(commands[0].Decision()).To(Equal(disruption.DeleteDecision))
 			Expect(commands[0].Action).To(Equal(disruption.DeleteAction))
-			Expect(commands[0].Candidates).To(HaveLen(4))
+			Expect(commands[0].Candidates).To(HaveLen(6))
 			selectedByPool := map[string][]*disruption.Candidate{}
 			for _, candidate := range commands[0].Candidates {
 				selectedByPool[candidate.NodePool.Name] = append(selectedByPool[candidate.NodePool.Name], candidate)
 			}
-			Expect(selectedByPool[scoreBasedNodePool.Name]).To(HaveLen(2))
-			Expect(selectedByPool[budgetOneNodePool.Name]).To(HaveLen(2))
+			Expect(selectedByPool[scoreBasedNodePool.Name]).To(HaveLen(3))
+			Expect(selectedByPool[budgetOneNodePool.Name]).To(HaveLen(3))
 			expectedHigherCostPerVCPU := mostExpensiveInstance
 			mostExpensiveCPU := mostExpensiveInstance.Capacity[corev1.ResourceCPU]
 			leastExpensiveCPU := leastExpensiveInstance.Capacity[corev1.ResourceCPU]
@@ -330,6 +330,9 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 		})
 
 		It("should compact only a feasible non-empty node when reclamation is not due", func() {
+			if disruption.ExperimentalReclamationRemoveAllEmptyImmediately {
+				Skip("interval gating is disabled while experimental immediate reclamation is enabled")
+			}
 			scoreBasedNodePool.Annotations[v1.ScoreBasedLastReclamationAnnotationKey] = fakeClock.Now().Add(-30 * time.Second).Format(time.RFC3339Nano)
 			ExpectApplied(ctx, env.Client, scoreBasedNodePool)
 

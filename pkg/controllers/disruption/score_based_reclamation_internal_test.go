@@ -89,7 +89,11 @@ func TestScoreBasedReclamationEmptyNodeMetricsIncludeAllConfiguredPools(t *testi
 	if dueCounts["due-pool"] != 2 {
 		t.Fatalf("due-pool empty count = %d, want 2", dueCounts["due-pool"])
 	}
-	if _, ok := dueCounts["not-due-pool"]; ok {
+	if ExperimentalReclamationRemoveAllEmptyImmediately {
+		if dueCounts["not-due-pool"] != 1 {
+			t.Fatalf("not-due-pool empty count = %d, want 1 while experimental immediate reclamation is enabled", dueCounts["not-due-pool"])
+		}
+	} else if _, ok := dueCounts["not-due-pool"]; ok {
 		t.Fatal("non-due pool should not be included in reclamation selection counts")
 	}
 	assertScoreBasedEmptyNodeMetric(t, "due-pool", scoreBasedEmptyNodeStateStandby, 1, true)
@@ -258,6 +262,9 @@ func resetScoreBasedEmptyNodeMetricForTest() {
 }
 
 func TestScoreBasedReclamationDueUsesConfiguredInterval(t *testing.T) {
+	if ExperimentalReclamationRemoveAllEmptyImmediately {
+		t.Skip("interval gating is disabled while experimental immediate reclamation is enabled")
+	}
 	now := time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC)
 	nodePool := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{
 		Name: "score-pool",
@@ -358,6 +365,9 @@ func TestScoreBasedReclamationIgnoresConsolidateAfter(t *testing.T) {
 }
 
 func TestReclamationRemovalCountRoundsUp(t *testing.T) {
+	if ExperimentalReclamationRemoveAllEmptyImmediately {
+		t.Skip("half-batch sizing is disabled while experimental immediate reclamation is enabled")
+	}
 	for count, want := range map[int]int{0: 0, 1: 1, 2: 1, 3: 2, 4: 2, 5: 3} {
 		if got := reclamationRemovalCount(count); got != want {
 			t.Errorf("reclamationRemovalCount(%d) = %d, want %d", count, got, want)

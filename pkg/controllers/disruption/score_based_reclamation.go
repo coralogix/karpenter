@@ -39,9 +39,14 @@ import (
 
 const defaultScoreBasedReclamationInterval = time.Minute
 
-// computeReclamationCommand chooses a pool-wide half-batch of empty candidates without applying
-// NodePool disruption budgets. It returns pools whose due empty capacity takes precedence over
-// compaction, including when no candidates are currently eligible for removal.
+// ExperimentalReclamationRemoveAllEmptyImmediately is a temporary policy until reclamation pacing
+// is finalized. When true, every configured pool with empty capacity is eligible on each pass and
+// all eligible empty nodes are reclaimed (no half-batch or interval gate).
+const ExperimentalReclamationRemoveAllEmptyImmediately = true
+
+// computeReclamationCommand chooses empty candidates for removal without applying NodePool
+// disruption budgets. It returns pools whose due empty capacity takes precedence over compaction,
+// including when no candidates are currently eligible for removal.
 func (s *ScoreBasedConsolidation) computeReclamationCommand(ctx context.Context, candidates []*Candidate) (*Command, map[string]bool, error) {
 	emptyCounts, err := s.emptyReclamationNodeCounts(ctx)
 	if err != nil {
@@ -350,6 +355,13 @@ func scoreBasedReclamationDue(nodePool *v1.NodePool, now time.Time) bool {
 	if !scoreBasedReclamationConfigured(nodePool) {
 		return false
 	}
+	if ExperimentalReclamationRemoveAllEmptyImmediately {
+		return true
+	}
+	return scoreBasedReclamationDueByInterval(nodePool, now)
+}
+
+func scoreBasedReclamationDueByInterval(nodePool *v1.NodePool, now time.Time) bool {
 	interval := scoreBasedReclamationInterval(nodePool)
 	lastRemoval := nodePool.Annotations[v1.ScoreBasedLastReclamationAnnotationKey]
 	if lastRemoval == "" {
@@ -403,8 +415,11 @@ func reclamationEmpty(ctx context.Context, kubeClient client.Client, node *corev
 	return true, nil
 }
 
-// reclamationRemovalCount rounds the pool-wide half-batch upward.
 func reclamationRemovalCount(emptyNodeCount int) int {
+	if ExperimentalReclamationRemoveAllEmptyImmediately {
+		return emptyNodeCount
+	}
+	// Rounds the pool-wide half-batch upward.
 	return (emptyNodeCount + 1) / 2
 }
 
