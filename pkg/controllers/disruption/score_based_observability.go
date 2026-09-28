@@ -46,9 +46,9 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: voluntaryDisruptionSubsystem,
 			Name:      "score_based_reclamation_node_removals_total",
-			Help:      "Number of NodeClaim deletion requests successfully processed by score-based reclamation.",
+			Help:      "Number of NodeClaim deletion requests successfully processed by score-based reclamation. Labeled by nodepool.",
 		},
-		[]string{},
+		[]string{metrics.NodePoolLabel},
 	)
 )
 

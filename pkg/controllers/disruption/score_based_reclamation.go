@@ -31,6 +31,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -324,7 +325,7 @@ func (s *ScoreBasedConsolidation) reclamationDeleteSucceeded(ctx context.Context
 	if err := s.updateLastReclamationRemoval(ctx, candidate.NodePool.Name); err != nil {
 		return err
 	}
-	ScoreBasedReclamationNodeRemovalsTotal.Inc(nil)
+	ScoreBasedReclamationNodeRemovalsTotal.Inc(map[string]string{metrics.NodePoolLabel: candidate.NodePool.Name})
 	return nil
 }
 
