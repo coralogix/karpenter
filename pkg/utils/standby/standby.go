@@ -24,10 +24,19 @@ import (
 )
 
 const (
-	NodeClaimAnnotationKey           = "karpenter.coralogix.net/standby"
-	NodeClaimActivatingAnnotationKey = "karpenter.coralogix.net/standby-activating"
-	NodeTaintKey                     = "karpenter.coralogix.net/standby"
-	NodeTaintValue                   = "true"
+	NodeClaimAnnotationKey                 = "karpenter.coralogix.net/standby"
+	NodeClaimActivatingAnnotationKey       = "karpenter.coralogix.net/standby-activating"
+	NodeClaimActivationSourceAnnotationKey = "karpenter.coralogix.net/standby-activation-source"
+	NodeTaintKey                           = "karpenter.coralogix.net/standby"
+	NodeTaintValue                         = "true"
+)
+
+type ActivationSource string
+
+const (
+	ActivationSourceProvisioning ActivationSource = "provisioning"
+	ActivationSourceCompaction   ActivationSource = "compaction"
+	ActivationSourceRecovery     ActivationSource = "recovery"
 )
 
 // NodeTaint returns the taint that prevents ordinary pods from scheduling onto standby capacity.
@@ -55,6 +64,31 @@ func SetNodeClaimActivating(nodeClaim *v1.NodeClaim, activating bool) {
 	if nodeClaim.Annotations != nil {
 		delete(nodeClaim.Annotations, NodeClaimActivatingAnnotationKey)
 	}
+}
+
+// NodeClaimActivationSource returns the source persisted with an in-progress activation.
+func NodeClaimActivationSource(nodeClaim *v1.NodeClaim) ActivationSource {
+	if nodeClaim == nil {
+		return ""
+	}
+	return ActivationSource(nodeClaim.Annotations[NodeClaimActivationSourceAnnotationKey])
+}
+
+// SetNodeClaimActivationSource updates the source persisted with an in-progress activation.
+func SetNodeClaimActivationSource(nodeClaim *v1.NodeClaim, source ActivationSource) {
+	if nodeClaim == nil {
+		return
+	}
+	if source == "" {
+		if nodeClaim.Annotations != nil {
+			delete(nodeClaim.Annotations, NodeClaimActivationSourceAnnotationKey)
+		}
+		return
+	}
+	if nodeClaim.Annotations == nil {
+		nodeClaim.Annotations = map[string]string{}
+	}
+	nodeClaim.Annotations[NodeClaimActivationSourceAnnotationKey] = string(source)
 }
 
 // IsNodeClaimStandby reports whether a NodeClaim carries the persistent standby marker.

@@ -275,6 +275,14 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 
 	// If there are no candidates, move to the next disruption
 	if len(candidates) == 0 {
+		// The score-based method normally refreshes its inventory while computing reclamation.
+		// Refresh here as well because this controller skips ComputeCommands when there are no
+		// candidates, but configured pools must still publish zero-valued inventory series.
+		if scoreBased, ok := disruption.(*ScoreBasedConsolidation); ok {
+			if _, err := scoreBased.emptyReclamationNodeCounts(ctx); err != nil {
+				return false, fmt.Errorf("updating score-based reclamation inventory, %w", err)
+			}
+		}
 		return false, nil
 	}
 	// Pass precomputed NodePool totals to consolidation methods for balanced scoring

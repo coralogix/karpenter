@@ -18,6 +18,7 @@ package disruption
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -39,6 +41,221 @@ import (
 	"sigs.k8s.io/karpenter/pkg/test"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
+
+func TestScoreBasedReclamationEmptyNodeMetricsIncludeAllConfiguredPools(t *testing.T) {
+	resetScoreBasedEmptyNodeMetricForTest()
+	defer resetScoreBasedEmptyNodeMetricForTest()
+
+	ctx := context.Background()
+	now := time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC)
+	clock := clocktesting.NewFakeClock(now)
+	duePool := scoreBasedReclamationTestPool("due-pool", "")
+	notDuePool := scoreBasedReclamationTestPool("not-due-pool", now.Format(time.RFC3339Nano))
+	zeroPool := scoreBasedReclamationTestPool("zero-pool", "")
+	unconfiguredPool := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "unconfigured-pool"}}
+
+	standbyClaim, standbyNode := scoreBasedReclamationTestNode("due-pool", "standby-node", true, true, false)
+	otherClaim, otherNode := scoreBasedReclamationTestNode("due-pool", "other-node", false, false, false)
+	emptyOtherClaim, emptyOtherNode := scoreBasedReclamationTestNode("due-pool", "empty-other-node", false, false, false)
+	markerOnlyClaim, markerOnlyNode := scoreBasedReclamationTestNode("not-due-pool", "marker-only-node", true, false, false)
+	terminatingClaim, terminatingNode := scoreBasedReclamationTestNode("due-pool", "terminating-node", false, false, true)
+	workload := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "bound", Namespace: "default"}, Spec: corev1.PodSpec{NodeName: otherNode.Name}}
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(duePool, notDuePool, zeroPool, unconfiguredPool, standbyClaim, standbyNode, otherClaim, otherNode, emptyOtherClaim, emptyOtherNode, markerOnlyClaim, markerOnlyNode, terminatingClaim, terminatingNode, workload).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
+			pod := obj.(*corev1.Pod)
+			if pod.Spec.NodeName == "" {
+				return nil
+			}
+			return []string{pod.Spec.NodeName}
+		}).Build()
+	cluster := state.NewCluster(clock, kubeClient, nil)
+	for _, nodeClaim := range []*v1.NodeClaim{standbyClaim, otherClaim, emptyOtherClaim, markerOnlyClaim, terminatingClaim} {
+		cluster.UpdateNodeClaim(nodeClaim)
+	}
+	for _, node := range []*corev1.Node{standbyNode, otherNode, emptyOtherNode, markerOnlyNode, terminatingNode} {
+		if err := cluster.UpdateNode(ctx, node); err != nil {
+			t.Fatal(err)
+		}
+	}
+	consolidation := MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
+	scoreBased := &ScoreBasedConsolidation{consolidation: consolidation}
+
+	dueCounts, err := scoreBased.emptyReclamationNodeCounts(ctx)
+	if err != nil {
+		t.Fatalf("emptyReclamationNodeCounts() error = %v", err)
+	}
+	if dueCounts["due-pool"] != 2 {
+		t.Fatalf("due-pool empty count = %d, want 2", dueCounts["due-pool"])
+	}
+	if _, ok := dueCounts["not-due-pool"]; ok {
+		t.Fatal("non-due pool should not be included in reclamation selection counts")
+	}
+	assertScoreBasedEmptyNodeMetric(t, "due-pool", scoreBasedEmptyNodeStateStandby, 1, true)
+	assertScoreBasedEmptyNodeMetric(t, "due-pool", scoreBasedEmptyNodeStateOther, 1, true)
+	assertScoreBasedEmptyNodeMetric(t, "not-due-pool", scoreBasedEmptyNodeStateStandby, 0, true)
+	assertScoreBasedEmptyNodeMetric(t, "not-due-pool", scoreBasedEmptyNodeStateOther, 1, true)
+	assertScoreBasedEmptyNodeMetric(t, "zero-pool", scoreBasedEmptyNodeStateStandby, 0, true)
+	assertScoreBasedEmptyNodeMetric(t, "zero-pool", scoreBasedEmptyNodeStateOther, 0, true)
+	assertScoreBasedEmptyNodeMetric(t, "unconfigured-pool", scoreBasedEmptyNodeStateOther, 0, false)
+}
+
+func TestScoreBasedReclamationEmptyNodeMetricsKeepLastCompleteScanAndRemoveOutOfScopePools(t *testing.T) {
+	resetScoreBasedEmptyNodeMetricForTest()
+	defer resetScoreBasedEmptyNodeMetricForTest()
+
+	ctx := context.Background()
+	clock := clocktesting.NewFakeClock(time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC))
+	oldPool := scoreBasedReclamationTestPool("old-pool", "")
+	oldClaim, oldNode := scoreBasedReclamationTestNode("old-pool", "old-node", false, false, false)
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(oldPool, oldClaim, oldNode).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
+			pod := obj.(*corev1.Pod)
+			if pod.Spec.NodeName == "" {
+				return nil
+			}
+			return []string{pod.Spec.NodeName}
+		}).Build()
+	cluster := state.NewCluster(clock, kubeClient, nil)
+	cluster.UpdateNodeClaim(oldClaim)
+	if err := cluster.UpdateNode(ctx, oldNode); err != nil {
+		t.Fatal(err)
+	}
+	consolidation := MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
+	scoreBased := &ScoreBasedConsolidation{consolidation: consolidation}
+	if _, err := scoreBased.emptyReclamationNodeCounts(ctx); err != nil {
+		t.Fatalf("initial emptyReclamationNodeCounts() error = %v", err)
+	}
+	assertScoreBasedEmptyNodeMetric(t, "old-pool", scoreBasedEmptyNodeStateOther, 1, true)
+
+	newPool := scoreBasedReclamationTestPool("new-pool", "")
+	newClaim, newNode := scoreBasedReclamationTestNode("new-pool", "new-node", false, false, false)
+	if err := kubeClient.Delete(ctx, oldPool); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Create(ctx, newPool); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Create(ctx, newClaim); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeClient.Create(ctx, newNode); err != nil {
+		t.Fatal(err)
+	}
+	cluster.UpdateNodeClaim(newClaim)
+	if err := cluster.UpdateNode(ctx, newNode); err != nil {
+		t.Fatal(err)
+	}
+
+	scoreBased.kubeClient = errorOnPodListClient{Client: kubeClient, err: errors.New("pod list failed")}
+	if _, err := scoreBased.emptyReclamationNodeCounts(ctx); err == nil {
+		t.Fatal("emptyReclamationNodeCounts() error = nil, want pod-list error")
+	}
+	assertScoreBasedEmptyNodeMetric(t, "old-pool", scoreBasedEmptyNodeStateOther, 1, true)
+	assertScoreBasedEmptyNodeMetric(t, "new-pool", scoreBasedEmptyNodeStateOther, 0, false)
+
+	scoreBased.kubeClient = kubeClient
+	if _, err := scoreBased.emptyReclamationNodeCounts(ctx); err != nil {
+		t.Fatalf("complete emptyReclamationNodeCounts() error = %v", err)
+	}
+	assertScoreBasedEmptyNodeMetric(t, "old-pool", scoreBasedEmptyNodeStateOther, 0, false)
+	assertScoreBasedEmptyNodeMetric(t, "new-pool", scoreBasedEmptyNodeStateOther, 1, true)
+}
+
+type errorOnPodListClient struct {
+	client.Client
+	err error
+}
+
+func (c errorOnPodListClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*corev1.PodList); ok {
+		return c.err
+	}
+	return c.Client.List(ctx, list, opts...)
+}
+
+func scoreBasedReclamationTestPool(name, lastReclamation string) *v1.NodePool {
+	annotations := map[string]string{v1.ScoreBasedConsolidationAnnotationKey: ""}
+	if lastReclamation != "" {
+		annotations[v1.ScoreBasedLastReclamationAnnotationKey] = lastReclamation
+	}
+	return &v1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: annotations},
+		Spec: v1.NodePoolSpec{Disruption: v1.Disruption{
+			ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
+			ConsolidateAfter:    v1.MustParseNillableDuration("0s"),
+		}},
+	}
+}
+
+func scoreBasedReclamationTestNode(poolName, name string, standbyMarker, standbyTaint, deleting bool) (*v1.NodeClaim, *corev1.Node) {
+	providerID := "provider://" + name
+	nodeClaim := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name:   name + "-claim",
+		Labels: map[string]string{v1.NodePoolLabelKey: poolName},
+	}, Status: v1.NodeClaimStatus{ProviderID: providerID}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: name,
+		Labels: map[string]string{
+			v1.NodePoolLabelKey:            poolName,
+			v1.NodeInitializedLabelKey:     "true",
+			corev1.LabelInstanceTypeStable: "m6i.large",
+		},
+	}, Spec: corev1.NodeSpec{ProviderID: providerID}}
+	if standbyMarker {
+		standby.SetNodeClaimStandby(nodeClaim, true)
+	}
+	if standbyTaint {
+		standby.SetNodeTaint(node, true)
+	}
+	if deleting {
+		deletionTimestamp := metav1.NewTime(time.Now())
+		nodeClaim.DeletionTimestamp = &deletionTimestamp
+		nodeClaim.Finalizers = []string{"test.karpenter.sh/finalizer"}
+	}
+	return nodeClaim, node
+}
+
+func assertScoreBasedEmptyNodeMetric(t *testing.T, pool, state string, want float64, wantFound bool) {
+	t.Helper()
+	metricFamilies, err := crmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range metricFamilies {
+		if family.GetName() != "karpenter_nodepools_empty_nodes" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			labels := map[string]string{}
+			for _, label := range metric.GetLabel() {
+				labels[label.GetName()] = label.GetValue()
+			}
+			if labels["nodepool"] == pool && labels["state"] == state {
+				if !wantFound {
+					t.Fatalf("metric series for nodepool=%q state=%q unexpectedly exists", pool, state)
+				}
+				if got := metric.GetGauge().GetValue(); got != want {
+					t.Fatalf("metric value for nodepool=%q state=%q = %v, want %v", pool, state, got, want)
+				}
+				return
+			}
+		}
+	}
+	if wantFound {
+		t.Fatalf("metric series for nodepool=%q state=%q was not found", pool, state)
+	}
+}
+
+func resetScoreBasedEmptyNodeMetricForTest() {
+	scoreBasedEmptyNodeMetricState.Lock()
+	defer scoreBasedEmptyNodeMetricState.Unlock()
+	ScoreBasedReclamationEmptyNodes.Reset()
+	scoreBasedEmptyNodeMetricState.pools = map[string]struct{}{}
+}
 
 func TestScoreBasedReclamationDueUsesConfiguredInterval(t *testing.T) {
 	now := time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC)

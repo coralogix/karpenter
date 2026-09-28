@@ -44,7 +44,7 @@ func (p *Provisioner) resumeStandbyActivations(ctx context.Context, nodes state.
 	if len(activating) == 0 {
 		return nil
 	}
-	if err := p.ActivateStandbyNodes(ctx, activating...); err != nil {
+	if err := p.ActivateStandbyNodes(ctx, standby.ActivationSourceRecovery, activating...); err != nil {
 		return err
 	}
 	for _, node := range activating {
@@ -65,28 +65,29 @@ func (p *Provisioner) activateScheduledStandbyNodes(ctx context.Context, results
 		}
 		return node.StateNode, true
 	})
-	return p.ActivateStandbyNodes(ctx, selected...)
+	return p.ActivateStandbyNodes(ctx, standby.ActivationSourceProvisioning, selected...)
 }
 
 // ActivateStandbyNodes activates retained nodes selected as scheduling
 // destinations. The NodeClaim marker is used as a persistent reservation so
-// reclamation cannot remove a node while its taint is being changed.
-func (p *Provisioner) ActivateStandbyNodes(ctx context.Context, nodes ...*state.StateNode) error {
+// reclamation cannot remove a node while its taint is being changed. The source
+// is persisted with that reservation so an interrupted activation keeps its origin.
+func (p *Provisioner) ActivateStandbyNodes(ctx context.Context, source standby.ActivationSource, nodes ...*state.StateNode) error {
 	var errs []error
 	for _, node := range nodes {
 		if node == nil || node.NodeClaim == nil ||
 			(!standby.IsNodeClaimStandby(node.NodeClaim) && !standby.IsNodeClaimActivating(node.NodeClaim) && !hasNodeActivationMarker(node.Node)) {
 			continue
 		}
-		if err := p.activateStandbyNode(ctx, node); err != nil {
+		if err := p.activateStandbyNode(ctx, source, node); err != nil {
 			errs = append(errs, fmt.Errorf("activating node %q, %w", node.Name(), err))
 		}
 	}
 	return multierr.Combine(errs...)
 }
 
-func (p *Provisioner) activateStandbyNode(ctx context.Context, stateNode *state.StateNode) error {
-	activationStarted, err := p.reserveStandbyActivation(ctx, stateNode.NodeClaim)
+func (p *Provisioner) activateStandbyNode(ctx context.Context, source standby.ActivationSource, stateNode *state.StateNode) error {
+	activationStarted, source, err := p.reserveStandbyActivation(ctx, stateNode.NodeClaim, source)
 	if err != nil {
 		return fmt.Errorf("reserving nodeclaim activation, %w", err)
 	}
@@ -105,13 +106,7 @@ func (p *Provisioner) activateStandbyNode(ctx context.Context, stateNode *state.
 		return fmt.Errorf("removing standby taint, %w", err)
 	}
 	if activated {
-		nodePool := stateNode.NodeClaim.Labels[v1.NodePoolLabelKey]
-		StandbyNodesActivatedTotal.Inc(map[string]string{karpenterMetrics.NodePoolLabel: nodePool})
-		log.FromContext(ctx).WithValues(
-			"Node", klog.KObj(stateNode.Node),
-			"NodeClaim", klog.KObj(stateNode.NodeClaim),
-			"NodePool", klog.KRef("", nodePool),
-		).Info("activated standby node")
+		recordStandbyActivation(ctx, stateNode, source)
 	}
 	if err := p.finishStandbyActivation(ctx, stateNode.NodeClaim); err != nil {
 		return fmt.Errorf("clearing activation markers, %w", err)
@@ -122,8 +117,30 @@ func (p *Provisioner) activateStandbyNode(ctx context.Context, stateNode *state.
 	return nil
 }
 
-func (p *Provisioner) reserveStandbyActivation(ctx context.Context, stateNodeClaim *v1.NodeClaim) (bool, error) {
+func recordStandbyActivation(ctx context.Context, stateNode *state.StateNode, source standby.ActivationSource) {
+	nodePool := stateNode.NodeClaim.Labels[v1.NodePoolLabelKey]
+	if nodePool == "" {
+		nodePool = "unknown"
+	}
+	instanceType := stateNode.NodeClaim.Labels[corev1.LabelInstanceTypeStable]
+	if instanceType == "" {
+		instanceType = "unknown"
+	}
+	StandbyNodesActivatedTotal.Inc(map[string]string{
+		karpenterMetrics.NodePoolLabel:     nodePool,
+		standbyActivationInstanceTypeLabel: instanceType,
+		standbyActivationSourceLabel:       string(source),
+	})
+	log.FromContext(ctx).WithValues(
+		"Node", klog.KObj(stateNode.Node),
+		"NodeClaim", klog.KObj(stateNode.NodeClaim),
+		"NodePool", klog.KRef("", nodePool),
+	).Info("activated standby node")
+}
+
+func (p *Provisioner) reserveStandbyActivation(ctx context.Context, stateNodeClaim *v1.NodeClaim, requestedSource standby.ActivationSource) (bool, standby.ActivationSource, error) {
 	var activationStarted bool
+	activationSource := standby.ActivationSourceRecovery
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		nodeClaim := &v1.NodeClaim{}
 		if err := p.kubeClient.Get(ctx, client.ObjectKeyFromObject(stateNodeClaim), nodeClaim); err != nil {
@@ -134,20 +151,32 @@ func (p *Provisioner) reserveStandbyActivation(ctx context.Context, stateNodeCla
 		}
 		if standby.IsNodeClaimActivating(nodeClaim) {
 			activationStarted = true
+			activationSource = normalizeStandbyActivationSource(standby.NodeClaimActivationSource(nodeClaim))
 			return nil
 		}
 		if !standby.IsNodeClaimStandby(nodeClaim) {
 			return nil
 		}
 		stored := nodeClaim.DeepCopy()
+		activationSource = normalizeStandbyActivationSource(requestedSource)
 		standby.SetNodeClaimActivating(nodeClaim, true)
+		standby.SetNodeClaimActivationSource(nodeClaim, activationSource)
 		if err := p.kubeClient.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
 			return err
 		}
 		activationStarted = true
 		return nil
 	})
-	return activationStarted, err
+	return activationStarted, activationSource, err
+}
+
+func normalizeStandbyActivationSource(source standby.ActivationSource) standby.ActivationSource {
+	switch source {
+	case standby.ActivationSourceProvisioning, standby.ActivationSourceCompaction:
+		return source
+	default:
+		return standby.ActivationSourceRecovery
+	}
 }
 
 func hasNodeActivationMarker(node *corev1.Node) bool {
@@ -203,12 +232,13 @@ func (p *Provisioner) finishStandbyActivation(ctx context.Context, stateNodeClai
 		if err := p.kubeClient.Get(ctx, client.ObjectKeyFromObject(stateNodeClaim), nodeClaim); err != nil {
 			return err
 		}
-		if !standby.IsNodeClaimStandby(nodeClaim) && !standby.IsNodeClaimActivating(nodeClaim) {
+		if !standby.IsNodeClaimStandby(nodeClaim) && !standby.IsNodeClaimActivating(nodeClaim) && standby.NodeClaimActivationSource(nodeClaim) == "" {
 			return nil
 		}
 		stored := nodeClaim.DeepCopy()
 		standby.SetNodeClaimStandby(nodeClaim, false)
 		standby.SetNodeClaimActivating(nodeClaim, false)
+		standby.SetNodeClaimActivationSource(nodeClaim, "")
 		return p.kubeClient.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
 	})
 }

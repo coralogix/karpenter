@@ -26,13 +26,18 @@ import (
 
 const standbyActivationSubsystem = "nodes"
 
+const (
+	standbyActivationInstanceTypeLabel = "instance_type"
+	standbyActivationSourceLabel       = "source"
+)
+
 var StandbyNodesActivatedTotal = opmetrics.NewPrometheusCounter(
 	crmetrics.Registry,
 	prometheus.CounterOpts{
 		Namespace: karpenterMetrics.Namespace,
 		Subsystem: standbyActivationSubsystem,
 		Name:      "standby_activated_total",
-		Help:      "Number of standby nodes activated by Karpenter. Labeled by the owning NodePool.",
+		Help:      "Number of standby nodes activated by Karpenter. Labeled by the owning NodePool, instance type, and activation source (provisioning, compaction, or recovery).",
 	},
-	[]string{karpenterMetrics.NodePoolLabel},
+	[]string{karpenterMetrics.NodePoolLabel, standbyActivationInstanceTypeLabel, standbyActivationSourceLabel},
 )

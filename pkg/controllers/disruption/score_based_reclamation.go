@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
@@ -168,38 +169,67 @@ func (s *ScoreBasedConsolidation) validateReclamationCommand(ctx context.Context
 	return &validated, reclamationPools, nil
 }
 
-// emptyReclamationNodeCounts counts all managed, non-terminating empty nodes in due
-// score-based pools, including nodes that are nominated or otherwise ineligible for this removal.
+// emptyReclamationNodeCounts counts managed, non-terminating empty nodes in configured score-based
+// pools. It returns due-pool counts for reclamation selection and publishes inventory counts for all
+// configured pools, regardless of reclamation cadence.
 func (s *ScoreBasedConsolidation) emptyReclamationNodeCounts(ctx context.Context) (map[string]int, error) {
-	var nodePoolList v1.NodePoolList
-	if err := s.kubeClient.List(ctx, &nodePoolList); err != nil {
-		return nil, fmt.Errorf("listing NodePools for reclamation, %w", err)
-	}
-	nodePools := make(map[string]*v1.NodePool, len(nodePoolList.Items))
-	for i := range nodePoolList.Items {
-		nodePools[nodePoolList.Items[i].Name] = &nodePoolList.Items[i]
+	nodePools, inventoryCounts, err := s.scoreBasedReclamationPools(ctx)
+	if err != nil {
+		return nil, err
 	}
 
-	counts := map[string]int{}
+	dueCounts := map[string]int{}
 	now := s.clock.Now()
 	for _, node := range s.cluster.DeepCopyNodes() {
-		if node.NodeClaim == nil || node.Node == nil || node.MarkedForDeletion() {
-			continue
-		}
-		poolName := node.Labels()[v1.NodePoolLabelKey]
-		nodePool := nodePools[poolName]
-		if !scoreBasedReclamationDue(nodePool, now) {
-			continue
-		}
-		empty, err := reclamationEmpty(ctx, s.kubeClient, node.Node)
+		nodePool, poolName, isStandby, empty, err := s.emptyReclamationNodeInventory(ctx, node, nodePools)
 		if err != nil {
-			return nil, fmt.Errorf("checking emptiness of node %q for reclamation, %w", node.Name(), err)
+			return nil, err
 		}
-		if empty {
-			counts[poolName]++
+		if !empty {
+			continue
+		}
+		inventoryCounts[poolName] = inventoryCounts[poolName].add(isStandby)
+		if scoreBasedReclamationDue(nodePool, now) {
+			dueCounts[poolName]++
 		}
 	}
-	return counts, nil
+	updateScoreBasedEmptyNodeMetrics(inventoryCounts)
+	return dueCounts, nil
+}
+
+func (s *ScoreBasedConsolidation) scoreBasedReclamationPools(ctx context.Context) (map[string]*v1.NodePool, map[string]scoreBasedEmptyNodeCounts, error) {
+	var nodePoolList v1.NodePoolList
+	if err := s.kubeClient.List(ctx, &nodePoolList); err != nil {
+		return nil, nil, fmt.Errorf("listing NodePools for reclamation, %w", err)
+	}
+	nodePools := make(map[string]*v1.NodePool, len(nodePoolList.Items))
+	inventoryCounts := make(map[string]scoreBasedEmptyNodeCounts, len(nodePoolList.Items))
+	for i := range nodePoolList.Items {
+		nodePool := &nodePoolList.Items[i]
+		if !scoreBasedReclamationConfigured(nodePool) {
+			continue
+		}
+		nodePools[nodePool.Name] = nodePool
+		inventoryCounts[nodePool.Name] = scoreBasedEmptyNodeCounts{}
+	}
+	return nodePools, inventoryCounts, nil
+}
+
+func (s *ScoreBasedConsolidation) emptyReclamationNodeInventory(ctx context.Context, node *state.StateNode, nodePools map[string]*v1.NodePool) (*v1.NodePool, string, bool, bool, error) {
+	if node.NodeClaim == nil || node.Node == nil || node.MarkedForDeletion() {
+		return nil, "", false, false, nil
+	}
+	poolName := node.Labels()[v1.NodePoolLabelKey]
+	nodePool := nodePools[poolName]
+	if nodePool == nil {
+		return nil, "", false, false, nil
+	}
+	empty, err := reclamationEmpty(ctx, s.kubeClient, node.Node)
+	if err != nil {
+		return nil, "", false, false, fmt.Errorf("checking emptiness of node %q for reclamation, %w", node.Name(), err)
+	}
+	isStandby := standby.IsNodeClaimStandby(node.NodeClaim) && standby.HasNodeTaint(node.Node)
+	return nodePool, poolName, isStandby, empty, nil
 }
 
 func (s *ScoreBasedConsolidation) reclamationBeforeDelete(candidates []*Candidate) func(context.Context) error {

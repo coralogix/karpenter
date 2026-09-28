@@ -560,7 +560,7 @@ func (q *Queue) activateStandbyDestinations(ctx context.Context, cmd *Command) e
 	if len(stateNodes) == 0 {
 		return nil
 	}
-	return q.provisioner.ActivateStandbyNodes(ctx, stateNodes...)
+	return q.provisioner.ActivateStandbyNodes(ctx, standby.ActivationSourceCompaction, stateNodes...)
 }
 
 func (q *Queue) rollbackStart(ctx context.Context, cmd *Command, candidates []*Candidate, cause error) error {
