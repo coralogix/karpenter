@@ -26,11 +26,24 @@ import (
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/destel/rill"
+	"go.opentelemetry.io/otel/attribute"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
+)
+
+const (
+	scoreBasedConsolidationSpan              = "karpenter.disruption.score_based_consolidation"
+	scoreBasedConsolidationReclamationSpan   = "karpenter.disruption.score_based_consolidation.reclamation"
+	scoreBasedConsolidationPrepareSpan       = "karpenter.disruption.score_based_consolidation.prepare_compaction_candidates"
+	scoreBasedConsolidationFilterSpan        = "karpenter.disruption.score_based_consolidation.filter_valid_candidates"
+	scoreBasedConsolidationMoveSetSearchSpan = "karpenter.disruption.score_based_consolidation.move_set_search"
+	scoreBasedConsolidationNewSimulatorSpan  = "karpenter.disruption.score_based_consolidation.new_scheduling_simulator"
+	scoreBasedConsolidationTTLWaitSpan       = "karpenter.disruption.score_based_consolidation.consolidation_ttl_wait"
+	scoreBasedConsolidationValidateSpan      = "karpenter.disruption.score_based_consolidation.validate_command"
 )
 
 var ScoreBasedConsolidationTimeoutDuration = 20 * time.Second
@@ -141,7 +154,14 @@ func (s *ScoreBasedConsolidation) compactionCandidateNonEmpty(ctx context.Contex
 
 //nolint:gocyclo
 func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
-	reclamationCommand, reclamationPools, err := s.computeReclamationCommand(ctx, candidates)
+	ctx, endConsolidation := cxtracing.Start(ctx, scoreBasedConsolidationSpan,
+		attribute.Int("candidate_count", len(candidates)),
+	)
+	defer endConsolidation()
+
+	reclamationCtx, stopReclamation := cxtracing.Measure(ctx, nil, scoreBasedConsolidationReclamationSpan)
+	reclamationCommand, reclamationPools, err := s.computeReclamationCommand(reclamationCtx, candidates)
+	stopReclamation()
 	if err != nil {
 		return []Command{}, err
 	}
@@ -153,6 +173,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		return reclamationCommands, nil
 	}
 
+	prepareCtx, stopPrepare := cxtracing.Measure(ctx, nil, scoreBasedConsolidationPrepareSpan)
 	// A pool with due, empty capacity is handled only by reclamation in this pass.
 	// Keep normal compaction available for other pools.
 	normalCandidates := make([]*Candidate, 0, len(candidates))
@@ -160,10 +181,11 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		if candidate == nil || candidate.NodePool == nil || reclamationPools[candidate.NodePool.Name] || standby.IsNodeClaimActivating(candidate.NodeClaim) || standby.IsNodeClaimStandby(candidate.NodeClaim) || standby.HasNodeTaint(candidate.Node) {
 			continue
 		}
-		if s.shouldCompact(ctx, candidate) {
+		if s.shouldCompact(prepareCtx, candidate) {
 			normalCandidates = append(normalCandidates, candidate)
 		}
 	}
+	stopPrepare()
 	candidates = normalCandidates
 	if len(candidates) == 0 {
 		return reclamationCommands, nil
@@ -174,6 +196,9 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	constrainedByBudgets := false
 	constrainedByPace := false
 
+	_, stopFilter := cxtracing.Measure(ctx, nil, scoreBasedConsolidationFilterSpan,
+		attribute.Int("compaction_candidate_count", len(candidates)),
+	)
 	candidates = s.SortCandidates(candidates)
 	var validCandidates []*Candidate
 	for _, candidate := range candidates {
@@ -187,8 +212,13 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		}
 		validCandidates = append(validCandidates, candidate)
 	}
+	stopFilter()
 
-	evals, evaluated, err := s.searchForMoveSets(ctx, validCandidates, deadline)
+	searchCtx, stopSearch := cxtracing.Measure(ctx, nil, scoreBasedConsolidationMoveSetSearchSpan,
+		attribute.Int("valid_candidate_count", len(validCandidates)),
+	)
+	evals, evaluated, err := s.searchForMoveSets(searchCtx, validCandidates, deadline)
+	stopSearch()
 	if err != nil {
 		return reclamationCommands, err
 	}
@@ -209,13 +239,22 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 
 	remainingValidationDelay := commandValidationDelay - s.clock.Since(start)
 	if remainingValidationDelay > 0 {
+		_, stopTTLWait := cxtracing.Start(ctx, scoreBasedConsolidationTTLWaitSpan,
+			attribute.String("remaining_delay", remainingValidationDelay.String()),
+		)
 		select {
 		case <-ctx.Done():
+			stopTTLWait()
 			return reclamationCommands, ctx.Err()
 		case <-s.clock.After(remainingValidationDelay):
 		}
+		stopTTLWait()
 	}
-	cmd, err := selectFirstStillValidCommand(ctx, s.validator, s.recorder, evals)
+	validateCtx, stopValidate := cxtracing.Measure(ctx, nil, scoreBasedConsolidationValidateSpan,
+		attribute.Int("move_set_eval_count", len(evals)),
+	)
+	cmd, err := selectFirstStillValidCommand(validateCtx, s.validator, s.recorder, evals)
+	stopValidate()
 	if err != nil {
 		return reclamationCommands, err
 	}
@@ -231,12 +270,17 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 	for i, candidate := range validCandidates {
 		moveSets[i] = moveSet{Nodes: []*Candidate{candidate}}
 	}
-	simulator, err := NewConsolidationSchedulingSimulator(ctx, s.kubeClient, s.cluster, s.provisioner, s.clock, s.recorder, validCandidates...)
+	simulatorCtx, stopSimulator := cxtracing.Measure(ctx, nil, scoreBasedConsolidationNewSimulatorSpan,
+		attribute.Int("valid_candidate_count", len(validCandidates)),
+	)
+	simulator, err := NewConsolidationSchedulingSimulator(simulatorCtx, s.kubeClient, s.cluster, s.provisioner, s.clock, s.recorder, validCandidates...)
+	stopSimulator()
 	if err != nil {
 		return nil, 0, err
 	}
-	compute := func(ctx context.Context, candidates ...*Candidate) (Command, error) {
-		return s.computeConsolidation(ctx, simulator, candidates...)
+	simulationCtx := cxtracing.WithoutSpan(ctx)
+	compute := func(_ context.Context, candidates ...*Candidate) (Command, error) {
+		return s.computeConsolidation(simulationCtx, simulator, candidates...)
 	}
 	return evaluateMoveSetsPar(ctx, moveSets, deadline, compute)
 }

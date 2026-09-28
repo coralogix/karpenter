@@ -43,3 +43,9 @@ func Measure(ctx context.Context, metricStop func(), name string, attrs ...attri
 		}
 	}
 }
+
+// WithoutSpan returns a context that keeps cancellation and values from ctx but does not
+// propagate the active span. Use it before work that should not nest under the current trace.
+func WithoutSpan(ctx context.Context) context.Context {
+	return trace.ContextWithSpanContext(ctx, trace.SpanContext{})
+}
