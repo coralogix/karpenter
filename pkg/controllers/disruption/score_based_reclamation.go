@@ -165,7 +165,7 @@ func (s *ScoreBasedConsolidation) validateReclamationCommand(ctx context.Context
 		case <-s.clock.After(remainingValidationDelay):
 		}
 	}
-	validated, err := selectFirstStillValidCommand(ctx, s.reclamationValidator(), s.recorder, []*moveSetEvaluation{{Command: cmd, Score: 1}})
+	validated, _, err := selectFirstStillValidCommand(ctx, s.reclamationValidator(), s.recorder, []*moveSetEvaluation{{Command: cmd, Score: 1}})
 	if err != nil {
 		return nil, reclamationPools, err
 	}

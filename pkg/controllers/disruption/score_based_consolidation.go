@@ -253,7 +253,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	validateCtx, stopValidate := cxtracing.Measure(ctx, nil, scoreBasedConsolidationValidateSpan,
 		attribute.Int("move_set_eval_count", len(evals)),
 	)
-	cmd, err := selectFirstStillValidCommand(validateCtx, s.validator, s.recorder, evals)
+	cmd, selectedEvalIdx, err := selectFirstStillValidCommand(validateCtx, s.validator, s.recorder, evals)
 	stopValidate()
 	if err != nil {
 		return reclamationCommands, err
@@ -261,6 +261,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	if len(cmd.Candidates) == 0 {
 		return reclamationCommands, nil
 	}
+	logScoreBasedCompactionMoveSelected(ctx, evals, selectedEvalIdx, evaluated, len(validCandidates))
 	cmd.Action = EvacuateAction
 	return append(reclamationCommands, cmd), nil
 }
@@ -389,7 +390,7 @@ func moveSetPriorityScore(moveSet moveSet) float64 {
 	return maxScore
 }
 
-func selectFirstStillValidCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation) (Command, error) {
+func selectFirstStillValidCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation) (Command, int, error) {
 	var firstValidationReason string
 
 	for i, eval := range evals {
@@ -400,14 +401,14 @@ func selectFirstStillValidCommand(ctx context.Context, validator Validator, reco
 				}
 				continue
 			}
-			return Command{}, fmt.Errorf("validating score-based consolidation, %w", err)
+			return Command{}, -1, fmt.Errorf("validating score-based consolidation, %w", err)
 		}
-		return eval.Command, nil
+		return eval.Command, i, nil
 	}
 	if firstValidationReason != "" {
 		evals[0].Command.EmitRejectedEvents(recorder, firstValidationReason)
 	}
-	return Command{}, nil
+	return Command{}, -1, nil
 }
 
 func (s *ScoreBasedConsolidation) Reason() v1.DisruptionReason {

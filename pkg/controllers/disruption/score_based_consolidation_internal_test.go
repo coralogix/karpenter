@@ -385,9 +385,12 @@ func TestSelectFirstValidatedCommand_validationFallback(t *testing.T) {
 	}
 	validator := rejectFirstCommandValidator{}
 
-	cmd, err := selectFirstStillValidCommand(ctx, validator, recorder, evals)
+	cmd, selectedIdx, err := selectFirstStillValidCommand(ctx, validator, recorder, evals)
 	if err != nil {
 		t.Fatalf("selectFirstValidatedCommand() error = %v", err)
+	}
+	if selectedIdx != 1 {
+		t.Fatalf("selected eval index = %d, want 1", selectedIdx)
 	}
 	if len(cmd.Candidates) != 1 {
 		t.Fatalf("command candidates = %d, want 1", len(cmd.Candidates))
@@ -415,9 +418,12 @@ func TestSelectFirstValidatedCommand_emitsRejectedEventOnlyForFirstEvalWhenAllFa
 		{Command: Command{Candidates: []*Candidate{lowScoreCandidate}}, Score: 0.10},
 	}
 
-	cmd, err := selectFirstStillValidCommand(ctx, rejectAllCommandValidator{}, recorder, evals)
+	cmd, selectedIdx, err := selectFirstStillValidCommand(ctx, rejectAllCommandValidator{}, recorder, evals)
 	if err != nil {
 		t.Fatalf("selectFirstValidatedCommand() error = %v", err)
+	}
+	if selectedIdx != -1 {
+		t.Fatalf("selected eval index = %d, want -1", selectedIdx)
 	}
 	if len(cmd.Candidates) != 0 {
 		t.Fatalf("command candidates = %d, want 0", len(cmd.Candidates))

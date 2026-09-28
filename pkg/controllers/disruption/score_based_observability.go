@@ -18,14 +18,17 @@ package disruption
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 )
 
@@ -124,5 +127,44 @@ func logMoveSetSearchComplete(
 		"maxMoveSetEvalDuration", stats.maxDuration(),
 		"computeErrors", stats.errorCount(),
 		"firstComputeError", stats.firstErrorMessage(),
+	)
+}
+
+func logScoreBasedCompactionMoveSelected(
+	ctx context.Context,
+	evals []*moveSetEvaluation,
+	selectedEvalIdx int,
+	candidatesEvaluated int,
+	compactionCandidateCount int,
+) {
+	if selectedEvalIdx < 0 || selectedEvalIdx >= len(evals) {
+		return
+	}
+	eval := evals[selectedEvalIdx]
+	cmd := eval.Command
+	candidate := cmd.Candidates[0]
+
+	selectionReason := "highest priority score among move sets with positive simulated savings"
+	if selectedEvalIdx > 0 {
+		selectionReason = fmt.Sprintf(
+			"validated fallback after %d higher-priority move set(s) failed post-simulation validation",
+			selectedEvalIdx,
+		)
+	}
+
+	log.FromContext(ctx).Info("score-based consolidation move selected",
+		"selectionReason", selectionReason,
+		"priorityScore", eval.Score,
+		"estimatedSavingsUSD", cmd.EstimatedSavings(),
+		"simulatedDecision", cmd.Decision(),
+		"validMoveSetCount", len(evals),
+		"priorityRank", selectedEvalIdx+1,
+		"moveSetsEvaluated", candidatesEvaluated,
+		"compactionCandidateCount", compactionCandidateCount,
+		"node", candidate.Name(),
+		"nodePool", candidate.NodePool.Name,
+		"instanceType", candidate.Labels()[corev1.LabelInstanceTypeStable],
+		"capacityType", candidate.Labels()[v1.CapacityTypeLabelKey],
+		"replacementNodeCount", len(cmd.Replacements),
 	)
 }
