@@ -4,6 +4,8 @@ Status: Implemented for score-based consolidation on annotated dynamic NodePools
 
 This mechanism applies only to NodePools that use score-based consolidation. Other NodePools retain their existing behavior.
 
+The score-based annotation is an explicit opt-in. It applies only to dynamic NodePools with `consolidationPolicy: WhenEmptyOrUnderutilized`; `consolidateAfter` is ignored in this mode, including `Never`. Removing the annotation returns the pool to upstream consolidation behavior.
+
 ## Motivation
 
 Consolidation currently couples disrupting pods to improve placement with removing their source nodes. Separate these responsibilities so workload placement and spare-capacity management can evolve independently.

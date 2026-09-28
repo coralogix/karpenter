@@ -96,6 +96,60 @@ func TestScoreBasedConsolidationCandidateFiltering(t *testing.T) {
 	})
 }
 
+func TestScoreBasedCompactionIgnoresConsolidateAfter(t *testing.T) {
+	ctx := context.Background()
+	c := MakeConsolidation(nil, nil, nil, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
+	scoreBased := NewScoreBasedConsolidation(c)
+	validator := scoreBased.validator.(*ConsolidationValidator)
+
+	t.Run("annotated pool with Never", func(t *testing.T) {
+		candidate := scoreBasedTestCandidate(true)
+		candidate.NodePool.Spec.Disruption.ConsolidateAfter = v1.MustParseNillableDuration(v1.Never)
+
+		if !scoreBased.shouldCompact(ctx, candidate) {
+			t.Fatal("score-based compaction must ignore consolidateAfter: Never")
+		}
+		if !validator.filter(ctx, candidate) {
+			t.Fatal("score-based compaction validator must admit an annotated Never pool")
+		}
+	})
+
+	t.Run("annotated pool with long duration and unset Consolidatable condition", func(t *testing.T) {
+		candidate := scoreBasedTestCandidate(true)
+		candidate.NodePool.Spec.Disruption.ConsolidateAfter = v1.MustParseNillableDuration("24h")
+		if err := candidate.NodeClaim.StatusConditions().Clear(v1.ConditionTypeConsolidatable); err != nil {
+			t.Fatalf("clearing Consolidatable condition: %v", err)
+		}
+
+		if !scoreBased.shouldCompact(ctx, candidate) {
+			t.Fatal("score-based compaction must not depend on consolidateAfter or the Consolidatable condition")
+		}
+		if !validator.filter(ctx, candidate) {
+			t.Fatal("score-based compaction validator must admit an annotated pool with Consolidatable unset")
+		}
+	})
+
+	t.Run("annotated pool retains the consolidation policy gate", func(t *testing.T) {
+		candidate := scoreBasedTestCandidate(true)
+		candidate.NodePool.Spec.Disruption.ConsolidationPolicy = v1.ConsolidationPolicyWhenEmpty
+		if scoreBased.shouldCompact(ctx, candidate) {
+			t.Fatal("score-based compaction must require WhenEmptyOrUnderutilized policy")
+		}
+	})
+
+	t.Run("unannotated pool with Never remains disabled", func(t *testing.T) {
+		candidate := scoreBasedTestCandidate(false)
+		candidate.NodePool.Spec.Disruption.ConsolidateAfter = v1.MustParseNillableDuration(v1.Never)
+
+		if scoreBased.ShouldDisrupt(ctx, candidate) {
+			t.Fatal("score-based compaction must reject an unannotated pool")
+		}
+		if c.ShouldDisrupt(ctx, candidate) {
+			t.Fatal("upstream consolidation must remain disabled for an unannotated Never pool")
+		}
+	})
+}
+
 func TestScoreBasedConsolidationValidatorFilter(t *testing.T) {
 	ctx := context.Background()
 	c := MakeConsolidation(nil, nil, nil, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)

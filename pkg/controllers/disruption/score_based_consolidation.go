@@ -110,13 +110,13 @@ func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candida
 // shouldCompact admits only eligible, non-empty active nodes into normal compaction.
 // It deliberately excludes empty nodes even when the combined method admits them for reclamation.
 func (s *ScoreBasedConsolidation) shouldCompact(ctx context.Context, cn *Candidate) bool {
-	if !s.compactionCandidateEligible(ctx, cn) {
+	if !s.compactionCandidateEligible(cn) {
 		return false
 	}
 	return s.compactionCandidateNonEmpty(ctx, cn)
 }
 
-func (s *ScoreBasedConsolidation) compactionCandidateEligible(ctx context.Context, cn *Candidate) bool {
+func (s *ScoreBasedConsolidation) compactionCandidateEligible(cn *Candidate) bool {
 	if cn == nil || cn.Node == nil || cn.NodeClaim == nil || cn.NodePool == nil {
 		return false
 	}
@@ -126,7 +126,7 @@ func (s *ScoreBasedConsolidation) compactionCandidateEligible(ctx context.Contex
 	if standby.IsNodeClaimActivating(cn.NodeClaim) || standby.IsNodeClaimStandby(cn.NodeClaim) || standby.HasNodeTaint(cn.Node) {
 		return false
 	}
-	return s.consolidation.ShouldDisrupt(ctx, cn)
+	return s.shouldDisruptIgnoringConsolidateAfter(cn)
 }
 
 func (s *ScoreBasedConsolidation) compactionCandidateNonEmpty(ctx context.Context, cn *Candidate) bool {

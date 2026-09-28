@@ -94,10 +94,6 @@ func TestScoreBasedReclamationRequiresEligibleConsolidationPolicy(t *testing.T) 
 			ConsolidationPolicy: v1.ConsolidationPolicyWhenEmpty,
 			ConsolidateAfter:    v1.MustParseNillableDuration("0s"),
 		},
-		"consolidation disabled": {
-			ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
-			ConsolidateAfter:    v1.MustParseNillableDuration(v1.Never),
-		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			nodePool := &v1.NodePool{
@@ -111,6 +107,36 @@ func TestScoreBasedReclamationRequiresEligibleConsolidationPolicy(t *testing.T) 
 				t.Fatal("reclamation should be disabled when the consolidation policy does not allow it")
 			}
 		})
+	}
+
+	t.Run("unannotated pool", func(t *testing.T) {
+		nodePool := &v1.NodePool{
+			ObjectMeta: metav1.ObjectMeta{Name: "score-pool"},
+			Spec: v1.NodePoolSpec{Disruption: v1.Disruption{
+				ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
+				ConsolidateAfter:    v1.MustParseNillableDuration(v1.Never),
+			}},
+		}
+		if scoreBasedReclamationDue(nodePool, now) {
+			t.Fatal("reclamation should remain disabled for an unannotated pool")
+		}
+	})
+}
+
+func TestScoreBasedReclamationIgnoresConsolidateAfter(t *testing.T) {
+	now := time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC)
+	nodePool := &v1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "score-pool",
+			Annotations: map[string]string{v1.ScoreBasedConsolidationAnnotationKey: ""},
+		},
+		Spec: v1.NodePoolSpec{Disruption: v1.Disruption{
+			ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
+			ConsolidateAfter:    v1.MustParseNillableDuration(v1.Never),
+		}},
+	}
+	if !scoreBasedReclamationDue(nodePool, now) {
+		t.Fatal("annotated reclamation must remain eligible when consolidateAfter is Never")
 	}
 }
 

@@ -102,8 +102,10 @@ func (c *consolidation) markConsolidated() {
 	c.lastConsolidationState = c.cluster.ConsolidationState()
 }
 
-// ShouldDisrupt is a predicate used to filter candidates
-func (c *consolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
+// shouldDisruptIgnoringConsolidateAfter applies the common consolidation gates that are also
+// required by score-based compaction. Score-based mode controls compaction eligibility itself,
+// so it does not use consolidateAfter or the upstream Consolidatable condition.
+func (c *consolidation) shouldDisruptIgnoringConsolidateAfter(cn *Candidate) bool {
 	// Disable consolidation for static NodePool
 	if cn.OwnedByStaticNodePool() {
 		return false
@@ -125,17 +127,27 @@ func (c *consolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
 		c.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("Node does not have label %q", corev1.LabelTopologyZone))...)
 		return false
 	}
+	// If we don't have the "WhenEmptyOrUnderutilized" policy set, we should not do any of the consolidation methods, but
+	// we should also not fire an event here to users since this can be confusing when the field on the NodePool
+	// is named "consolidationPolicy"
+	if cn.NodePool.Spec.Disruption.ConsolidationPolicy != v1.ConsolidationPolicyWhenEmptyOrUnderutilized {
+		c.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("NodePool %q has non-empty consolidation disabled", cn.NodePool.Name))...)
+		return false
+	}
+	return true
+}
+
+// ShouldDisrupt is a predicate used to filter candidates.
+func (c *consolidation) ShouldDisrupt(_ context.Context, cn *Candidate) bool {
+	if !c.shouldDisruptIgnoringConsolidateAfter(cn) {
+		return false
+	}
 	if cn.NodePool.Spec.Disruption.ConsolidateAfter.Duration == nil {
 		c.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("NodePool %q has consolidation disabled", cn.NodePool.Name))...)
 		return false
 	}
 	// Empty nodes are handled by Emptiness (reason "Empty") for correct budget accounting.
 	if cn.IsEmpty() {
-		return false
-	}
-	// WhenEmpty pools only allow empty-node deletions, which Emptiness handles.
-	if cn.NodePool.Spec.Disruption.ConsolidationPolicy == v1.ConsolidationPolicyWhenEmpty {
-		c.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("NodePool %q has consolidation policy WhenEmpty, but node is not empty", cn.NodePool.Name))...)
 		return false
 	}
 	return cn.NodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable).IsTrue()

@@ -2,6 +2,8 @@
 
 This fork adds an alternate consolidation disruption method for NodePools that opt in via annotation. It works like single-node consolidation except instead of sorting nodes by DisruptionCost it sorts them by `nodePriorityScore`, a search-guidance heuristic that ranks expensive, underused nodes higher (price divided by non-daemon pod CPU/memory requests).
 
+The annotation opts a NodePool into this behavior. Score-based consolidation applies only to dynamic NodePools whose `consolidationPolicy` is `WhenEmptyOrUnderutilized`. In score-based mode, `consolidateAfter` is ignored entirely, including `Never`. Removing the score-based annotation returns the pool to upstream consolidation behavior. An annotated pool with another policy does not run score-based consolidation; remove the annotation to use upstream consolidation for that pool.
+
 ## Configuration
 
 Add the annotation to a `NodePool`:
@@ -16,7 +18,7 @@ metadata:
 spec:
   disruption:
     consolidationPolicy: WhenEmptyOrUnderutilized
-    consolidateAfter: 0s
+    consolidateAfter: 0s # Required by the NodePool schema; ignored by score-based mode
 ```
 
 | Annotation | Meaning |
@@ -26,7 +28,8 @@ spec:
 
 ## Behavior
 
-- NodePools with the annotation are handled by the score-based consolidation method, which runs after multi-node consolidation and before single-node consolidation.
+- Eligible annotated dynamic NodePools are handled by the score-based consolidation method, which runs after multi-node consolidation and before single-node consolidation.
+- The `WhenEmptyOrUnderutilized` policy and dynamic NodePool requirement still apply, but `consolidateAfter` does not gate score-based compaction or reclamation. Its value, including `Never`, has no effect while the score-based annotation is present.
 - Annotated NodePools are excluded from emptiness, single-node consolidation, and multi-node consolidation.
 - Drift and static drift are unchanged; annotated NodePools continue to use the standard drift methods.
 - The method reports `Underutilized` as its disruption reason. Non-empty compaction honors the `Underutilized` disruption budget; empty-node reclamation is exempt from NodePool disruption budgets.
@@ -46,3 +49,5 @@ Rolling back the controller to upstream Karpenter is safe:
 - Upstream ignores the annotation and does not run score-based consolidation.
 - Annotated NodePools resume standard emptiness and underutilized consolidation behavior.
 - No manifest or CRD changes are required to roll back.
+
+Removing the annotation from an individual NodePool also returns that pool to the upstream consolidation methods.

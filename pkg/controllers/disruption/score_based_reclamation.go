@@ -334,13 +334,12 @@ func scoreBasedReclamationDue(nodePool *v1.NodePool, now time.Time) bool {
 }
 
 // scoreBasedReclamationConfigured reports whether this pool is configured for score-based dynamic
-// consolidation. Reclamation deliberately follows the same policy and consolidateAfter gates as
-// ordinary consolidation, while its own cadence is controlled separately by the reclamation interval.
+// consolidation. Its policy gate matches compaction, while its cadence is controlled separately by
+// the reclamation interval. consolidateAfter does not affect score-based mode.
 func scoreBasedReclamationConfigured(nodePool *v1.NodePool) bool {
 	return NodePoolUsesScoreBasedConsolidation(nodePool) &&
 		nodePool.Spec.Replicas == nil &&
-		nodePool.Spec.Disruption.ConsolidationPolicy == v1.ConsolidationPolicyWhenEmptyOrUnderutilized &&
-		nodePool.Spec.Disruption.ConsolidateAfter.Duration != nil
+		nodePool.Spec.Disruption.ConsolidationPolicy == v1.ConsolidationPolicyWhenEmptyOrUnderutilized
 }
 
 func scoreBasedReclamationInterval(nodePool *v1.NodePool) time.Duration {
