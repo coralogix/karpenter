@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/awslabs/operatorpkg/option"
-	"go.opentelemetry.io/otel/attribute"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -33,7 +32,6 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
-	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
@@ -89,11 +87,6 @@ func (s *ScoreBasedReclamation) ShouldDisrupt(ctx context.Context, candidate *Ca
 }
 
 func (s *ScoreBasedReclamation) ComputeCommands(ctx context.Context, _ map[string]int, candidates ...*Candidate) ([]Command, error) {
-	ctx, end := cxtracing.Start(ctx, scoreBasedReclamationSpan,
-		attribute.Int("candidate_count", len(candidates)),
-	)
-	defer end()
-
 	cmd, err := s.computeReclamationCommand(ctx, candidates)
 	if err != nil {
 		return []Command{}, err

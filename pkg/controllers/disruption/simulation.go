@@ -207,7 +207,8 @@ func simulationSchedulerOptions(ctx context.Context, extraOpts ...scheduling.Opt
 //
 //nolint:gocyclo
 func (simulator *SchedulingSimulator) Simulate(ctx context.Context, candidates ...*Candidate) (scheduling.Results, error) {
-	ctx, stopRoot := cxtracing.Measure(ctx, metrics.Measure(SimulateSchedulingDurationSeconds, map[string]string{}), "karpenter.disruption.simulate_scheduling")
+	// Scheduling simulations remain separate traces with independent sampling decisions.
+	ctx, stopRoot := cxtracing.Measure(cxtracing.WithoutSpan(ctx), metrics.Measure(SimulateSchedulingDurationSeconds, map[string]string{}), "karpenter.disruption.simulate_scheduling")
 	defer stopRoot()
 
 	candidateNames := sets.New[string]()

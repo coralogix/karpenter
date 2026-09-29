@@ -26,6 +26,9 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,6 +38,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/utils/pdb"
@@ -252,6 +256,75 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 	})
 
 	Context("Controller", func() {
+		It("traces an iteration with a span for each attempted method", func() {
+			previousProvider := otel.GetTracerProvider()
+			spanRecorder := tracetest.NewSpanRecorder()
+			otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRecorder)))
+			DeferCleanup(func() { otel.SetTracerProvider(previousProvider) })
+
+			controller := disruption.NewController(fakeClock, env.Client, prov, cloudProvider, recorder, cluster, queue,
+				disruption.WithMethods(NewMethodsWithRealValidator()...))
+			parentCtx, endParent := cxtracing.Start(ctx, "incoming")
+			_, err := controller.Reconcile(parentCtx)
+			endParent()
+			Expect(err).To(Succeed())
+
+			spans := map[string]sdktrace.ReadOnlySpan{}
+			for _, span := range spanRecorder.Ended() {
+				spans[span.Name()] = span
+			}
+			loop := spans["karpenter.disruption.loop"]
+			Expect(loop).NotTo(BeNil())
+			Expect(loop.Parent().IsValid()).To(BeFalse())
+			Expect(loop.SpanContext().TraceID()).NotTo(Equal(spans["incoming"].SpanContext().TraceID()))
+			for _, name := range []string{
+				"karpenter.disruption.emptiness",
+				"karpenter.disruption.score_based_reclamation",
+				"karpenter.disruption.static_drift",
+				"karpenter.disruption.drift",
+				"karpenter.disruption.multi_node_consolidation",
+				"karpenter.disruption.score_based_consolidation",
+				"karpenter.disruption.single_node_consolidation",
+			} {
+				method := spans[name]
+				Expect(method).NotTo(BeNil())
+				Expect(method.Parent().SpanID()).To(Equal(loop.SpanContext().SpanID()))
+			}
+		})
+
+		It("keeps scheduling simulations in separate traces from the disruption iteration", func() {
+			previousProvider := otel.GetTracerProvider()
+			spanRecorder := tracetest.NewSpanRecorder()
+			otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRecorder)))
+			DeferCleanup(func() { otel.SetTracerProvider(previousProvider) })
+
+			loopCtx, endLoop := cxtracing.Start(ctx, "karpenter.disruption.loop")
+			methodCtx, endMethod := cxtracing.Start(loopCtx, "karpenter.disruption.score_based_consolidation")
+			simulator, err := disruption.NewSchedulingSimulator(methodCtx, env.Client, cluster, prov)
+			Expect(err).To(Succeed())
+			_, err = simulator.Simulate(methodCtx)
+			Expect(err).To(Succeed())
+			endMethod()
+			endLoop()
+
+			spans := map[string]sdktrace.ReadOnlySpan{}
+			for _, span := range spanRecorder.Ended() {
+				spans[span.Name()] = span
+			}
+			loop := spans["karpenter.disruption.loop"]
+			method := spans["karpenter.disruption.score_based_consolidation"]
+			simulation := spans["karpenter.disruption.simulate_scheduling"]
+			phase := spans["karpenter.disruption.simulate_scheduling.solve"]
+			Expect(loop).NotTo(BeNil())
+			Expect(method).NotTo(BeNil())
+			Expect(simulation).NotTo(BeNil())
+			Expect(phase).NotTo(BeNil())
+			Expect(method.Parent().SpanID()).To(Equal(loop.SpanContext().SpanID()))
+			Expect(simulation.Parent().IsValid()).To(BeFalse())
+			Expect(simulation.SpanContext().TraceID()).NotTo(Equal(loop.SpanContext().TraceID()))
+			Expect(phase.Parent().SpanID()).To(Equal(simulation.SpanContext().SpanID()))
+		})
+
 		It("logs when candidate discovery finds no score-based compaction candidates", func() {
 			var output strings.Builder
 			logger := funcr.New(func(_, args string) {

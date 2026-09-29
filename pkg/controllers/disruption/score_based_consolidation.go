@@ -145,11 +145,6 @@ func (s *ScoreBasedConsolidation) compactionCandidateNonEmpty(ctx context.Contex
 
 //nolint:gocyclo
 func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
-	ctx, endConsolidation := cxtracing.Start(ctx, scoreBasedConsolidationSpan,
-		attribute.Int("candidate_count", len(candidates)),
-	)
-	defer endConsolidation()
-
 	if s.IsConsolidated() {
 		logScoreBasedCompactionNoMove(ctx, scoreBasedNoMoveAlreadyConsolidated, scoreBasedNoMoveDetails{
 			candidateCount:           len(candidates),

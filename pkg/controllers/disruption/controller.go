@@ -33,6 +33,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -48,6 +50,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
@@ -156,6 +159,9 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 }
 
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
+	// Give each disruption iteration its own trace and sampling decision.
+	ctx, end := cxtracing.Start(cxtracing.WithoutSpan(ctx), "karpenter.disruption.loop")
+	defer end()
 	ctx = injection.WithControllerName(ctx, c.Name())
 
 	// this won't catch if the reconciler loop hangs forever, but it will catch other issues
@@ -184,7 +190,12 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	// Attempt different disruption methods. We'll only let one method perform an action
 	for _, m := range c.methods {
 		c.recordRun(fmt.Sprintf("%T", m))
-		success, err := c.disrupt(ctx, m)
+		methodCtx, endMethod := cxtracing.Start(ctx, disruptionMethodSpanName(m),
+			attribute.String("method", fmt.Sprintf("%T", m)),
+			attribute.String("reason", string(m.Reason())),
+		)
+		success, err := c.disrupt(methodCtx, m)
+		endMethod()
 		if err != nil {
 			if errors.IsConflict(err) {
 				return reconciler.Result{Requeue: true}, nil
@@ -198,6 +209,27 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 
 	// All methods did nothing, so return nothing to do
 	return reconciler.Result{RequeueAfter: pollingPeriod}, nil
+}
+
+func disruptionMethodSpanName(method Method) string {
+	switch method.(type) {
+	case *Emptiness:
+		return "karpenter.disruption.emptiness"
+	case *ScoreBasedReclamation:
+		return scoreBasedReclamationSpan
+	case *StaticDrift:
+		return "karpenter.disruption.static_drift"
+	case *Drift:
+		return "karpenter.disruption.drift"
+	case *MultiNodeConsolidation:
+		return "karpenter.disruption.multi_node_consolidation"
+	case *ScoreBasedConsolidation:
+		return scoreBasedConsolidationSpan
+	case *SingleNodeConsolidation:
+		return "karpenter.disruption.single_node_consolidation"
+	default:
+		return "karpenter.disruption.method"
+	}
 }
 
 func (c *Controller) cleanupStaleDisruptionState(ctx context.Context) error {
@@ -271,6 +303,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 	if err != nil {
 		return false, fmt.Errorf("determining candidates, %w", err)
 	}
+	trace.SpanFromContext(ctx).SetAttributes(attribute.Int("candidate_count", len(candidates)))
 	EligibleNodes.Set(float64(len(candidates)), map[string]string{
 		metrics.ReasonLabel: strings.ToLower(string(disruption.Reason())),
 	})
