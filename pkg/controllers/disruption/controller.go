@@ -196,6 +196,9 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		)
 		success, err := c.disrupt(methodCtx, m)
 		endMethod()
+		if success {
+			DisruptionLoopIterationsTotal.Inc(map[string]string{disruptionLoopOutcomeLabel: disruptionLoopOutcomeCommand})
+		}
 		if err != nil {
 			if errors.IsConflict(err) {
 				return reconciler.Result{Requeue: true}, nil
@@ -208,6 +211,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	}
 
 	// All methods did nothing, so return nothing to do
+	DisruptionLoopIterationsTotal.Inc(map[string]string{disruptionLoopOutcomeLabel: disruptionLoopOutcomeNoAction})
 	return reconciler.Result{RequeueAfter: pollingPeriod}, nil
 }
 

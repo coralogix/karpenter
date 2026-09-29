@@ -27,6 +27,7 @@ import (
 const (
 	voluntaryDisruptionSubsystem = "voluntary_disruption"
 	decisionLabel                = "decision"
+	disruptionLoopOutcomeLabel   = "outcome"
 	ConsolidationTypeLabel       = "consolidation_type"
 	CandidatesIneligible         = "candidates_ineligible"
 	policyLabel                  = "policy"
@@ -38,6 +39,9 @@ const (
 	evacuationOutcomeLabel       = "outcome"
 	evacuationOutcomeCompleted   = "completed"
 	evacuationOutcomeFailed      = "failed"
+
+	disruptionLoopOutcomeCommand  = "command"
+	disruptionLoopOutcomeNoAction = "no_action"
 )
 
 func init() {
@@ -100,6 +104,16 @@ var (
 			Help:      "Number of disruption decisions performed. Labeled by disruption decision, reason, and consolidation type.",
 		},
 		[]string{decisionLabel, metrics.ReasonLabel, ConsolidationTypeLabel},
+	)
+	DisruptionLoopIterationsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "loop_iterations_total",
+			Help:      "Number of disruption loop iterations that completed a decision. Labeled by outcome: command when a command was started, or no_action when all methods completed without starting one.",
+		},
+		[]string{disruptionLoopOutcomeLabel},
 	)
 	NodepoolDecisionsPerformed = opmetrics.NewPrometheusCounter(
 		crmetrics.Registry,

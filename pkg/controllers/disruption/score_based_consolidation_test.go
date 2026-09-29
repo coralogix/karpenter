@@ -256,6 +256,37 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 	})
 
 	Context("Controller", func() {
+		It("counts an iteration with no action after all methods complete", func() {
+			controller := disruption.NewController(fakeClock, env.Client, prov, cloudProvider, recorder, cluster, queue,
+				disruption.WithMethods(&controllerBoundaryMethod{reason: v1.DisruptionReasonEmpty, typeLabel: "loop-metric-test"}))
+
+			result, err := controller.Reconcile(ctx)
+			Expect(err).To(Succeed())
+			Expect(result.RequeueAfter).To(Equal(10 * time.Second))
+			ExpectMetricCounterValue(disruption.DisruptionLoopIterationsTotal, 1, map[string]string{"outcome": "no_action"})
+			_, found := FindMetricWithLabelValues("karpenter_voluntary_disruption_loop_iterations_total", map[string]string{"outcome": "command"})
+			Expect(found).To(BeFalse())
+		})
+
+		It("does not count a no-action outcome when a method errors before starting a command", func() {
+			_, err := createScoreBasedCandidatesForPool(scoreBasedNodePool, mostExpensiveInstance)
+			Expect(err).To(Succeed())
+
+			method := &controllerBoundaryMethod{
+				reason:     v1.DisruptionReasonEmpty,
+				typeLabel:  "loop-metric-test",
+				computeErr: fmt.Errorf("decision failed"),
+			}
+			controller := disruption.NewController(fakeClock, env.Client, prov, cloudProvider, recorder, cluster, queue, disruption.WithMethods(method))
+
+			_, err = controller.Reconcile(ctx)
+			Expect(err).To(HaveOccurred())
+			_, found := FindMetricWithLabelValues("karpenter_voluntary_disruption_loop_iterations_total", map[string]string{"outcome": "no_action"})
+			Expect(found).To(BeFalse())
+			_, found = FindMetricWithLabelValues("karpenter_voluntary_disruption_loop_iterations_total", map[string]string{"outcome": "command"})
+			Expect(found).To(BeFalse())
+		})
+
 		It("traces an iteration with a span for each attempted method", func() {
 			previousProvider := otel.GetTracerProvider()
 			spanRecorder := tracetest.NewSpanRecorder()
@@ -357,6 +388,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			result, err := controller.Reconcile(ctx)
 			Expect(err).To(Succeed())
 			Expect(result.RequeueAfter).To(BeNumerically("<", time.Second))
+			ExpectMetricCounterValue(disruption.DisruptionLoopIterationsTotal, 1, map[string]string{"outcome": "command"})
 			Expect(reclamation.computeCalls).To(Equal(1))
 			Expect(compaction.computeCalls).To(BeZero(), "the controller should stop after reclamation starts a command")
 			Expect(queue.GetCommands()).To(HaveLen(1))
@@ -364,6 +396,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 
 			_, err = controller.Reconcile(ctx)
 			Expect(err).To(Succeed())
+			ExpectMetricCounterValue(disruption.DisruptionLoopIterationsTotal, 1, map[string]string{"outcome": "no_action"})
 			Expect(reclamation.computeCalls).To(Equal(2))
 			Expect(compaction.computeCalls).To(Equal(1), "compaction should run on the retry pass")
 		})
@@ -381,6 +414,9 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring(computeErr.Error()))
 			Expect(queue.HasAny(candidates[0].ProviderID())).To(BeTrue(), "the valid partial command should be queued despite the decision error")
+			ExpectMetricCounterValue(disruption.DisruptionLoopIterationsTotal, 1, map[string]string{"outcome": "command"})
+			_, found := FindMetricWithLabelValues("karpenter_voluntary_disruption_loop_iterations_total", map[string]string{"outcome": "no_action"})
+			Expect(found).To(BeFalse())
 		})
 	})
 
@@ -794,6 +830,7 @@ type controllerBoundaryMethod struct {
 	reason       v1.DisruptionReason
 	typeLabel    string
 	commandFirst bool
+	computeErr   error
 	computeCalls int
 }
 
@@ -806,7 +843,7 @@ func (m *controllerBoundaryMethod) ComputeCommands(_ context.Context, _ map[stri
 	if m.commandFirst && m.computeCalls == 1 {
 		return []disruption.Command{{Action: disruption.DeleteAction, Candidates: []*disruption.Candidate{candidates[0]}}}, nil
 	}
-	return nil, nil
+	return nil, m.computeErr
 }
 
 func (m *controllerBoundaryMethod) Reason() v1.DisruptionReason { return m.reason }
