@@ -20,13 +20,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"runtime"
 	"sort"
-	"sync/atomic"
 	"time"
 
 	"github.com/awslabs/operatorpkg/option"
-	"github.com/destel/rill"
 	"go.opentelemetry.io/otel/attribute"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -64,6 +63,15 @@ type moveSet struct {
 type moveSetEvaluation struct {
 	Command Command
 	Score   float64
+}
+
+type moveSetSearchResult struct {
+	evals       []*moveSetEvaluation
+	evaluated   int
+	timedOut    bool
+	stats       *moveSetSearchStats
+	complete    bool
+	constrained bool
 }
 
 type consolidationComputer func(ctx context.Context, candidates ...*Candidate) (Command, error)
@@ -227,16 +235,20 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	searchCtx, stopSearch := cxtracing.Measure(ctx, nil, scoreBasedConsolidationMoveSetSearchSpan,
 		attribute.Int("valid_candidate_count", len(validCandidates)),
 	)
-	evals, evaluated, timedOut, searchStats, err := s.searchForMoveSets(searchCtx, validCandidates, deadline)
+	searchResult, err := s.searchForMoveSets(searchCtx, validCandidates, disruptionBudgetMapping, deadline)
 	stopSearch()
 	if err != nil {
 		return []Command{}, err
 	}
+	evals := searchResult.evals
+	evaluated := searchResult.evaluated
+	timedOut := searchResult.timedOut
+	searchStats := searchResult.stats
 	if len(evals) == 0 {
 		if timedOut {
 			log.FromContext(ctx).V(1).Info(fmt.Sprintf("abandoning score-based consolidation due to timeout after evaluating %d candidates", evaluated))
 		}
-		if !timedOut && budgetBlockedCandidateCount == 0 && paceBlockedCandidateCount == 0 {
+		if searchResult.complete && !searchResult.constrained && !timedOut && budgetBlockedCandidateCount == 0 && paceBlockedCandidateCount == 0 {
 			s.markConsolidated()
 		}
 		reason := scoreBasedNoMoveNoPositiveFeasibleMove
@@ -316,143 +328,91 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	return []Command{cmd}, nil
 }
 
-func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCandidates []*Candidate, deadline time.Time) ([]*moveSetEvaluation, int, bool, *moveSetSearchStats, error) {
-	moveSets := make([]moveSet, len(validCandidates))
+//nolint:gocyclo // Keep the single-first decision, bounded fallback branch, and shared deadline handling together.
+func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCandidates []*Candidate, budgets map[string]int, deadline time.Time) (moveSetSearchResult, error) {
+	result := moveSetSearchResult{stats: &moveSetSearchStats{}}
+	searchCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	singleNodeMoveSets := make([]moveSet, len(validCandidates))
 	for i, candidate := range validCandidates {
-		moveSets[i] = moveSet{Nodes: []*Candidate{candidate}}
+		singleNodeMoveSets[i] = moveSet{Nodes: []*Candidate{candidate}}
 	}
-	simulatorCtx, stopSimulator := cxtracing.Measure(ctx, nil, scoreBasedConsolidationNewSimulatorSpan,
+	simulatorCtx, stopSimulator := cxtracing.Measure(searchCtx, nil, scoreBasedConsolidationNewSimulatorSpan,
 		attribute.Int("valid_candidate_count", len(validCandidates)),
 	)
 	simulator, err := NewConsolidationSchedulingSimulator(simulatorCtx, s.kubeClient, s.cluster, s.provisioner, s.clock, s.recorder, validCandidates...)
 	stopSimulator()
 	if err != nil {
-		return nil, 0, false, nil, err
+		if errors.Is(searchCtx.Err(), context.DeadlineExceeded) {
+			result.timedOut = true
+			return result, nil
+		}
+		if searchCtx.Err() != nil {
+			return result, searchCtx.Err()
+		}
+		return result, err
 	}
-	simulationCtx := cxtracing.WithoutSpan(ctx)
 	searchConsolidation := s.consolidation
 	searchConsolidation.recorder = scoreBasedSearchEventRecorder{recorder: s.recorder}
-	compute := func(_ context.Context, candidates ...*Candidate) (Command, error) {
-		cmd, err := searchConsolidation.computeConsolidation(simulationCtx, simulator, candidates...)
+	compute := func(computeCtx context.Context, candidates ...*Candidate) (Command, error) {
+		cmd, err := searchConsolidation.computeConsolidation(cxtracing.WithoutSpan(computeCtx), simulator, candidates...)
 		publishScoreBasedNoSavingsEvent(s.recorder, cmd, err)
 		return cmd, err
 	}
-	return evaluateMoveSetsPar(ctx, moveSets, deadline, compute)
-}
 
-type scoreBasedSearchEventRecorder struct {
-	recorder events.Recorder
-}
-
-func (r scoreBasedSearchEventRecorder) Publish(evts ...events.Event) {
-	forward := make([]events.Event, 0, len(evts))
-	for _, evt := range evts {
-		if evt.Reason != events.ConsolidationCandidate {
-			forward = append(forward, evt)
-		}
+	// Search every singleton before deciding whether to batch successes or explore pairs.
+	singles, evaluated, timedOut, stats, err := evaluateMoveSetsParWithStats(searchCtx, singleNodeMoveSets, deadline, compute, 0, nil, nil, result.stats)
+	result.evals = singles
+	result.evaluated += evaluated
+	result.timedOut = timedOut
+	if err != nil {
+		return result, err
 	}
-	if len(forward) > 0 {
-		r.recorder.Publish(forward...)
+	if timedOut {
+		result.evals = retainScoreBasedMoveSetResults(singles, nil, scoreBasedMoveSetResultLimit)
+		return result, nil
 	}
-}
 
-func evaluateMoveSetsPar(
-	ctx context.Context,
-	moveSets []moveSet,
-	deadline time.Time,
-	compute consolidationComputer,
-) ([]*moveSetEvaluation, int, bool, *moveSetSearchStats, error) {
-	searchStart := time.Now()
-	stats := &moveSetSearchStats{}
-
-	ctx, cancel := context.WithDeadline(ctx, deadline)
-	defer cancel()
-
-	var evaluated atomic.Int64
-
-	// Stop feeding move sets once the deadline passes so in-flight work is drained but new work is not started.
-	pending := rill.Generate(func(send func(moveSet), _ func(error)) {
-		for _, moveSet := range moveSets {
-			if ctx.Err() != nil {
-				return
+	if len(singles) > 0 {
+		zeroReplacementSingles := make([]*moveSetEvaluation, 0, len(singles))
+		for _, single := range singles {
+			if len(single.Command.Candidates) == 1 && len(single.Command.Replacements) == 0 {
+				zeroReplacementSingles = append(zeroReplacementSingles, single)
 			}
-			send(moveSet)
 		}
-	})
-
-	valid := rill.OrderedFilterMap(pending, scoreBasedMoveSetParallelism, func(moveSet moveSet) (*moveSetEvaluation, bool, error) {
-		eval := evaluateMoveSet(ctx, moveSet, compute, stats)
-		if ctx.Err() == nil {
-			evaluated.Add(1)
-			return eval, eval != nil, nil
+		batches, attempted, batchTimedOut, batchErr := growScoreBasedBatches(searchCtx, zeroReplacementSingles, budgets, s.underutilizedPace, compute, result.stats)
+		if batchErr != nil {
+			return result, batchErr
 		}
-		return nil, false, nil
-	})
+		result.evals = retainScoreBasedMoveSetResults(singles, batches, scoreBasedMoveSetResultLimit)
+		result.evaluated += attempted
+		result.timedOut = batchTimedOut
+		result.complete = !batchTimedOut
+		return result, nil
+	}
 
-	evals, err := collectMoveSetEvaluations(valid, scoreBasedMoveSetResultLimit)
-	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
-	logMoveSetSearchComplete(ctx, len(moveSets), int(evaluated.Load()), len(evals), timedOut, time.Since(searchStart), stats)
+	// If every singleton completed without a positive feasible move, sample pairs with higher
+	// probability for lower-utilization nodes. Pair generation is bounded and deadline-aware.
+	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // Random order only guides this non-security-sensitive search.
+	pairs, exhaustive, constrained := scoreBasedPairMoveSets(searchCtx, validCandidates, budgets, s.underutilizedPace, scoreBasedPairSearchLimit, rng)
+	result.constrained = constrained
+	if searchCtx.Err() != nil {
+		if !errors.Is(searchCtx.Err(), context.DeadlineExceeded) {
+			return result, searchCtx.Err()
+		}
+		result.timedOut = true
+		return result, nil
+	}
+	pairEvals, pairEvaluated, pairTimedOut, _, err := evaluateMoveSetsParWithStats(searchCtx, pairs, deadline, compute, scoreBasedMoveSetResultLimit,
+		func(cmd Command) bool { return len(cmd.Candidates) == 2 && len(cmd.Replacements) == 1 }, nil, stats)
 	if err != nil {
-		return nil, int(evaluated.Load()), timedOut, stats, err
+		return result, err
 	}
-	if ctx.Err() != nil && !timedOut {
-		return nil, int(evaluated.Load()), false, stats, ctx.Err()
-	}
-	if timedOut && len(evals) == 0 {
-		ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
-	}
-	return evals, int(evaluated.Load()), timedOut, stats, nil
-}
-
-func evaluateMoveSet(ctx context.Context, moveSet moveSet, compute consolidationComputer, stats *moveSetSearchStats) *moveSetEvaluation {
-	select {
-	case <-ctx.Done():
-		return nil
-	default:
-	}
-
-	start := time.Now()
-	cmd, err := compute(ctx, moveSet.Nodes...)
-	stats.record(time.Since(start), err)
-	select {
-	case <-ctx.Done():
-		return nil
-	default:
-	}
-	if err != nil {
-		return nil
-	}
-	if cmd.Decision() == NoOpDecision {
-		stats.recordNoOpMoveSet()
-		return nil
-	}
-	if cmd.EstimatedSavings() <= 0 {
-		stats.recordNonPositiveSavingsMoveSet()
-		return nil
-	}
-	return &moveSetEvaluation{
-		Command: cmd,
-		Score:   moveSetPriorityScore(cmd),
-	}
-}
-
-func collectMoveSetEvaluations(valid <-chan rill.Try[*moveSetEvaluation], limit int) ([]*moveSetEvaluation, error) {
-	defer rill.Discard(valid)
-
-	var evals []*moveSetEvaluation
-	for a := range valid {
-		if a.Error != nil {
-			return nil, a.Error
-		}
-		evals = append(evals, a.Value)
-	}
-	sort.Slice(evals, func(i, j int) bool {
-		return evals[i].Score > evals[j].Score
-	})
-	if len(evals) > limit {
-		evals = evals[:limit]
-	}
-	return evals, nil
+	result.evals = pairEvals
+	result.evaluated += pairEvaluated
+	result.timedOut = pairTimedOut
+	result.complete = exhaustive && !pairTimedOut
+	return result, nil
 }
 
 func selectFirstStillValidCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation) (Command, int, error) {

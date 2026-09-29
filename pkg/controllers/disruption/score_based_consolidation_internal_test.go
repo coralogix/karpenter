@@ -19,6 +19,7 @@ package disruption
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,11 +31,13 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
+	clocktesting "k8s.io/utils/clock/testing"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
@@ -270,6 +273,242 @@ func TestMoveSetPriorityScore(t *testing.T) {
 	if got := moveSetPriorityScore(multiCmd); got != 152 {
 		t.Fatalf("multi-node move set score = %v, want 152", got)
 	}
+}
+
+func TestScoreBasedPairSamplingWeightsFavorLowUtilizationWithoutExcludingHigh(t *testing.T) {
+	if low, high := scoreBasedPairSamplingWeight(0.1), scoreBasedPairSamplingWeight(0.95); low <= high || high <= 0 {
+		t.Fatalf("pair weights for low/high utilization = %v/%v, want low > high > 0", low, high)
+	}
+
+	weights := []float64{1, 9, 1, 10}
+	prefix := []float64{1, 10, 11, 21}
+	rng := rand.New(rand.NewSource(42)) //nolint:gosec // A fixed seed makes this sampler-distribution test repeatable.
+	counts := make([]int, len(weights))
+	const samples = 120_000
+	for range samples {
+		index := weightedCandidateIndex(rng, weights, prefix, 1)
+		if index == 1 {
+			t.Fatal("weighted sampling selected the excluded candidate")
+		}
+		counts[index]++
+	}
+	for index, want := range map[int]float64{0: 1.0 / 12, 2: 1.0 / 12, 3: 10.0 / 12} {
+		got := float64(counts[index]) / samples
+		if delta := got - want; delta < -0.01 || delta > 0.01 {
+			t.Errorf("candidate %d sampled at %.3f, want approximately %.3f", index, got, want)
+		}
+	}
+}
+
+func TestGrowScoreBasedBatchesUsesAdditiveSingleScoresAndRequiresZeroReplacement(t *testing.T) {
+	first := scoreBasedBatchTestCandidate("first", "pool")
+	second := scoreBasedBatchTestCandidate("second", "pool")
+	third := scoreBasedBatchTestCandidate("third", "pool")
+	singletons := []*moveSetEvaluation{
+		{Command: Command{Candidates: []*Candidate{first}}, Score: 4},
+		{Command: Command{Candidates: []*Candidate{second}}, Score: 3},
+		{Command: Command{Candidates: []*Candidate{third}}, Score: 2},
+	}
+	compute := func(_ context.Context, candidates ...*Candidate) (Command, error) {
+		if len(candidates) == 1 {
+			return Command{Candidates: candidates}, nil
+		}
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "result-marker", Namespace: "default"}}
+		return Command{Candidates: candidates, Results: pscheduling.Results{PodErrors: map[*corev1.Pod]error{pod: fmt.Errorf("retained simulation result")}}}, nil
+	}
+	batches, _, timedOut, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 3}, nil, compute, &moveSetSearchStats{})
+	if err != nil || timedOut {
+		t.Fatalf("growScoreBasedBatches() error/timedOut = %v/%v, want nil/false", err, timedOut)
+	}
+	assertAdditiveBatchResults(t, batches, map[string]float64{
+		candidateMoveSetKey([]*Candidate{first}):  4,
+		candidateMoveSetKey([]*Candidate{second}): 3,
+		candidateMoveSetKey([]*Candidate{third}):  2,
+	})
+
+	replacementCompute := func(_ context.Context, candidates ...*Candidate) (Command, error) {
+		if len(candidates) > 1 {
+			return Command{Candidates: candidates, Replacements: []*Replacement{{Name: "replacement"}}}, nil
+		}
+		return Command{Candidates: candidates}, nil
+	}
+	withoutZeroReplacement, _, _, err := growScoreBasedBatches(context.Background(), singletons[:2], map[string]int{"pool": 2}, nil, replacementCompute, &moveSetSearchStats{})
+	if err != nil {
+		t.Fatalf("growScoreBasedBatches() with replacement error = %v", err)
+	}
+	if len(withoutZeroReplacement) != 0 {
+		t.Fatalf("replacement batches retained = %d, want none", len(withoutZeroReplacement))
+	}
+}
+
+func assertAdditiveBatchResults(t *testing.T, batches []*moveSetEvaluation, scoreByCandidate map[string]float64) {
+	t.Helper()
+	var foundTwoNodeBatch, foundThreeNodeBatch bool
+	for _, batch := range batches {
+		var wantScore float64
+		for _, candidate := range batch.Command.Candidates {
+			wantScore += scoreByCandidate[candidateMoveSetKey([]*Candidate{candidate})]
+		}
+		if batch.Score != wantScore {
+			t.Errorf("batch score = %v, want sum of singleton scores %v", batch.Score, wantScore)
+		}
+		if len(batch.Command.Results.PodErrors) != 1 {
+			t.Errorf("batch scheduling result PodErrors = %v, want retained simulation result", batch.Command.Results.PodErrors)
+		}
+		switch len(batch.Command.Candidates) {
+		case 2:
+			foundTwoNodeBatch = true
+		case 3:
+			foundThreeNodeBatch = true
+		}
+	}
+	if !foundTwoNodeBatch || !foundThreeNodeBatch {
+		t.Fatalf("batch sizes retained = %v, want feasible two- and three-node fallbacks", batchSizes(batches))
+	}
+}
+
+func TestScoreBasedBatchPlanningEnforcesBudgetsPacingAndDeadline(t *testing.T) {
+	first := scoreBasedBatchTestCandidate("first", "pool")
+	second := scoreBasedBatchTestCandidate("second", "pool")
+	singletons := []*moveSetEvaluation{
+		{Command: Command{Candidates: []*Candidate{first}}, Score: 2},
+		{Command: Command{Candidates: []*Candidate{second}}, Score: 1},
+	}
+	computeCalls := 0
+	compute := func(_ context.Context, candidates ...*Candidate) (Command, error) {
+		computeCalls++
+		return Command{Candidates: candidates}, nil
+	}
+
+	batches, attempted, _, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 1}, nil, compute, &moveSetSearchStats{})
+	if err != nil {
+		t.Fatalf("budget-limited batch search error = %v", err)
+	}
+	if len(batches) != 0 || attempted != 0 || computeCalls != 0 {
+		t.Fatalf("budget-limited search returned %d batches after %d simulations (%d compute calls), want all zero", len(batches), attempted, computeCalls)
+	}
+
+	first.NodePool.Annotations = map[string]string{
+		v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey: "5",
+		v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey:    "1",
+	}
+	second.NodePool = first.NodePool
+	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
+	batches, attempted, _, err = growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 2}, pace, compute, &moveSetSearchStats{})
+	if err != nil {
+		t.Fatalf("pace-limited batch search error = %v", err)
+	}
+	if len(batches) != 0 || attempted != 0 || computeCalls != 0 {
+		t.Fatalf("pace-limited search returned %d batches after %d simulations (%d compute calls), want all zero", len(batches), attempted, computeCalls)
+	}
+
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	_, _, timedOut, err := growScoreBasedBatches(expired, singletons, map[string]int{"pool": 2}, nil, compute, &moveSetSearchStats{})
+	if err != nil || !timedOut {
+		t.Fatalf("expired batch search error/timedOut = %v/%v, want nil/true", err, timedOut)
+	}
+}
+
+func TestScoreBasedPairSearchSamplesUniqueBoundedPairs(t *testing.T) {
+	candidates := []*Candidate{
+		scoreBasedBatchTestCandidate("one", "pool"),
+		scoreBasedBatchTestCandidate("two", "pool"),
+		scoreBasedBatchTestCandidate("three", "pool"),
+		scoreBasedBatchTestCandidate("four", "pool"),
+	}
+	pairs, exhaustive, constrained := scoreBasedPairMoveSets(context.Background(), candidates, map[string]int{"pool": 4}, nil, 3, rand.New(rand.NewSource(1))) //nolint:gosec // Fixed seed makes pair-set sampling deterministic.
+	if exhaustive || constrained {
+		t.Fatalf("pair search exhaustive/constrained = %v/%v, want false/false", exhaustive, constrained)
+	}
+	if len(pairs) != 3 {
+		t.Fatalf("sampled pairs = %d, want limit 3", len(pairs))
+	}
+	seen := map[string]struct{}{}
+	for _, pair := range pairs {
+		if len(pair.Nodes) != 2 {
+			t.Fatalf("pair candidate count = %d, want 2", len(pair.Nodes))
+		}
+		key := candidateMoveSetKey(pair.Nodes)
+		if _, found := seen[key]; found {
+			t.Fatalf("duplicate sampled pair %q", key)
+		}
+		seen[key] = struct{}{}
+	}
+}
+
+func TestRetainScoreBasedMoveSetResultsKeepsBestSingletonAndSmallBatchWithinLimit(t *testing.T) {
+	single := scoreBasedBatchTestCandidate("best-single", "pool")
+	singles := []*moveSetEvaluation{{Command: Command{Candidates: []*Candidate{single}}, Score: 100}}
+	var batches []*moveSetEvaluation
+	for i := 0; i < 12; i++ {
+		candidates := make([]*Candidate, 0, i+2)
+		for j := 0; j < i+2; j++ {
+			candidates = append(candidates, scoreBasedBatchTestCandidate(fmt.Sprintf("batch-%d-node-%d", i, j), fmt.Sprintf("pool-%d", i)))
+		}
+		batches = append(batches, &moveSetEvaluation{Command: Command{Candidates: candidates}, Score: float64(1000 + i)})
+	}
+	retained := retainScoreBasedMoveSetResults(singles, batches, 10)
+	if len(retained) > 10 {
+		t.Fatalf("retained results = %d, want at most 10", len(retained))
+	}
+	bestSingletonRetained, smallestBatchRetained := false, false
+	for _, eval := range retained {
+		if candidateMoveSetKey(eval.Command.Candidates) == candidateMoveSetKey([]*Candidate{single}) {
+			bestSingletonRetained = true
+		}
+		if len(eval.Command.Candidates) == 2 {
+			smallestBatchRetained = true
+		}
+	}
+	if !bestSingletonRetained || !smallestBatchRetained {
+		t.Fatalf("best singleton/smallest batch retained = %v/%v, want true/true", bestSingletonRetained, smallestBatchRetained)
+	}
+}
+
+func scoreBasedBatchTestCandidate(name, pool string) *Candidate {
+	offering := &cloudprovider.Offering{
+		Price: 0.2,
+		Requirements: scheduling.NewLabelRequirements(map[string]string{
+			v1.CapacityTypeLabelKey:  v1.CapacityTypeOnDemand,
+			corev1.LabelTopologyZone: "us-east-1a",
+		}),
+	}
+	instanceType := &cloudprovider.InstanceType{
+		Name: "m5.large",
+		Capacity: corev1.ResourceList{
+			corev1.ResourceCPU: resource.MustParse("2"),
+		},
+		Offerings: cloudprovider.Offerings{offering},
+	}
+	claim := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: name,
+		Labels: map[string]string{
+			corev1.LabelInstanceTypeStable: instanceType.Name,
+			v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
+			corev1.LabelTopologyZone:       "us-east-1a",
+		},
+	}, Spec: corev1.NodeSpec{ProviderID: name}}
+	stateNode := state.NewNode()
+	stateNode.Node = node
+	stateNode.NodeClaim = claim
+	return &Candidate{
+		StateNode:         stateNode,
+		instanceType:      instanceType,
+		NodePool:          &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: pool}},
+		capacityType:      v1.CapacityTypeOnDemand,
+		zone:              "us-east-1a",
+		reschedulablePods: []*corev1.Pod{{}},
+	}
+}
+
+func batchSizes(evals []*moveSetEvaluation) []int {
+	sizes := make([]int, 0, len(evals))
+	for _, eval := range evals {
+		sizes = append(sizes, len(eval.Command.Candidates))
+	}
+	return sizes
 }
 
 func TestEvaluateMoveSetsPar_respectsOrder(t *testing.T) {

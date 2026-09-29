@@ -219,6 +219,7 @@ func logScoreBasedCompactionMoveSelected(
 		"priorityRank", selectedEvalIdx+1,
 		"moveSetsEvaluated", candidatesEvaluated,
 		"compactionCandidateCount", compactionCandidateCount,
+		"candidateNodeCount", len(cmd.Candidates),
 		"node", candidate.Name(),
 		"nodePool", candidate.NodePool.Name,
 		"instanceType", candidate.Labels()[corev1.LabelInstanceTypeStable],
