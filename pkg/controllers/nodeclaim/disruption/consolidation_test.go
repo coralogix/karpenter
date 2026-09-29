@@ -131,6 +131,33 @@ var _ = Describe("Underutilized", func() {
 		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable)).To(BeNil())
 	})
+	It("should mark score-based NodeClaims consolidatable without waiting for consolidateAfter", func() {
+		nodePool.Spec.Disruption.ConsolidateAfter = v1.MustParseNillableDuration("Never")
+		if nodePool.Annotations == nil {
+			nodePool.Annotations = map[string]string{}
+		}
+		nodePool.Annotations[v1.ScoreBasedConsolidationAnnotationKey] = ""
+		nodeClaim.Status.LastPodEventTime.Time = fakeClock.Now()
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimDisruptionController, nodeClaim)
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable).IsTrue()).To(BeTrue())
+	})
+	It("should preserve consolidateAfter behavior for annotated NodePools with another policy", func() {
+		nodePool.Spec.Disruption.ConsolidationPolicy = v1.ConsolidationPolicyWhenEmpty
+		nodePool.Spec.Disruption.ConsolidateAfter = v1.MustParseNillableDuration("Never")
+		if nodePool.Annotations == nil {
+			nodePool.Annotations = map[string]string{}
+		}
+		nodePool.Annotations[v1.ScoreBasedConsolidationAnnotationKey] = ""
+		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+
+		ExpectObjectReconciled(ctx, env.Client, nodeClaimDisruptionController, nodeClaim)
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable)).To(BeNil())
+	})
 	It("should remove the status condition from the nodeClaim when the nodeClaim initialization condition is unknown", func() {
 		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
 		nodeClaim.StatusConditions().SetUnknown(v1.ConditionTypeInitialized)

@@ -19,8 +19,10 @@ package disruption_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -28,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -249,6 +252,20 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 	})
 
 	Context("Controller", func() {
+		It("logs when candidate discovery finds no score-based compaction candidates", func() {
+			var output strings.Builder
+			logger := funcr.New(func(_, args string) {
+				output.WriteString(args)
+				output.WriteByte('\n')
+			}, funcr.Options{})
+			controller := disruption.NewController(fakeClock, env.Client, prov, cloudProvider, recorder, cluster, queue, disruption.WithMethods(scoreBased))
+
+			_, err := controller.Reconcile(log.IntoContext(ctx, logger))
+			Expect(err).To(Succeed())
+			Expect(output.String()).To(ContainSubstring("score-based consolidation made no move"))
+			Expect(output.String()).To(ContainSubstring(`"reason"="no_eligible_candidates"`))
+		})
+
 		It("places score-based reclamation immediately after empty consolidation", func() {
 			methods := NewMethodsWithRealValidator()
 			Expect(methods).To(HaveLen(7))
@@ -308,6 +325,86 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			commands, err := scoreBased.ComputeCommands(ctx, budgets, candidates...)
 			Expect(err).To(Succeed())
 			Expect(commands).To(BeEmpty())
+		})
+
+		It("reports an exhausted effective budget caused by an in-flight disruption", func() {
+			scoreBasedNodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "1"}}
+			ExpectApplied(ctx, env.Client, scoreBasedNodePool)
+			candidates, err := createScoreBasedCandidatesForPool(scoreBasedNodePool, mostExpensiveInstance)
+			Expect(err).To(Succeed())
+
+			inFlightNodeClaim, inFlightNode := test.NodeClaimAndNode(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "in-flight-budget-nodeclaim",
+					Labels: map[string]string{
+						v1.NodePoolLabelKey:            scoreBasedNodePool.Name,
+						corev1.LabelInstanceTypeStable: leastExpensiveInstance.Name,
+						v1.CapacityTypeLabelKey:        leastExpensiveOffering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+						corev1.LabelTopologyZone:       leastExpensiveOffering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+					},
+				},
+				Status: v1.NodeClaimStatus{
+					Allocatable: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("32")},
+				},
+			})
+			ExpectApplied(ctx, env.Client, inFlightNodeClaim, inFlightNode)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*corev1.Node{inFlightNode}, []*v1.NodeClaim{inFlightNodeClaim})
+			ExpectMakeNodesNotReady(ctx, env.Client, inFlightNode)
+			ExpectReconcileSucceeded(ctx, nodeStateController, client.ObjectKeyFromObject(inFlightNode))
+
+			recorder.Reset()
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, fakeClock, env.Client, cloudProvider, recorder, scoreBased.Reason())
+			Expect(err).To(Succeed())
+			Expect(budgets[scoreBasedNodePool.Name]).To(Equal(0))
+			Expect(recorder.Calls("DisruptionBlocked")).To(BeZero(), "the configured allowance is positive, so the helper should not report a fully blocking budget")
+
+			var logOutput strings.Builder
+			logCtx := log.IntoContext(ctx, funcr.New(func(_, args string) { logOutput.WriteString(args) }, funcr.Options{}))
+			commands, err := scoreBased.ComputeCommands(logCtx, budgets, candidates...)
+			Expect(err).To(Succeed())
+			Expect(commands).To(BeEmpty())
+			Expect(recorder.DetectedEvent("No allowed Underutilized disruptions because the NodePool's allowed disruptions are already in flight")).To(BeTrue())
+			Expect(logOutput.String()).To(ContainSubstring(`"budgetBlockedNodePools"=["score-based-pool"]`))
+		})
+
+		It("does not report effective exhaustion when the configured allowance is zero", func() {
+			scoreBasedNodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
+			ExpectApplied(ctx, env.Client, scoreBasedNodePool)
+			candidates, err := createScoreBasedCandidatesForPool(scoreBasedNodePool, mostExpensiveInstance)
+			Expect(err).To(Succeed())
+
+			recorder.Reset()
+			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, fakeClock, env.Client, cloudProvider, recorder, scoreBased.Reason())
+			Expect(err).To(Succeed())
+			Expect(budgets[scoreBasedNodePool.Name]).To(Equal(0))
+			Expect(recorder.Calls("DisruptionBlocked")).To(Equal(1), "the budget builder already reports a configured allowance of zero")
+
+			commands, err := scoreBased.ComputeCommands(ctx, budgets, candidates...)
+			Expect(err).To(Succeed())
+			Expect(commands).To(BeEmpty())
+			Expect(recorder.Calls("DisruptionBlocked")).To(Equal(1), "score-based consolidation should not duplicate the configured-zero budget event")
+		})
+	})
+
+	Context("Pacing", func() {
+		It("reports NodePool pacing when the rate limit blocks compaction", func() {
+			scoreBasedNodePool.Annotations[v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey] = "1"
+			ExpectApplied(ctx, env.Client, scoreBasedNodePool)
+			candidates, err := createScoreBasedCandidatesForPool(scoreBasedNodePool, mostExpensiveInstance)
+			Expect(err).To(Succeed())
+
+			pace := disruption.NewUnderutilizedConsolidationPace(fakeClock)
+			pace.Charge(&disruption.Command{Candidates: candidates})
+			paced := disruption.NewScoreBasedConsolidation(disruption.MakeConsolidation(fakeClock, cluster, env.Client, prov, cloudProvider, recorder, queue, pace))
+			recorder.Reset()
+			var logOutput strings.Builder
+			logCtx := log.IntoContext(ctx, funcr.New(func(_, args string) { logOutput.WriteString(args) }, funcr.Options{}))
+			commands, err := paced.ComputeCommands(logCtx, map[string]int{scoreBasedNodePool.Name: 1}, candidates...)
+			Expect(err).To(Succeed())
+			Expect(commands).To(BeEmpty())
+			Expect(recorder.DetectedEvent(fmt.Sprintf("Underutilized consolidation is waiting for NodePool pace limit %s=1 disruptions per minute", v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey))).To(BeTrue())
+			Expect(recorder.Calls("DisruptionBlocked")).To(Equal(1))
+			Expect(logOutput.String()).To(ContainSubstring(`"paceBlockedNodePools"=["score-based-pool"]`))
 		})
 	})
 
@@ -423,6 +520,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 
 			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, fakeClock, env.Client, cloudProvider, recorder, scoreBased.Reason())
 			Expect(err).To(Succeed())
+			recorder.Reset()
 			var commands []disruption.Command
 			ExpectParallelized(
 				func() {
@@ -438,6 +536,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Expect(commands[0].Action).To(Equal(disruption.EvacuateAction))
 			Expect(commands[0].Candidates).To(HaveLen(1))
 			Expect(commands[0].Candidates[0].Name()).To(Equal(expectedCandidate.Name()))
+			Expect(recorder.Calls("ConsolidationCandidate")).To(Equal(2), "the selected move should emit one event on its Node and NodeClaim")
 		})
 
 		It("should not pace empty annotated pool nodes", func() {
@@ -589,6 +688,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, scoreBasedConsolidation.ShouldDisrupt, scoreBasedConsolidation.Class(), queue)
 			Expect(err).To(Succeed())
 
+			recorder.Reset()
 			var cmds []disruption.Command
 			ExpectParallelized(
 				func() {
@@ -601,6 +701,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			)
 			Expect(err).To(Succeed())
 			Expect(cmds).To(Equal([]disruption.Command{}))
+			Expect(recorder.Calls("ConsolidationCandidate")).To(BeZero(), "a rejected move should not be reported as a consolidation candidate")
 
 			Expect(scoreBasedConsolidation.IsConsolidated()).To(BeFalse())
 			ExpectMetricCounterValue(disruption.FailedValidationsTotal, 1, map[string]string{disruption.ConsolidationTypeLabel: scoreBasedConsolidation.ConsolidationType()})

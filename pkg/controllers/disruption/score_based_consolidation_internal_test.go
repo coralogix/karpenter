@@ -25,10 +25,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -54,6 +57,42 @@ func TestNodePoolUsesScoreBasedConsolidation(t *testing.T) {
 				t.Fatalf("NodePoolUsesScoreBasedConsolidation() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestLogScoreBasedCompactionNoMoveSummarizesBlockedPools(t *testing.T) {
+	var output string
+	ctx := log.IntoContext(context.Background(), funcr.New(func(_, args string) {
+		output = args
+	}, funcr.Options{}))
+	logScoreBasedCompactionNoMove(ctx, scoreBasedNoMoveBudgetOrPaceFiltered, scoreBasedNoMoveDetails{
+		candidateCount:                 6,
+		compactionCandidateCount:       6,
+		budgetBlockedCandidateCount:    3,
+		budgetBlockedNodePools:         map[string]struct{}{"zeta": {}, "alpha": {}},
+		paceBlockedCandidateCount:      2,
+		paceBlockedNodePools:           map[string]struct{}{"gamma": {}, "beta": {}},
+		validCandidateCount:            1,
+		moveSetsEvaluated:              1,
+		noOpMoveSetCount:               2,
+		nonPositiveSavingsMoveSetCount: 3,
+	})
+
+	for _, field := range []string{
+		`"reason"="budget_or_pace_filtered"`,
+		`"candidateCount"=6`,
+		`"budgetBlockedCandidateCount"=3`,
+		`"paceBlockedCandidateCount"=2`,
+		`"validCandidateCount"=1`,
+		`"noOpMoveSetCount"=2`,
+		`"nonPositiveSavingsMoveSetCount"=3`,
+	} {
+		if !strings.Contains(output, field) {
+			t.Errorf("log output %q does not contain %q", output, field)
+		}
+	}
+	if strings.Index(output, "alpha") > strings.Index(output, "zeta") || strings.Index(output, "beta") > strings.Index(output, "gamma") {
+		t.Fatalf("blocked NodePool names are not sorted in log output: %s", output)
 	}
 }
 
@@ -256,7 +295,7 @@ func TestEvaluateMoveSetsPar_respectsOrder(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	winner, evaluated, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(time.Second), compute)
+	winner, evaluated, _, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(time.Second), compute)
 	if err != nil {
 		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
 	}
@@ -288,7 +327,7 @@ func TestEvaluateMoveSetsPar_stopsOnDeadline(t *testing.T) {
 		}
 	}
 
-	winner, evaluated, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(-time.Millisecond), compute)
+	winner, evaluated, timedOut, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(-time.Millisecond), compute)
 	if err != nil {
 		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
 	}
@@ -297,6 +336,9 @@ func TestEvaluateMoveSetsPar_stopsOnDeadline(t *testing.T) {
 	}
 	if evaluated != 0 {
 		t.Fatalf("evaluated = %d, want 0", evaluated)
+	}
+	if !timedOut {
+		t.Fatal("timedOut = false, want true")
 	}
 }
 
@@ -314,7 +356,7 @@ func TestEvaluateMoveSetsPar_returnsTopResultsAfterSearch(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	evals, evaluated, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(time.Second), compute)
+	evals, evaluated, _, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(time.Second), compute)
 	if err != nil {
 		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
 	}
@@ -358,7 +400,7 @@ func TestEvaluateMoveSetsPar_returnsPartialOnTimeout(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	evals, evaluated, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(100*time.Millisecond), compute)
+	evals, evaluated, timedOut, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(100*time.Millisecond), compute)
 	if err != nil {
 		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
 	}
@@ -371,9 +413,12 @@ func TestEvaluateMoveSetsPar_returnsPartialOnTimeout(t *testing.T) {
 	if evaluated != 1 {
 		t.Fatalf("evaluated = %d, want 1", evaluated)
 	}
+	if !timedOut {
+		t.Fatal("timedOut = false, want true")
+	}
 }
 
-func TestSelectFirstValidatedCommand_validationFallback(t *testing.T) {
+func TestSelectFirstValidatedCommand_validationFallbackReportsRejectedAttempt(t *testing.T) {
 	ctx := context.Background()
 	fakeRecorder := record.NewFakeRecorder(10)
 	recorder := events.NewRecorder(fakeRecorder)
@@ -402,12 +447,16 @@ func TestSelectFirstValidatedCommand_validationFallback(t *testing.T) {
 	if cmd.Candidates[0] != lowScoreCandidate {
 		t.Fatal("expected fallback to lower-scored command after validation rejection")
 	}
-	if got := len(collectFakeRecorderEvents(fakeRecorder)); got != 0 {
-		t.Fatalf("rejected events = %d, want 0 when a fallback command passes validation", got)
+	rejectedEvents := collectFakeRecorderEvents(fakeRecorder)
+	if !eventsMentioningNode(rejectedEvents, "high-score") {
+		t.Fatal("expected rejected events for the failed high-score command")
+	}
+	if eventsMentioningNode(rejectedEvents, "low-score") {
+		t.Fatal("did not expect rejected events for the validated fallback command")
 	}
 }
 
-func TestSelectFirstValidatedCommand_emitsRejectedEventOnlyForFirstEvalWhenAllFail(t *testing.T) {
+func TestSelectFirstValidatedCommand_emitsRejectedEventForEachAttemptWhenAllFail(t *testing.T) {
 	ctx := context.Background()
 	fakeRecorder := record.NewFakeRecorder(10)
 	recorder := events.NewRecorder(fakeRecorder)
@@ -434,12 +483,45 @@ func TestSelectFirstValidatedCommand_emitsRejectedEventOnlyForFirstEvalWhenAllFa
 	}
 
 	rejectedEvents := collectFakeRecorderEvents(fakeRecorder)
-	if eventsMentioningNode(rejectedEvents, "low-score") {
-		t.Fatal("did not expect rejected events for fallback eval")
+	if !eventsMentioningNode(rejectedEvents, "low-score") || !eventsMentioningNode(rejectedEvents, "high-score") {
+		t.Fatal("expected rejected events for each command that failed validation")
 	}
-	if !eventsMentioningNode(rejectedEvents, "high-score") {
-		t.Fatal("expected rejected events for the first eval when all validations fail")
+}
+
+func TestScoreBasedSearchEventRecorderSuppressesOnlyCandidateEvents(t *testing.T) {
+	capture := &capturedEventRecorder{}
+	recorder := scoreBasedSearchEventRecorder{recorder: capture}
+	recorder.Publish(
+		events.Event{Reason: events.ConsolidationCandidate},
+		events.Event{Reason: events.Unconsolidatable},
+	)
+	if len(capture.events) != 1 || capture.events[0].Reason != events.Unconsolidatable {
+		t.Fatalf("forwarded events = %#v, want only the Unconsolidatable blocker event", capture.events)
 	}
+}
+
+func TestPublishScoreBasedNoSavingsEventIsDedupeable(t *testing.T) {
+	fakeRecorder := record.NewFakeRecorder(10)
+	recorder := events.NewRecorder(fakeRecorder)
+	candidate := candidateWithPrice(t, 0)
+	candidate.Node.UID = "node-uid"
+	candidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "nodeclaim", UID: "nodeclaim-uid"}}
+	cmd := Command{Candidates: []*Candidate{candidate}}
+
+	publishScoreBasedNoSavingsEvent(recorder, cmd, nil)
+	publishScoreBasedNoSavingsEvent(recorder, cmd, nil)
+	recorded := collectFakeRecorderEvents(fakeRecorder)
+	if len(recorded) != 2 {
+		t.Fatalf("recorded Unconsolidatable events = %d, want one per Node and NodeClaim after deduplication", len(recorded))
+	}
+}
+
+type capturedEventRecorder struct {
+	events []events.Event
+}
+
+func (r *capturedEventRecorder) Publish(evts ...events.Event) {
+	r.events = append(r.events, evts...)
 }
 
 func collectFakeRecorderEvents(fakeRecorder *record.FakeRecorder) []string {

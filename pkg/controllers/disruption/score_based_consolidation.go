@@ -18,6 +18,7 @@ package disruption
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"sort"
@@ -27,11 +28,13 @@ import (
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/destel/rill"
 	"go.opentelemetry.io/otel/attribute"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/events"
+	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
@@ -148,10 +151,15 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	defer endConsolidation()
 
 	if s.IsConsolidated() {
+		logScoreBasedCompactionNoMove(ctx, scoreBasedNoMoveAlreadyConsolidated, scoreBasedNoMoveDetails{
+			candidateCount:           len(candidates),
+			compactionCandidateCount: -1,
+		})
 		return []Command{}, nil
 	}
 
 	prepareCtx, stopPrepare := cxtracing.Measure(ctx, nil, scoreBasedConsolidationPrepareSpan)
+	inputCandidateCount := len(candidates)
 	normalCandidates := make([]*Candidate, 0, len(candidates))
 	for _, candidate := range candidates {
 		if candidate == nil || candidate.NodePool == nil || standby.IsNodeClaimActivating(candidate.NodeClaim) || standby.IsNodeClaimStandby(candidate.NodeClaim) || standby.HasNodeTaint(candidate.Node) {
@@ -164,13 +172,23 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	stopPrepare()
 	candidates = normalCandidates
 	if len(candidates) == 0 {
+		reason := scoreBasedNoMoveAllCandidatesFiltered
+		if inputCandidateCount == 0 {
+			reason = scoreBasedNoMoveNoEligibleCandidates
+		}
+		logScoreBasedCompactionNoMove(ctx, reason, scoreBasedNoMoveDetails{
+			candidateCount:           inputCandidateCount,
+			compactionCandidateCount: 0,
+		})
 		return []Command{}, nil
 	}
 
 	start := s.clock.Now()
 	deadline := start.Add(ScoreBasedConsolidationTimeoutDuration)
-	constrainedByBudgets := false
-	constrainedByPace := false
+	budgetBlockedCandidateCount := 0
+	paceBlockedCandidateCount := 0
+	budgetBlockedNodePools := map[string]struct{}{}
+	paceBlockedNodePools := map[string]struct{}{}
 
 	_, stopFilter := cxtracing.Measure(ctx, nil, scoreBasedConsolidationFilterSpan,
 		attribute.Int("compaction_candidate_count", len(candidates)),
@@ -179,33 +197,72 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	var validCandidates []*Candidate
 	for _, candidate := range candidates {
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
-			constrainedByBudgets = true
+			budgetBlockedCandidateCount++
+			if _, checked := budgetBlockedNodePools[candidate.NodePool.Name]; !checked {
+				budgetBlockedNodePools[candidate.NodePool.Name] = struct{}{}
+				if s.budgetExhaustedByInFlightDisruptions(candidate.NodePool) {
+					s.recorder.Publish(scoreBasedNodePoolBlockedByInFlightDisruptions(candidate.NodePool))
+				}
+			}
 			continue
 		}
 		if len(candidate.reschedulablePods) > 0 && !s.underutilizedPace.candidateAllowed(candidate.NodePool, 0) {
-			constrainedByPace = true
+			paceBlockedCandidateCount++
+			if _, reported := paceBlockedNodePools[candidate.NodePool.Name]; !reported {
+				s.recorder.Publish(scoreBasedNodePoolBlockedByPace(candidate.NodePool))
+				paceBlockedNodePools[candidate.NodePool.Name] = struct{}{}
+			}
 			continue
 		}
 		validCandidates = append(validCandidates, candidate)
 	}
 	stopFilter()
+	if len(validCandidates) == 0 {
+		logScoreBasedCompactionNoMove(ctx, scoreBasedNoMoveBudgetOrPaceFiltered, scoreBasedNoMoveDetails{
+			candidateCount:              inputCandidateCount,
+			compactionCandidateCount:    len(candidates),
+			budgetBlockedCandidateCount: budgetBlockedCandidateCount,
+			paceBlockedCandidateCount:   paceBlockedCandidateCount,
+			budgetBlockedNodePools:      budgetBlockedNodePools,
+			paceBlockedNodePools:        paceBlockedNodePools,
+		})
+		return []Command{}, nil
+	}
 
 	searchCtx, stopSearch := cxtracing.Measure(ctx, nil, scoreBasedConsolidationMoveSetSearchSpan,
 		attribute.Int("valid_candidate_count", len(validCandidates)),
 	)
-	evals, evaluated, err := s.searchForMoveSets(searchCtx, validCandidates, deadline)
+	evals, evaluated, timedOut, searchStats, err := s.searchForMoveSets(searchCtx, validCandidates, deadline)
 	stopSearch()
 	if err != nil {
 		return []Command{}, err
 	}
 	if len(evals) == 0 {
-		timedOut := evaluated < len(validCandidates)
 		if timedOut {
 			log.FromContext(ctx).V(1).Info(fmt.Sprintf("abandoning score-based consolidation due to timeout after evaluating %d candidates", evaluated))
 		}
-		if !timedOut && !constrainedByBudgets && !constrainedByPace {
+		if !timedOut && budgetBlockedCandidateCount == 0 && paceBlockedCandidateCount == 0 {
 			s.markConsolidated()
 		}
+		reason := scoreBasedNoMoveNoPositiveFeasibleMove
+		if timedOut {
+			reason = scoreBasedNoMoveSearchTimedOut
+		}
+		logScoreBasedCompactionNoMove(ctx, reason, scoreBasedNoMoveDetails{
+			candidateCount:                 inputCandidateCount,
+			compactionCandidateCount:       len(candidates),
+			budgetBlockedCandidateCount:    budgetBlockedCandidateCount,
+			paceBlockedCandidateCount:      paceBlockedCandidateCount,
+			budgetBlockedNodePools:         budgetBlockedNodePools,
+			paceBlockedNodePools:           paceBlockedNodePools,
+			validCandidateCount:            len(validCandidates),
+			moveSetsEvaluated:              evaluated,
+			noOpMoveSetCount:               searchStats.noOpMoveSetCount(),
+			nonPositiveSavingsMoveSetCount: searchStats.nonPositiveSavingsMoveSetCount(),
+			searchTimedOut:                 timedOut,
+			moveSetEvaluationErrorCount:    searchStats.errorCount(),
+			firstMoveSetEvaluationError:    searchStats.firstErrorMessage(),
+		})
 		return []Command{}, nil
 	}
 
@@ -235,14 +292,36 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		return []Command{}, err
 	}
 	if len(cmd.Candidates) == 0 {
+		reason := scoreBasedNoMoveValidationReturnedNoMove
+		if selectedEvalIdx < 0 {
+			reason = scoreBasedNoMoveAllValidationFailed
+		}
+		logScoreBasedCompactionNoMove(ctx, reason, scoreBasedNoMoveDetails{
+			candidateCount:                 inputCandidateCount,
+			compactionCandidateCount:       len(candidates),
+			budgetBlockedCandidateCount:    budgetBlockedCandidateCount,
+			paceBlockedCandidateCount:      paceBlockedCandidateCount,
+			budgetBlockedNodePools:         budgetBlockedNodePools,
+			paceBlockedNodePools:           paceBlockedNodePools,
+			validCandidateCount:            len(validCandidates),
+			moveSetsEvaluated:              evaluated,
+			validMoveSetCount:              len(evals),
+			noOpMoveSetCount:               searchStats.noOpMoveSetCount(),
+			nonPositiveSavingsMoveSetCount: searchStats.nonPositiveSavingsMoveSetCount(),
+			searchTimedOut:                 timedOut,
+			moveSetEvaluationErrorCount:    searchStats.errorCount(),
+			firstMoveSetEvaluationError:    searchStats.firstErrorMessage(),
+			validationAttemptCount:         len(evals),
+		})
 		return []Command{}, nil
 	}
 	logScoreBasedCompactionMoveSelected(ctx, evals, selectedEvalIdx, evaluated, len(validCandidates))
+	cmd.EmitCandidateEvents(s.recorder)
 	cmd.Action = EvacuateAction
 	return []Command{cmd}, nil
 }
 
-func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCandidates []*Candidate, deadline time.Time) ([]*moveSetEvaluation, int, error) {
+func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCandidates []*Candidate, deadline time.Time) ([]*moveSetEvaluation, int, bool, *moveSetSearchStats, error) {
 	moveSets := make([]moveSet, len(validCandidates))
 	for i, candidate := range validCandidates {
 		moveSets[i] = moveSet{Nodes: []*Candidate{candidate}}
@@ -253,13 +332,33 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 	simulator, err := NewConsolidationSchedulingSimulator(simulatorCtx, s.kubeClient, s.cluster, s.provisioner, s.clock, s.recorder, validCandidates...)
 	stopSimulator()
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, false, nil, err
 	}
 	simulationCtx := cxtracing.WithoutSpan(ctx)
+	searchConsolidation := s.consolidation
+	searchConsolidation.recorder = scoreBasedSearchEventRecorder{recorder: s.recorder}
 	compute := func(_ context.Context, candidates ...*Candidate) (Command, error) {
-		return s.computeConsolidation(simulationCtx, simulator, candidates...)
+		cmd, err := searchConsolidation.computeConsolidation(simulationCtx, simulator, candidates...)
+		publishScoreBasedNoSavingsEvent(s.recorder, cmd, err)
+		return cmd, err
 	}
 	return evaluateMoveSetsPar(ctx, moveSets, deadline, compute)
+}
+
+type scoreBasedSearchEventRecorder struct {
+	recorder events.Recorder
+}
+
+func (r scoreBasedSearchEventRecorder) Publish(evts ...events.Event) {
+	forward := make([]events.Event, 0, len(evts))
+	for _, evt := range evts {
+		if evt.Reason != events.ConsolidationCandidate {
+			forward = append(forward, evt)
+		}
+	}
+	if len(forward) > 0 {
+		r.recorder.Publish(forward...)
+	}
 }
 
 func evaluateMoveSetsPar(
@@ -267,7 +366,7 @@ func evaluateMoveSetsPar(
 	moveSets []moveSet,
 	deadline time.Time,
 	compute consolidationComputer,
-) ([]*moveSetEvaluation, int, error) {
+) ([]*moveSetEvaluation, int, bool, *moveSetSearchStats, error) {
 	searchStart := time.Now()
 	stats := &moveSetSearchStats{}
 
@@ -296,18 +395,18 @@ func evaluateMoveSetsPar(
 	})
 
 	evals, err := collectMoveSetEvaluations(valid, scoreBasedMoveSetResultLimit)
-	timedOut := ctx.Err() != nil && len(evals) == 0
+	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
 	logMoveSetSearchComplete(ctx, len(moveSets), int(evaluated.Load()), len(evals), timedOut, time.Since(searchStart), stats)
 	if err != nil {
-		return nil, int(evaluated.Load()), err
+		return nil, int(evaluated.Load()), timedOut, stats, err
 	}
-	if len(evals) == 0 {
-		if timedOut {
-			ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
-		}
-		return nil, int(evaluated.Load()), nil
+	if ctx.Err() != nil && !timedOut {
+		return nil, int(evaluated.Load()), false, stats, ctx.Err()
 	}
-	return evals, int(evaluated.Load()), nil
+	if timedOut && len(evals) == 0 {
+		ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
+	}
+	return evals, int(evaluated.Load()), timedOut, stats, nil
 }
 
 func evaluateMoveSet(ctx context.Context, moveSet moveSet, compute consolidationComputer, stats *moveSetSearchStats) *moveSetEvaluation {
@@ -329,9 +428,11 @@ func evaluateMoveSet(ctx context.Context, moveSet moveSet, compute consolidation
 		return nil
 	}
 	if cmd.Decision() == NoOpDecision {
+		stats.recordNoOpMoveSet()
 		return nil
 	}
 	if cmd.EstimatedSavings() <= 0 {
+		stats.recordNonPositiveSavingsMoveSet()
 		return nil
 	}
 	return &moveSetEvaluation{
@@ -360,24 +461,98 @@ func collectMoveSetEvaluations(valid <-chan rill.Try[*moveSetEvaluation], limit 
 }
 
 func selectFirstStillValidCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation) (Command, int, error) {
-	var firstValidationReason string
-
 	for i, eval := range evals {
 		if _, err := validator.Validate(ctx, eval.Command, 0); err != nil {
 			if IsValidationError(err) {
-				if i == 0 {
-					firstValidationReason = getValidationFailureReason(err)
-				}
+				eval.Command.EmitRejectedEvents(recorder, getValidationFailureReason(err))
 				continue
 			}
 			return Command{}, -1, fmt.Errorf("validating score-based consolidation, %w", err)
 		}
 		return eval.Command, i, nil
 	}
-	if firstValidationReason != "" {
-		evals[0].Command.EmitRejectedEvents(recorder, firstValidationReason)
-	}
 	return Command{}, -1, nil
+}
+
+func (s *ScoreBasedConsolidation) budgetExhaustedByInFlightDisruptions(nodePool *v1.NodePool) bool {
+	if nodePool == nil || s.cluster == nil {
+		return false
+	}
+	numNodes, disrupting := 0, 0
+	for _, node := range s.cluster.DeepCopyNodes() {
+		if !node.Managed() || !node.Initialized() || node.NodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
+			continue
+		}
+		if node.Labels()[v1.NodePoolLabelKey] != nodePool.Name {
+			continue
+		}
+		numNodes++
+		if node.MarkedForDeletion() || nodeutils.GetCondition(node.Node, corev1.NodeReady).Status != corev1.ConditionTrue {
+			disrupting++
+		}
+	}
+	allowed := nodePool.MustGetAllowedDisruptions(s.clock, numNodes, v1.DisruptionReasonUnderutilized)
+	return allowed > 0 && disrupting >= allowed
+}
+
+func scoreBasedNoPositiveSavingsEvents(candidates []*Candidate) []events.Event {
+	const message = "Score-based consolidation found no positive simulated savings"
+	var evts []events.Event
+	for _, candidate := range candidates {
+		if candidate == nil {
+			continue
+		}
+		if candidate.Node != nil {
+			evts = append(evts, events.Event{
+				InvolvedObject: candidate.Node,
+				Type:           corev1.EventTypeNormal,
+				Reason:         events.Unconsolidatable,
+				Message:        message,
+				DedupeValues:   []string{string(candidate.Node.UID), "score-based-no-positive-savings"},
+				DedupeTimeout:  15 * time.Minute,
+			})
+		}
+		if candidate.NodeClaim != nil {
+			evts = append(evts, events.Event{
+				InvolvedObject: candidate.NodeClaim,
+				Type:           corev1.EventTypeNormal,
+				Reason:         events.Unconsolidatable,
+				Message:        message,
+				DedupeValues:   []string{string(candidate.NodeClaim.UID), "score-based-no-positive-savings"},
+				DedupeTimeout:  15 * time.Minute,
+			})
+		}
+	}
+	return evts
+}
+
+func publishScoreBasedNoSavingsEvent(recorder events.Recorder, cmd Command, err error) {
+	if err == nil && cmd.Decision() != NoOpDecision && cmd.EstimatedSavings() <= 0 {
+		recorder.Publish(scoreBasedNoPositiveSavingsEvents(cmd.Candidates)...)
+	}
+}
+
+func scoreBasedNodePoolBlockedByInFlightDisruptions(nodePool *v1.NodePool) events.Event {
+	return events.Event{
+		InvolvedObject: nodePool,
+		Type:           corev1.EventTypeNormal,
+		Reason:         events.DisruptionBlocked,
+		Message:        "No allowed Underutilized disruptions because the NodePool's allowed disruptions are already in flight",
+		DedupeValues:   []string{string(nodePool.UID), "score-based-underutilized-budget-in-flight"},
+		DedupeTimeout:  time.Minute,
+	}
+}
+
+func scoreBasedNodePoolBlockedByPace(nodePool *v1.NodePool) events.Event {
+	paceLimit := nodePool.Annotations[v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey]
+	return events.Event{
+		InvolvedObject: nodePool,
+		Type:           corev1.EventTypeNormal,
+		Reason:         events.DisruptionBlocked,
+		Message:        fmt.Sprintf("Underutilized consolidation is waiting for NodePool pace limit %s=%s disruptions per minute", v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey, paceLimit),
+		DedupeValues:   []string{string(nodePool.UID), "score-based-underutilized-pace"},
+		DedupeTimeout:  time.Minute,
+	}
 }
 
 func (s *ScoreBasedConsolidation) Reason() v1.DisruptionReason {

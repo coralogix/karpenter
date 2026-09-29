@@ -19,6 +19,7 @@ package disruption
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -62,6 +63,39 @@ type moveSetSearchStats struct {
 	max        time.Duration
 	errors     int
 	firstError string
+	noOpMoves  int
+	noSavings  int
+}
+
+type scoreBasedNoMoveReason string
+
+const (
+	scoreBasedNoMoveAlreadyConsolidated      scoreBasedNoMoveReason = "cluster_already_marked_consolidated"
+	scoreBasedNoMoveNoEligibleCandidates     scoreBasedNoMoveReason = "no_eligible_candidates"
+	scoreBasedNoMoveAllCandidatesFiltered    scoreBasedNoMoveReason = "all_candidates_filtered"
+	scoreBasedNoMoveBudgetOrPaceFiltered     scoreBasedNoMoveReason = "budget_or_pace_filtered"
+	scoreBasedNoMoveSearchTimedOut           scoreBasedNoMoveReason = "search_timed_out"
+	scoreBasedNoMoveNoPositiveFeasibleMove   scoreBasedNoMoveReason = "no_positive_or_feasible_move_after_completed_search"
+	scoreBasedNoMoveAllValidationFailed      scoreBasedNoMoveReason = "all_top_moves_failed_validation"
+	scoreBasedNoMoveValidationReturnedNoMove scoreBasedNoMoveReason = "validation_returned_no_command"
+)
+
+type scoreBasedNoMoveDetails struct {
+	candidateCount                 int
+	compactionCandidateCount       int
+	budgetBlockedCandidateCount    int
+	paceBlockedCandidateCount      int
+	validCandidateCount            int
+	budgetBlockedNodePools         map[string]struct{}
+	paceBlockedNodePools           map[string]struct{}
+	moveSetsEvaluated              int
+	validMoveSetCount              int
+	noOpMoveSetCount               int
+	nonPositiveSavingsMoveSetCount int
+	searchTimedOut                 bool
+	moveSetEvaluationErrorCount    int
+	firstMoveSetEvaluationError    string
+	validationAttemptCount         int
 }
 
 func (s *moveSetSearchStats) record(d time.Duration, err error) {
@@ -106,6 +140,30 @@ func (s *moveSetSearchStats) firstErrorMessage() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.firstError
+}
+
+func (s *moveSetSearchStats) recordNoOpMoveSet() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.noOpMoves++
+}
+
+func (s *moveSetSearchStats) recordNonPositiveSavingsMoveSet() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.noSavings++
+}
+
+func (s *moveSetSearchStats) noOpMoveSetCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.noOpMoves
+}
+
+func (s *moveSetSearchStats) nonPositiveSavingsMoveSetCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.noSavings
 }
 
 func logMoveSetSearchComplete(
@@ -167,4 +225,48 @@ func logScoreBasedCompactionMoveSelected(
 		"capacityType", candidate.Labels()[v1.CapacityTypeLabelKey],
 		"replacementNodeCount", len(cmd.Replacements),
 	)
+}
+
+func logScoreBasedCompactionNoMove(ctx context.Context, reason scoreBasedNoMoveReason, details scoreBasedNoMoveDetails) {
+	fields := []any{
+		"reason", reason,
+		"candidateCount", details.candidateCount,
+	}
+	if details.compactionCandidateCount >= 0 {
+		fields = append(fields, "compactionCandidateCount", details.compactionCandidateCount)
+	}
+	fields = append(fields,
+		"budgetBlockedCandidateCount", details.budgetBlockedCandidateCount,
+		"budgetBlockedNodePools", sortedScoreBasedNodePoolNames(details.budgetBlockedNodePools),
+		"paceBlockedCandidateCount", details.paceBlockedCandidateCount,
+		"paceBlockedNodePools", sortedScoreBasedNodePoolNames(details.paceBlockedNodePools),
+		"validCandidateCount", details.validCandidateCount,
+		"moveSetsEvaluated", details.moveSetsEvaluated,
+		"validMoveSetCount", details.validMoveSetCount,
+		"noOpMoveSetCount", details.noOpMoveSetCount,
+		"nonPositiveSavingsMoveSetCount", details.nonPositiveSavingsMoveSetCount,
+		"searchTimedOut", details.searchTimedOut,
+		"moveSetEvaluationErrorCount", details.moveSetEvaluationErrorCount,
+		"firstMoveSetEvaluationError", details.firstMoveSetEvaluationError,
+		"validationAttemptCount", details.validationAttemptCount,
+	)
+	log.FromContext(ctx).Info("score-based consolidation made no move", fields...)
+}
+
+func logScoreBasedNoEligibleCandidates(ctx context.Context, disruption Method) {
+	if _, ok := disruption.(*ScoreBasedConsolidation); !ok {
+		return
+	}
+	logScoreBasedCompactionNoMove(ctx, scoreBasedNoMoveNoEligibleCandidates, scoreBasedNoMoveDetails{
+		compactionCandidateCount: 0,
+	})
+}
+
+func sortedScoreBasedNodePoolNames(nodePools map[string]struct{}) []string {
+	names := make([]string, 0, len(nodePools))
+	for name := range nodePools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

@@ -54,6 +54,9 @@ linters:
       enable-all: true
     misspell:
       locale: US
+      # This spelling is part of an existing public NodePool annotation key.
+      ignore-rules:
+        - utilisation
     revive:
       rules:
         - name: dot-imports

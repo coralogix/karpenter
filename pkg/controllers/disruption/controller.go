@@ -277,6 +277,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 
 	// If there are no candidates, move to the next disruption
 	if len(candidates) == 0 {
+		logScoreBasedNoEligibleCandidates(ctx, disruption)
 		// Reclamation normally refreshes its inventory while computing commands.
 		// Refresh here as well because this controller skips ComputeCommands when there are no
 		// candidates, but configured pools must still publish zero-valued inventory series.
