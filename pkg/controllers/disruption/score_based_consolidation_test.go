@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/cxtracing"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/utils/pdb"
@@ -47,6 +48,7 @@ import (
 
 var _ = Describe("ScoreBasedConsolidation", func() {
 	var scoreBased *disruption.ScoreBasedConsolidation
+	var scoreBasedStandby *disruption.ScoreBasedStandby
 	var scoreBasedReclamation *disruption.ScoreBasedReclamation
 	var scoreBasedNodePool *v1.NodePool
 	var scoreBasedNodePoolMap map[string]*v1.NodePool
@@ -84,6 +86,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 
 		c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)
 		scoreBased = disruption.NewScoreBasedConsolidation(c)
+		scoreBasedStandby = disruption.NewScoreBasedStandby(c)
 		scoreBasedReclamation = disruption.NewScoreBasedReclamation(c)
 	})
 
@@ -150,6 +153,8 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 							Allocatable: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("32")},
 						},
 					})
+					standby.SetNodeClaimStandby(nodeClaim, true)
+					standby.SetNodeTaint(node, true)
 					node.Name = fmt.Sprintf("reclamation-%s-node-%d", nodePool.Name, i)
 					nodeClaims = append(nodeClaims, nodeClaim)
 					nodes = append(nodes, node)
@@ -167,18 +172,10 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Expect(compactionCandidates).To(BeEmpty(), "empty nodes should not be compaction candidates")
 
 			var commands []disruption.Command
-			ExpectParallelized(
-				func() {
-					commands, err = scoreBasedReclamation.ComputeCommands(ctx, map[string]int{
-						scoreBasedNodePool.Name: 0,
-						budgetOneNodePool.Name:  1,
-					}, candidates...)
-				},
-				func() {
-					Eventually(fakeClock.HasWaiters, time.Second*10).Should(BeTrue())
-					fakeClock.Step(15 * time.Second)
-				},
-			)
+			commands, err = scoreBasedReclamation.ComputeCommands(ctx, map[string]int{
+				scoreBasedNodePool.Name: 0,
+				budgetOneNodePool.Name:  1,
+			}, candidates...)
 			Expect(err).To(Succeed())
 			Expect(commands).To(HaveLen(1))
 			Expect(commands[0].Decision()).To(Equal(disruption.DeleteDecision))
@@ -205,7 +202,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			}
 		})
 
-		DescribeTable("should reject an empty node that becomes unsafe during validation", func(unsafeState string) {
+		DescribeTable("should reject a standby node that becomes unsafe during validation", func(unsafeState string) {
 			scoreBasedNodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
 			ExpectApplied(ctx, env.Client, scoreBasedNodePool)
 			offering := leastExpensiveInstance.Offerings[0]
@@ -222,31 +219,25 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 					Allocatable: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("32")},
 				},
 			})
+			standby.SetNodeClaimStandby(nodeClaim, true)
+			standby.SetNodeTaint(node, true)
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, scoreBasedReclamation.ShouldDisrupt, scoreBasedReclamation.Class(), queue)
 			Expect(err).To(Succeed())
 			Expect(candidates).To(HaveLen(1))
 
-			var commands []disruption.Command
-			ExpectParallelized(
-				func() {
-					commands, err = scoreBasedReclamation.ComputeCommands(ctx, map[string]int{scoreBasedNodePool.Name: 0}, candidates...)
-				},
-				func() {
-					Eventually(fakeClock.HasWaiters, time.Second*10).Should(BeTrue())
-					switch unsafeState {
-					case "nominated":
-						cluster.NominateNodeForPod(ctx, node.Spec.ProviderID)
-					case "activating":
-						stored := &v1.NodeClaim{}
-						Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), stored)).To(Succeed())
-						standby.SetNodeClaimActivating(stored, true)
-						ExpectApplied(ctx, env.Client, stored)
-					}
-					fakeClock.Step(15 * time.Second)
-				},
-			)
+			switch unsafeState {
+			case "nominated":
+				cluster.NominateNodeForPod(ctx, node.Spec.ProviderID)
+			case "activating":
+				stored := &v1.NodeClaim{}
+				Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), stored)).To(Succeed())
+				standby.SetNodeClaimActivating(stored, true)
+				ExpectApplied(ctx, env.Client, stored)
+				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(stored))
+			}
+			commands, err := scoreBasedReclamation.ComputeCommands(ctx, map[string]int{scoreBasedNodePool.Name: 0}, candidates...)
 			Expect(err).To(Succeed())
 			Expect(commands).To(BeEmpty())
 		},
@@ -310,6 +301,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Expect(loop.SpanContext().TraceID()).NotTo(Equal(spans["incoming"].SpanContext().TraceID()))
 			for _, name := range []string{
 				"karpenter.disruption.emptiness",
+				"karpenter.disruption.score_based_standby",
 				"karpenter.disruption.score_based_reclamation",
 				"karpenter.disruption.static_drift",
 				"karpenter.disruption.drift",
@@ -370,12 +362,77 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Expect(output.String()).To(ContainSubstring(`"reason"="no_eligible_candidates"`))
 		})
 
-		It("places score-based reclamation immediately after empty consolidation", func() {
+		It("places score-based standby and reclamation before drift", func() {
 			methods := NewMethodsWithRealValidator()
-			Expect(methods).To(HaveLen(7))
+			Expect(methods).To(HaveLen(8))
 			Expect(methods[0]).To(BeAssignableToTypeOf(&disruption.Emptiness{}))
-			Expect(methods[1]).To(BeAssignableToTypeOf(&disruption.ScoreBasedReclamation{}))
-			Expect(methods[2]).To(BeAssignableToTypeOf(&disruption.StaticDrift{}))
+			Expect(methods[1]).To(BeAssignableToTypeOf(&disruption.ScoreBasedStandby{}))
+			Expect(methods[2]).To(BeAssignableToTypeOf(&disruption.ScoreBasedReclamation{}))
+			Expect(methods[3]).To(BeAssignableToTypeOf(&disruption.StaticDrift{}))
+		})
+
+		It("marks an empty active node as standby before reclaiming it on the next pass", func() {
+			offering := leastExpensiveInstance.Offerings[0]
+			nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+					v1.NodePoolLabelKey:            scoreBasedNodePool.Name,
+					corev1.LabelInstanceTypeStable: leastExpensiveInstance.Name,
+					v1.CapacityTypeLabelKey:        offering.Requirements.Get(v1.CapacityTypeLabelKey).Any(),
+					corev1.LabelTopologyZone:       offering.Requirements.Get(corev1.LabelTopologyZone).Any(),
+				}},
+				Status: v1.NodeClaimStatus{
+					Allocatable: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("32")},
+				},
+			})
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+			disruption.EvacuationCommandsTotal.Reset()
+			disruption.NodeClaimsEvacuatedTotal.Reset()
+			disruption.ScoreBasedStandbyNodesMarkedTotal.Reset()
+			DeferCleanup(func() {
+				disruption.EvacuationCommandsTotal.Reset()
+				disruption.NodeClaimsEvacuatedTotal.Reset()
+				disruption.ScoreBasedStandbyNodesMarkedTotal.Reset()
+			})
+			var output strings.Builder
+			logger := funcr.New(func(_, args string) {
+				output.WriteString(args)
+				output.WriteByte('\n')
+			}, funcr.Options{})
+			controller := disruption.NewController(fakeClock, env.Client, prov, cloudProvider, recorder, cluster, queue,
+				disruption.WithMethods(NewMethodsWithRealValidator()...))
+			start := fakeClock.Now()
+
+			result, err := controller.Reconcile(log.IntoContext(ctx, logger))
+			Expect(err).To(Succeed())
+			Expect(result.RequeueAfter).To(BeNumerically("<", time.Second))
+			Expect(queue.GetCommands()).To(BeEmpty(), "standby marking is synchronous and does not enqueue an evacuation")
+			storedClaim := &v1.NodeClaim{}
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), storedClaim)).To(Succeed())
+			Expect(standby.IsNodeClaimStandby(storedClaim)).To(BeTrue())
+			storedNode := ExpectNodeExists(ctx, env.Client, node.Name)
+			Expect(standby.HasNodeTaint(storedNode)).To(BeTrue())
+			ExpectMetricCounterValue(disruption.ScoreBasedStandbyNodesMarkedTotal, 1, map[string]string{metrics.NodePoolLabel: scoreBasedNodePool.Name})
+
+			result, err = controller.Reconcile(log.IntoContext(ctx, logger))
+			Expect(err).To(Succeed())
+			Expect(result.RequeueAfter).To(BeNumerically("<", time.Second))
+			commands := queue.GetCommands()
+			Expect(commands).To(HaveLen(1))
+			Expect(commands[0].Action).To(Equal(disruption.DeleteAction))
+			Expect(commands[0].Candidates).To(HaveLen(1))
+			Expect(commands[0].Candidates[0].Name()).To(Equal(node.Name))
+			Expect(fakeClock.Now()).To(Equal(start), "standby marking and reclamation should not wait for consolidation TTL")
+
+			_, found := FindMetricWithLabelValues("karpenter_voluntary_disruption_evacuation_commands_total", map[string]string{metrics.ReasonLabel: "empty"})
+			Expect(found).To(BeFalse())
+			_, found = FindMetricWithLabelValues("karpenter_nodeclaims_evacuated_total", map[string]string{
+				metrics.ReasonLabel: "empty", metrics.NodePoolLabel: scoreBasedNodePool.Name,
+			})
+			Expect(found).To(BeFalse())
+			Expect(output.String()).To(ContainSubstring("marked empty nodes as standby"))
+			Expect(output.String()).NotTo(ContainSubstring("evacuation completed; source nodes handed off to standby"))
 		})
 
 		It("retries later methods on the next pass after reclamation starts a command", func() {
@@ -518,7 +575,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 	})
 
 	Context("Empty nodes", func() {
-		It("should produce a delete command for empty annotated pool nodes", func() {
+		It("should produce a delete command only for empty standby nodes", func() {
 			nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
@@ -532,6 +589,8 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 					Allocatable: map[corev1.ResourceName]resource.Quantity{corev1.ResourceCPU: resource.MustParse("32")},
 				},
 			})
+			standby.SetNodeClaimStandby(nodeClaim, true)
+			standby.SetNodeTaint(node, true)
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
@@ -557,16 +616,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Expect(err).To(BeNil())
 
 			budgetMapping := map[string]int{scoreBasedNodePool.Name: 1}
-			var cmds []disruption.Command
-			ExpectParallelized(
-				func() {
-					cmds, err = scoreBasedReclamation.ComputeCommands(ctx, budgetMapping, candidate)
-				},
-				func() {
-					Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
-					env.Clock.Step(15 * time.Second)
-				},
-			)
+			cmds, err := scoreBasedReclamation.ComputeCommands(ctx, budgetMapping, candidate)
 			Expect(err).To(BeNil())
 			Expect(cmds).To(HaveLen(1))
 			Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
@@ -623,9 +673,12 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Expect(err).To(Succeed())
 			Expect(candidates).To(HaveLen(1))
 			Expect(candidates[0].Name()).To(Equal(expectedCandidate.Name()))
+			standbyCandidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, scoreBasedStandby.ShouldDisrupt, scoreBasedStandby.Class(), queue)
+			Expect(err).To(Succeed())
+			Expect(standbyCandidates).To(HaveLen(2), "standby marking should consider both empty nodes")
 			reclamationCandidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, scoreBasedReclamation.ShouldDisrupt, scoreBasedReclamation.Class(), queue)
 			Expect(err).To(Succeed())
-			Expect(reclamationCandidates).To(HaveLen(2), "reclamation should consider the two empty nodes and exclude the non-empty compaction candidate")
+			Expect(reclamationCandidates).To(BeEmpty(), "reclamation should consider only nodes already in standby")
 
 			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, fakeClock, env.Client, cloudProvider, recorder, scoreBased.Reason())
 			Expect(err).To(Succeed())
@@ -648,13 +701,13 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Expect(recorder.Calls("ConsolidationCandidate")).To(Equal(2), "the selected move should emit one event on its Node and NodeClaim")
 		})
 
-		It("should not pace empty annotated pool nodes", func() {
+		It("should not pace empty active nodes entering standby", func() {
 			scoreBasedNodePool.Annotations[v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey] = "1"
 			ExpectApplied(ctx, env.Client, scoreBasedNodePool)
 
 			underutilizedPace := disruption.NewUnderutilizedConsolidationPace(env.Clock)
 			c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, underutilizedPace)
-			scoreBasedWithPace := disruption.NewScoreBasedReclamation(c)
+			scoreBasedWithPace := disruption.NewScoreBasedStandby(c)
 
 			nonEmptyCandidates, err := createScoreBasedCandidatesForPool(scoreBasedNodePool, mostExpensiveInstance)
 			Expect(err).To(BeNil())
@@ -697,21 +750,14 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			)
 			Expect(err).To(BeNil())
 
-			budgetMapping := map[string]int{scoreBasedNodePool.Name: 0}
-			var cmds []disruption.Command
-			ExpectParallelized(
-				func() {
-					cmds, err = scoreBasedWithPace.ComputeCommands(ctx, budgetMapping, candidate)
-				},
-				func() {
-					Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
-					env.Clock.Step(15 * time.Second)
-				},
-			)
+			start := env.Clock.Now()
+			cmds, err := scoreBasedWithPace.ComputeCommands(ctx, map[string]int{scoreBasedNodePool.Name: 0}, candidate)
 			Expect(err).To(BeNil())
 			Expect(cmds).To(HaveLen(1))
-			Expect(cmds[0].Decision()).To(Equal(disruption.DeleteDecision))
+			Expect(cmds[0].Decision()).To(Equal(disruption.StandbyDecision))
+			Expect(cmds[0].Action).To(Equal(disruption.StandbyAction))
 			Expect(cmds[0].Candidates[0].Name()).To(Equal(node.Name))
+			Expect(env.Clock.Now()).To(Equal(start), "empty active standby marking should not wait for consolidation TTL")
 		})
 	})
 

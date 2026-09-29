@@ -230,8 +230,12 @@ type Command struct {
 	Succeeded bool
 	// Action overrides the default replace/delete behavior inferred from candidates and replacements.
 	Action CommandAction
-	// BeforeDelete validates candidates immediately before a delete action is applied.
-	BeforeDelete func(context.Context) error
+	// BeforeDelete validates candidates immediately before a delete action is applied. It may
+	// refresh candidate objects so conditional deletion uses the validated resource versions.
+	BeforeDelete func(context.Context, []*Candidate) error
+	// DeleteWithPreconditions makes the queue delete candidates using their current UID and
+	// resourceVersion, so a concurrent update invalidates the delete instead of being lost.
+	DeleteWithPreconditions bool
 	// OnSuccess runs after the action is committed, before the command leaves the orchestration queue.
 	OnSuccess func(context.Context) error
 	// OnDeleteSuccess runs after each source NodeClaim delete succeeds.
@@ -266,12 +270,17 @@ var (
 	ReplaceDecision  Decision = "replace"
 	DeleteDecision   Decision = "delete"
 	EvacuateDecision Decision = "evacuate"
+	StandbyDecision  Decision = "standby"
 
 	DeleteAction   CommandAction = "delete"
 	EvacuateAction CommandAction = "evacuate"
+	StandbyAction  CommandAction = "standby"
 )
 
 func (c Command) Decision() Decision {
+	if c.Action == StandbyAction && len(c.Candidates) > 0 {
+		return StandbyDecision
+	}
 	if c.Action == EvacuateAction && len(c.Candidates) > 0 {
 		return EvacuateDecision
 	}
@@ -384,8 +393,9 @@ func (c Command) SourceCost() float64 {
 // available compatible offering contributes 0 to destination cost and inflates
 // them.
 func (c Command) EstimatedSavings() float64 {
-	if c.Action == EvacuateAction {
-		// Evacuation retains the source node. Savings are realized only if a later reclamation pass removes it.
+	if c.Action == EvacuateAction || c.Action == StandbyAction {
+		// Evacuation and empty-to-standby both retain the source node. Savings are realized only if
+		// a later reclamation pass removes it.
 		return 0
 	}
 	sourcePrice := c.SourceCost()

@@ -131,6 +131,8 @@ func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Clien
 	return []Method{
 		// Delete empty nodes across all consolidation policies (WhenEmpty, WhenEmptyOrUnderutilized, Balanced).
 		NewEmptiness(c),
+		// Move naturally empty active nodes into standby before considering their reclamation.
+		NewScoreBasedStandby(c),
 		// Reclaim empty capacity in NodePools that opt in to score-based consolidation.
 		NewScoreBasedReclamation(c),
 		// Terminate and create replacement for drifted NodeClaims in Static NodePool
@@ -152,6 +154,8 @@ func (c *Controller) Name() string {
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	c.apiReader = m.GetAPIReader()
+	c.queue.SetAPIReader(c.apiReader)
+	c.provisioner.SetAPIReader(c.apiReader)
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).
@@ -221,6 +225,8 @@ func disruptionMethodSpanName(method Method) string {
 		return "karpenter.disruption.emptiness"
 	case *ScoreBasedReclamation:
 		return scoreBasedReclamationSpan
+	case *ScoreBasedStandby:
+		return scoreBasedStandbySpan
 	case *StaticDrift:
 		return "karpenter.disruption.static_drift"
 	case *Drift:
@@ -237,6 +243,9 @@ func disruptionMethodSpanName(method Method) string {
 }
 
 func (c *Controller) cleanupStaleDisruptionState(ctx context.Context) error {
+	if err := c.recoverOccupiedStandbyNodes(ctx); err != nil {
+		return fmt.Errorf("recovering occupied standby nodes, %w", err)
+	}
 	// Karpenter taints nodes with a karpenter.sh/disruption taint as part of the disruption process while it progresses in memory.
 	// If Karpenter restarts or fails with an error during a disruption action, some nodes can be left tainted.
 	// Idempotently remove this taint from candidates that are not in the orchestration queue before continuing.
@@ -254,6 +263,71 @@ func (c *Controller) cleanupStaleDisruptionState(ctx context.Context) error {
 		return serrors.Wrap(fmt.Errorf("removing condition from nodeclaims, %w", err), "condition", v1.ConditionTypeDisruptionReason)
 	}
 	return nil
+}
+
+//nolint:gocyclo // This recovery pass intentionally keeps each live-state check beside the mutation it gates.
+func (c *Controller) recoverOccupiedStandbyNodes(ctx context.Context) error {
+	for _, stateNode := range c.cluster.DeepCopyNodes() {
+		if stateNode == nil || stateNode.Node == nil || stateNode.NodeClaim == nil || stateNode.MarkedForDeletion() || c.queue.HasAny(stateNode.ProviderID()) {
+			continue
+		}
+		if !standby.IsNodeClaimStandby(stateNode.NodeClaim) && !standby.IsNodeClaimActivating(stateNode.NodeClaim) &&
+			!standby.HasNodeTaint(stateNode.Node) && stateNode.Node.Annotations[standby.NodeClaimActivatingAnnotationKey] != "true" {
+			continue
+		}
+		node := &corev1.Node{}
+		if err := c.apiReader.Get(ctx, client.ObjectKeyFromObject(stateNode.Node), node); err != nil {
+			if errors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("getting standby Node %q, %w", stateNode.Name(), err)
+		}
+		nodeClaim := &v1.NodeClaim{}
+		if err := c.apiReader.Get(ctx, client.ObjectKeyFromObject(stateNode.NodeClaim), nodeClaim); err != nil {
+			if errors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("getting standby NodeClaim %q, %w", stateNode.NodeClaim.Name, err)
+		}
+		if node.UID != stateNode.Node.UID || nodeClaim.UID != stateNode.NodeClaim.UID || node.Spec.ProviderID != stateNode.ProviderID() ||
+			(!standby.IsNodeClaimStandby(nodeClaim) && !standby.IsNodeClaimActivating(nodeClaim) && node.Annotations[standby.NodeClaimActivatingAnnotationKey] != "true") ||
+			!node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() {
+			continue
+		}
+		empty, err := reclamationEmpty(ctx, c.apiReader, node)
+		if err != nil {
+			return fmt.Errorf("checking standby Node %q for bound workloads, %w", node.Name, err)
+		}
+		if empty {
+			continue
+		}
+		activationNode := &state.StateNode{Node: node, NodeClaim: nodeClaim}
+		if err := c.provisioner.ActivateStandbyNodes(ctx, standby.ActivationSourceRecovery, activationNode); err != nil {
+			return fmt.Errorf("activating occupied standby Node %q, %w", node.Name, err)
+		}
+		if err := c.queue.removeDisruptionTaint(ctx, node.Name); err != nil {
+			return fmt.Errorf("removing temporary disruption taint from recovered Node %q, %w", node.Name, err)
+		}
+		if err := c.refreshStandbyState(ctx, node.Name, nodeClaim.Name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Controller) refreshStandbyState(ctx context.Context, nodeName, nodeClaimName string) error {
+	node := &corev1.Node{}
+	if err := c.apiReader.Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
+		return fmt.Errorf("refreshing standby Node %q, %w", nodeName, err)
+	}
+	nodeClaim := &v1.NodeClaim{}
+	if err := c.apiReader.Get(ctx, client.ObjectKey{Name: nodeClaimName}, nodeClaim); err != nil {
+		return fmt.Errorf("refreshing standby NodeClaim %q, %w", nodeClaimName, err)
+	}
+	if standby.IsNodeClaimStandby(nodeClaim) || standby.IsNodeClaimActivating(nodeClaim) || standby.HasNodeTaint(node) || node.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" {
+		return fmt.Errorf("standby activation for NodeClaim %q has not completed", nodeClaimName)
+	}
+	return updateStandbyState(ctx, c.cluster, c.apiReader, node, nodeClaim)
 }
 
 func (c *Controller) ensureStandbyTaints(ctx context.Context, nodes ...*state.StateNode) error {
@@ -360,6 +434,9 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 
 func (c *Controller) budgetMappingForMethod(ctx context.Context, disruption Method) (map[string]int, error) {
 	if _, budgetExempt := disruption.(*ScoreBasedReclamation); budgetExempt {
+		return map[string]int{}, nil
+	}
+	if _, budgetExempt := disruption.(*ScoreBasedStandby); budgetExempt {
 		return map[string]int{}, nil
 	}
 	return BuildDisruptionBudgetMapping(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, c.recorder, disruption.Reason())

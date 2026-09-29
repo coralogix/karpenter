@@ -143,7 +143,7 @@ func (p *Provisioner) reserveStandbyActivation(ctx context.Context, stateNodeCla
 	activationSource := standby.ActivationSourceRecovery
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		nodeClaim := &v1.NodeClaim{}
-		if err := p.kubeClient.Get(ctx, client.ObjectKeyFromObject(stateNodeClaim), nodeClaim); err != nil {
+		if err := p.apiObjectReader().Get(ctx, client.ObjectKeyFromObject(stateNodeClaim), nodeClaim); err != nil {
 			return err
 		}
 		if !nodeClaim.DeletionTimestamp.IsZero() {
@@ -186,7 +186,7 @@ func hasNodeActivationMarker(node *corev1.Node) bool {
 func (p *Provisioner) setNodeActivationMarker(ctx context.Context, nodeName string, activating bool) error {
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		node := &corev1.Node{}
-		if err := p.kubeClient.Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
+		if err := p.apiObjectReader().Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
 			return err
 		}
 		if activating == hasNodeActivationMarker(node) {
@@ -209,7 +209,7 @@ func (p *Provisioner) removeStandbyNodeTaint(ctx context.Context, nodeName strin
 	var activated bool
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		node := &corev1.Node{}
-		if err := p.kubeClient.Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
+		if err := p.apiObjectReader().Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
 			return err
 		}
 		if !standby.HasNodeTaint(node) {
@@ -229,7 +229,7 @@ func (p *Provisioner) removeStandbyNodeTaint(ctx context.Context, nodeName strin
 func (p *Provisioner) finishStandbyActivation(ctx context.Context, stateNodeClaim *v1.NodeClaim) error {
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		nodeClaim := &v1.NodeClaim{}
-		if err := p.kubeClient.Get(ctx, client.ObjectKeyFromObject(stateNodeClaim), nodeClaim); err != nil {
+		if err := p.apiObjectReader().Get(ctx, client.ObjectKeyFromObject(stateNodeClaim), nodeClaim); err != nil {
 			return err
 		}
 		if !standby.IsNodeClaimStandby(nodeClaim) && !standby.IsNodeClaimActivating(nodeClaim) && standby.NodeClaimActivationSource(nodeClaim) == "" {

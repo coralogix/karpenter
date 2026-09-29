@@ -79,19 +79,19 @@ func TestScoreBasedReclamationEmptyNodeMetricsIncludeAllConfiguredPools(t *testi
 			t.Fatal(err)
 		}
 	}
-	consolidation := MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
-	reclamation := NewScoreBasedReclamation(consolidation)
+	consolidator := MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
+	reclamation := NewScoreBasedReclamation(consolidator)
 
 	dueCounts, err := reclamation.emptyReclamationNodeCounts(ctx)
 	if err != nil {
 		t.Fatalf("emptyReclamationNodeCounts() error = %v", err)
 	}
-	if dueCounts["due-pool"] != 2 {
-		t.Fatalf("due-pool empty count = %d, want 2", dueCounts["due-pool"])
+	if dueCounts["due-pool"] != 1 {
+		t.Fatalf("due-pool standby count = %d, want 1", dueCounts["due-pool"])
 	}
 	if ExperimentalReclamationRemoveAllEmptyImmediately {
-		if dueCounts["not-due-pool"] != 1 {
-			t.Fatalf("not-due-pool empty count = %d, want 1 while experimental immediate reclamation is enabled", dueCounts["not-due-pool"])
+		if dueCounts["not-due-pool"] != 0 {
+			t.Fatalf("not-due-pool standby count = %d, want 0 for marker-only node", dueCounts["not-due-pool"])
 		}
 	} else if _, ok := dueCounts["not-due-pool"]; ok {
 		t.Fatal("non-due pool should not be included in reclamation selection counts")
@@ -128,8 +128,8 @@ func TestScoreBasedReclamationEmptyNodeMetricsKeepLastCompleteScanAndRemoveOutOf
 	if err := cluster.UpdateNode(ctx, oldNode); err != nil {
 		t.Fatal(err)
 	}
-	consolidation := MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
-	reclamation := NewScoreBasedReclamation(consolidation)
+	consolidator := MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
+	reclamation := NewScoreBasedReclamation(consolidator)
 	if _, err := reclamation.emptyReclamationNodeCounts(ctx); err != nil {
 		t.Fatalf("initial emptyReclamationNodeCounts() error = %v", err)
 	}
@@ -496,8 +496,8 @@ func TestReclamationDeleteSuccessPersistsNodePoolTimestamp(t *testing.T) {
 	now := time.Date(2026, time.September, 25, 12, 30, 0, 123456789, time.UTC)
 	nodePool := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "score-pool"}}
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(nodePool).Build()
-	consolidation := MakeConsolidation(clocktesting.NewFakeClock(now), nil, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
-	reclamation := NewScoreBasedReclamation(consolidation)
+	consolidator := MakeConsolidation(clocktesting.NewFakeClock(now), nil, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
+	reclamation := NewScoreBasedReclamation(consolidator)
 	candidate := &Candidate{NodePool: nodePool}
 	if err := reclamation.reclamationDeleteSucceeded(ctx, candidate); err != nil {
 		t.Fatalf("reclamationDeleteSucceeded() error = %v", err)
@@ -526,6 +526,7 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 		Name:   "reclamation-claim",
 		Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name},
 	}, Status: v1.NodeClaimStatus{ProviderID: "provider-1"}}
+	standby.SetNodeClaimStandby(nodeClaim, true)
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
 		Name: "reclamation-node",
 		Labels: map[string]string{
@@ -533,6 +534,7 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 			v1.NodeInitializedLabelKey: "true",
 		},
 	}, Spec: corev1.NodeSpec{ProviderID: nodeClaim.Status.ProviderID}}
+	standby.SetNodeTaint(node, true)
 	kubeClient := fake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithObjects(nodePool, nodeClaim, node).
@@ -545,14 +547,13 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 		}).Build()
 	clk := clocktesting.NewFakeClock(now)
 	cluster := state.NewCluster(clk, kubeClient, nil)
-	consolidation := MakeConsolidation(clk, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
-	reclamation := NewScoreBasedReclamation(consolidation)
+	consolidator := MakeConsolidation(clk, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
+	reclamation := NewScoreBasedReclamation(consolidator)
 	stateNode := state.NewNode()
 	stateNode.Node = node
 	stateNode.NodeClaim = nodeClaim
 	candidate := &Candidate{StateNode: stateNode, NodePool: nodePool}
-	beforeDelete := reclamation.reclamationBeforeDelete([]*Candidate{candidate})
-	if err := beforeDelete(ctx); err != nil {
+	if err := reclamation.reclamationBeforeDelete(ctx, []*Candidate{candidate}); err != nil {
 		t.Fatalf("BeforeDelete() error for an empty node = %v", err)
 	}
 
@@ -560,7 +561,7 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 	if err := kubeClient.Create(ctx, workload); err != nil {
 		t.Fatal(err)
 	}
-	if err := beforeDelete(ctx); !IsUnrecoverableError(err) {
+	if err := reclamation.reclamationBeforeDelete(ctx, []*Candidate{candidate}); !IsUnrecoverableError(err) {
 		t.Fatalf("BeforeDelete() error with a newly bound pod = %v, want unrecoverable", err)
 	}
 	if err := kubeClient.Delete(ctx, workload); err != nil {
@@ -571,7 +572,7 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 		t.Fatal(err)
 	}
 	cluster.NominateNodeForPod(ctx, candidate.ProviderID())
-	if err := beforeDelete(ctx); !IsUnrecoverableError(err) {
+	if err := reclamation.reclamationBeforeDelete(ctx, []*Candidate{candidate}); !IsUnrecoverableError(err) {
 		t.Fatalf("BeforeDelete() error for a nominated node = %v, want unrecoverable", err)
 	}
 	candidate.ClearNomination()
@@ -584,7 +585,7 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 	if err := kubeClient.Update(ctx, storedNodeClaim); err != nil {
 		t.Fatal(err)
 	}
-	if err := beforeDelete(ctx); !IsUnrecoverableError(err) {
+	if err := reclamation.reclamationBeforeDelete(ctx, []*Candidate{candidate}); !IsUnrecoverableError(err) {
 		t.Fatalf("BeforeDelete() error for an activating node = %v, want unrecoverable", err)
 	}
 }

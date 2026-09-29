@@ -1,6 +1,10 @@
-# Implementation notes: standalone reclamation and non-empty compaction
+# Historical implementation plan: standalone reclamation and non-empty compaction
 
-Status: target behavior for the score-based method split. See [Score-based consolidation](score-based-consolidation.md) for current configuration and runtime behavior.
+Status: superseded by the current implementation and design. See [Score-based consolidation](score-based-consolidation.md) for current configuration and runtime behavior, and [Separating compaction from capacity reclamation](compaction-and-reclamation-design.md) for lifecycle details.
+
+This plan records an earlier design in which reclamation selected naturally empty active nodes and waited for the consolidation TTL. Current behavior has a separate `ScoreBasedStandby` method that moves eligible empty active nodes into standby with its own action, logs, and metrics. `ScoreBasedReclamation` selects only nodes carrying both the standby marker and taint, checks live occupancy and activation immediately before deletion, and uses a conditional NodeClaim delete without a consolidation TTL. Score-based compaction still handles only non-empty active nodes.
+
+The remaining sections are historical implementation notes; their old active-empty reclamation and TTL-validation instructions no longer apply.
 
 ## Intended behavior
 

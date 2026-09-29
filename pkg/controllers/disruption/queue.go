@@ -32,6 +32,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
@@ -103,6 +104,7 @@ type Queue struct {
 	ProviderIDToCommand map[string]*Command // providerID -> command, maps a candidate to its command
 	source              chan event.TypedGenericEvent[*v1.NodeClaim]
 	kubeClient          client.Client
+	apiReader           client.Reader
 	recorder            events.Recorder
 	cluster             *state.Cluster
 	clock               clock.Clock
@@ -115,6 +117,12 @@ func (q *Queue) SetEvictionQueue(evictionQueue *terminator.Queue) {
 	q.evictionQueue = evictionQueue
 }
 
+func (q *Queue) SetAPIReader(reader client.Reader) {
+	if reader != nil {
+		q.apiReader = reader
+	}
+}
+
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands
 func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clock.Clock,
 	provisioner *provisioning.Provisioner,
@@ -125,6 +133,7 @@ func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state
 		source:              make(chan event.TypedGenericEvent[*v1.NodeClaim], 10000),
 		ProviderIDToCommand: map[string]*Command{},
 		kubeClient:          kubeClient,
+		apiReader:           kubeClient,
 		recorder:            recorder,
 		cluster:             cluster,
 		clock:               clock,
@@ -138,6 +147,7 @@ func (q *Queue) Name() string {
 }
 
 func (q *Queue) Register(ctx context.Context, m manager.Manager) error {
+	q.apiReader = m.GetAPIReader()
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(q.Name()).
 		WatchesRawSource(source.Channel(q.source, &handler.TypedEnqueueRequestForObject[*v1.NodeClaim]{})).
@@ -305,12 +315,6 @@ func (q *Queue) waitOrTerminate(ctx context.Context, callbackCtx context.Context
 	if cmd.Action == EvacuateAction {
 		return q.evacuate(ctx, cmd)
 	}
-	if cmd.BeforeDelete != nil {
-		if err := cmd.BeforeDelete(ctx); err != nil {
-			return fmt.Errorf("validating nodes before deletion, %w", err)
-		}
-	}
-
 	// All replacements have been provisioned.
 	// All we need to do now is get a successful delete call for each node claim,
 	// then the termination controller will handle the eventual deletion of the nodes.
@@ -337,10 +341,30 @@ func (q *Queue) waitOrTerminate(ctx context.Context, callbackCtx context.Context
 			}
 			return
 		}
-		if err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
-			return q.kubeClient.Delete(ctx, candidate.NodeClaim)
-		}); err != nil {
-			errs[i] = client.IgnoreNotFound(err)
+		if cmd.BeforeDelete != nil {
+			if err := cmd.BeforeDelete(ctx, []*Candidate{candidate}); err != nil {
+				errs[i] = fmt.Errorf("validating node before deletion, %w", err)
+				return
+			}
+		}
+		var deleteErr error
+		if cmd.DeleteWithPreconditions {
+			if candidate.NodeClaim == nil || candidate.NodeClaim.UID == "" || candidate.NodeClaim.ResourceVersion == "" {
+				errs[i] = NewUnrecoverableError(fmt.Errorf("conditional deletion requires a fresh NodeClaim UID and resourceVersion"))
+				return
+			}
+			uid, resourceVersion := candidate.NodeClaim.UID, candidate.NodeClaim.ResourceVersion
+			deleteErr = q.kubeClient.Delete(ctx, candidate.NodeClaim, &client.DeleteOptions{Preconditions: &metav1.Preconditions{
+				UID:             &uid,
+				ResourceVersion: &resourceVersion,
+			}})
+		} else {
+			deleteErr = retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
+				return q.kubeClient.Delete(ctx, candidate.NodeClaim)
+			})
+		}
+		if deleteErr != nil {
+			errs[i] = client.IgnoreNotFound(deleteErr)
 			return
 		}
 		q.Lock()
@@ -603,6 +627,9 @@ func (q *Queue) rollbackStart(ctx context.Context, cmd *Command, candidates []*C
 // 2. Spin up replacement nodes
 // 3. Add Command to the queue to wait to delete the candidates.
 func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
+	if cmd.Action == StandbyAction {
+		return q.startStandbyCommand(ctx, cmd)
+	}
 	// First check if we can add the command.
 	providerIDs := lo.Map(cmd.Candidates, func(c *Candidate, _ int) string {
 		return c.ProviderID()

@@ -84,6 +84,7 @@ func WithReason(reason string) func(*LaunchOptions) {
 type Provisioner struct {
 	cloudProvider              cloudprovider.CloudProvider
 	kubeClient                 client.Client
+	apiReader                  client.Reader
 	batcher                    *Batcher[types.UID]
 	volumeTopology             *scheduler.VolumeTopology
 	cluster                    *state.Cluster
@@ -102,6 +103,7 @@ func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 		batcher:                    NewBatcher[types.UID](clock),
 		cloudProvider:              cloudProvider,
 		kubeClient:                 kubeClient,
+		apiReader:                  kubeClient,
 		volumeTopology:             scheduler.NewVolumeTopology(kubeClient),
 		cluster:                    cluster,
 		recorder:                   recorder,
@@ -122,10 +124,24 @@ func (p *Provisioner) Name() string {
 }
 
 func (p *Provisioner) Register(_ context.Context, m manager.Manager) error {
+	p.SetAPIReader(m.GetAPIReader())
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(p.Name()).
 		WatchesRawSource(singleton.Source()).
 		Complete(singleton.AsReconciler(p))
+}
+
+func (p *Provisioner) SetAPIReader(reader client.Reader) {
+	if reader != nil {
+		p.apiReader = reader
+	}
+}
+
+func (p *Provisioner) apiObjectReader() client.Reader {
+	if p.apiReader != nil {
+		return p.apiReader
+	}
+	return p.kubeClient
 }
 
 func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, err error) {
