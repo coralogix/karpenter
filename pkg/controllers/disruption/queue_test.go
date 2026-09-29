@@ -55,6 +55,7 @@ var _ = Describe("Queue", func() {
 	BeforeEach(func() {
 		disruption.EvacuationCommandsTotal.Reset()
 		disruption.EvacuationDurationSeconds.Reset()
+		disruption.NodeClaimsEvacuatedTotal.Reset()
 		nodePool = test.NodePool()
 		nodeClaim1, node1 = test.NodeClaimAndNode(
 			v1.NodeClaim{
@@ -393,9 +394,48 @@ var _ = Describe("Queue", func() {
 				"outcome":           "completed",
 				metrics.ReasonLabel: "drifted",
 			})
+			ExpectMetricCounterValue(disruption.NodeClaimsEvacuatedTotal, 1, map[string]string{
+				metrics.ReasonLabel:       "drifted",
+				metrics.NodePoolLabel:     nodePool.Name,
+				metrics.CapacityTypeLabel: nodeClaim1.Labels[v1.CapacityTypeLabelKey],
+			})
 			ExpectMetricHistogramSampleCountValue("karpenter_voluntary_disruption_evacuation_duration_seconds", 1, map[string]string{
 				metrics.ReasonLabel: "drifted",
 			})
+		})
+		It("should count each source NodeClaim evacuated by one completed command", func() {
+			evictionQueue := terminator.NewQueue(env.Client, recorder)
+			queue.SetEvictionQueue(evictionQueue)
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1, nodeClaim2, node2)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
+			stateNode1 := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+			stateNode2 := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim2)
+			cmd := &disruption.Command{
+				Method: disruption.NewScoreBasedConsolidation(disruption.MakeConsolidation(
+					fakeClock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil,
+				)),
+				CreationTimestamp: fakeClock.Now(),
+				ID:                uuid.New(),
+				Candidates: []*disruption.Candidate{
+					{StateNode: stateNode1, NodePool: nodePool},
+					{StateNode: stateNode2, NodePool: nodePool},
+				},
+				Action: disruption.EvacuateAction,
+			}
+			Expect(queue.StartCommand(ctx, cmd)).To(Succeed())
+
+			ExpectObjectReconciled(ctx, env.Client, queue, stateNode1.NodeClaim)
+
+			labels := map[string]string{
+				metrics.ReasonLabel:       "underutilized",
+				metrics.NodePoolLabel:     nodePool.Name,
+				metrics.CapacityTypeLabel: nodeClaim1.Labels[v1.CapacityTypeLabelKey],
+			}
+			ExpectMetricCounterValue(disruption.EvacuationCommandsTotal, 1, map[string]string{
+				"outcome":           "completed",
+				metrics.ReasonLabel: "underutilized",
+			})
+			ExpectMetricCounterValue(disruption.NodeClaimsEvacuatedTotal, 2, labels)
 		})
 		It("should count evacuation failures without replacements", func() {
 			queue.SetEvictionQueue(nil)
@@ -417,6 +457,12 @@ var _ = Describe("Queue", func() {
 				"outcome":           "failed",
 				metrics.ReasonLabel: "drifted",
 			})
+			_, evacuatedMetricExists := FindMetricWithLabelValues("karpenter_nodeclaims_evacuated_total", map[string]string{
+				metrics.ReasonLabel:       "drifted",
+				metrics.NodePoolLabel:     nodePool.Name,
+				metrics.CapacityTypeLabel: nodeClaim1.Labels[v1.CapacityTypeLabelKey],
+			})
+			Expect(evacuatedMetricExists).To(BeFalse(), "failed evacuations should not create an evacuated NodeClaim metric")
 			ExpectMetricHistogramSampleCountValue("karpenter_voluntary_disruption_evacuation_duration_seconds", 1, map[string]string{
 				metrics.ReasonLabel: "drifted",
 			})

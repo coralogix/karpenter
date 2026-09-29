@@ -212,6 +212,28 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 func (q *Queue) recordEvacuationOutcome(ctx context.Context, cmd *Command, outcome string, err error) {
 	duration := q.clock.Since(cmd.CreationTimestamp)
 	reason := pretty.ToSnakeCase(string(cmd.Reason()))
+	if outcome == evacuationOutcomeCompleted {
+		seenNodeClaims := map[string]struct{}{}
+		for _, candidate := range cmd.Candidates {
+			if candidate == nil || candidate.NodeClaim == nil {
+				continue
+			}
+			nodeClaim := candidate.NodeClaim
+			nodeClaimID := nodeClaim.Name
+			if nodeClaimID == "" {
+				nodeClaimID = nodeClaim.Status.ProviderID
+			}
+			if _, seen := seenNodeClaims[nodeClaimID]; seen {
+				continue
+			}
+			seenNodeClaims[nodeClaimID] = struct{}{}
+			NodeClaimsEvacuatedTotal.Inc(map[string]string{
+				metrics.ReasonLabel:       reason,
+				metrics.NodePoolLabel:     nodeClaim.Labels[v1.NodePoolLabelKey],
+				metrics.CapacityTypeLabel: nodeClaim.Labels[v1.CapacityTypeLabelKey],
+			})
+		}
+	}
 	EvacuationCommandsTotal.Inc(map[string]string{
 		evacuationOutcomeLabel: outcome,
 		metrics.ReasonLabel:    reason,
