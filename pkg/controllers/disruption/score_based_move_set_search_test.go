@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/awslabs/operatorpkg/status"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -46,7 +47,7 @@ var _ = Describe("ScoreBasedMoveSetSearch", func() {
 	BeforeEach(func() {
 		sourcePool = moveSetSearchNodePool("move-set-source-pool", true)
 		ExpectApplied(ctx, env.Client, sourcePool)
-		method = disruption.NewScoreBasedConsolidation(disruption.MakeConsolidation(fakeClock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil))
+		method = disruption.NewScoreBasedConsolidation(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil))
 	})
 
 	AfterEach(func() {
@@ -63,7 +64,7 @@ var _ = Describe("ScoreBasedMoveSetSearch", func() {
 		createMoveSetSearchNodes(sourcePool, mostExpensiveInstance, []string{"2", "2"})
 		createMoveSetSearchNodes(keeperPool, keeperType, []string{""})
 
-		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, method.ShouldDisrupt, method.Class(), queue)
+		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, method.ShouldDisrupt, method.Class(), queue)
 		Expect(err).To(Succeed())
 		Expect(candidates).To(HaveLen(2))
 
@@ -88,16 +89,18 @@ var _ = Describe("ScoreBasedMoveSetSearch", func() {
 		cloudProvider.InstanceTypesForNodePool[sourcePool.Name] = []*cloudprovider.InstanceType{sourceType, replacementType}
 		createMoveSetSearchNodes(sourcePool, sourceType, []string{"3", "3"})
 
-		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, method.ShouldDisrupt, method.Class(), queue)
+		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, method.ShouldDisrupt, method.Class(), queue)
 		Expect(err).To(Succeed())
 		Expect(candidates).To(HaveLen(2))
 		for _, candidate := range candidates {
-			singleton := disruption.NewScoreBasedConsolidation(disruption.MakeConsolidation(fakeClock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil))
+			Expect(candidate.Price).To(BeNumerically(">", 0))
+		}
+		for _, candidate := range candidates {
+			singleton := disruption.NewScoreBasedConsolidation(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil))
 			commands, err := singleton.ComputeCommands(ctx, map[string]int{sourcePool.Name: 2}, candidate)
 			Expect(err).To(Succeed())
 			Expect(commands).To(BeEmpty(), "a real single-candidate simulation should find no positive-savings command")
 		}
-
 		commands := computeMoveSetSearchCommands(method, map[string]int{sourcePool.Name: 2}, candidates...)
 		Expect(commands).To(HaveLen(1))
 		Expect(commands[0].Action).To(Equal(disruption.EvacuateAction))
@@ -121,7 +124,7 @@ var _ = Describe("ScoreBasedMoveSetSearch", func() {
 		createMoveSetSearchNodes(sourcePool, mostExpensiveInstance, []string{"4", "4"})
 		createMoveSetSearchNodes(keeperPool, keeperType, []string{"4"})
 
-		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, fakeClock, cloudProvider, method.ShouldDisrupt, method.Class(), queue)
+		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, method.ShouldDisrupt, method.Class(), queue)
 		Expect(err).To(Succeed())
 		Expect(candidates).To(HaveLen(2))
 
@@ -139,7 +142,7 @@ func moveSetSearchNodePool(name string, scoreBased bool) *v1.NodePool {
 	if scoreBased {
 		annotations[v1.ScoreBasedConsolidationAnnotationKey] = ""
 	}
-	return test.NodePool(v1.NodePool{
+	nodePool := test.NodePool(v1.NodePool{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: annotations},
 		Spec: v1.NodePoolSpec{Disruption: v1.Disruption{
 			ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
@@ -147,6 +150,8 @@ func moveSetSearchNodePool(name string, scoreBased bool) *v1.NodePool {
 			Budgets:             []v1.Budget{{Nodes: "100%"}},
 		}},
 	})
+	nodePool.StatusConditions().SetTrue(status.ConditionReady)
+	return nodePool
 }
 
 func createMoveSetSearchNodes(nodePool *v1.NodePool, instanceType *cloudprovider.InstanceType, podCPUs []string) {
@@ -192,26 +197,25 @@ func createMoveSetSearchNodes(nodePool *v1.NodePool, instanceType *cloudprovider
 	for i := range pods {
 		ExpectManualBinding(ctx, env.Client, pods[i], nodes[i])
 	}
-	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
 }
 
 func moveSetSearchInstanceType(name, cpu, memory string, price float64) *cloudprovider.InstanceType {
-	return fake.NewInstanceType(fake.InstanceTypeOptions{
-		Name: name,
-		Resources: corev1.ResourceList{
+	return fake.NewInstanceType(name,
+		fake.WithResources(corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse(cpu),
 			corev1.ResourceMemory: resource.MustParse(memory),
 			corev1.ResourcePods:   resource.MustParse("100"),
-		},
-		Offerings: []*cloudprovider.Offering{{
+		}),
+		fake.WithOfferings(cloudprovider.Offering{
 			Available: true,
 			Requirements: scheduling.NewLabelRequirements(map[string]string{
 				v1.CapacityTypeLabelKey:  v1.CapacityTypeOnDemand,
 				corev1.LabelTopologyZone: "test-zone-1",
 			}),
 			Price: price,
-		}},
-	})
+		}),
+	)
 }
 
 func instanceTypeForCPU(instanceTypes []*cloudprovider.InstanceType, cpu int64) *cloudprovider.InstanceType {
@@ -233,9 +237,9 @@ func computeMoveSetSearchCommands(method *disruption.ScoreBasedConsolidation, bu
 		commands, err = method.ComputeCommands(ctx, budgets, candidates...)
 		result <- struct{}{}
 	}()
-	Eventually(func() bool { return fakeClock.HasWaiters() || len(result) > 0 }, 10*time.Second).Should(BeTrue())
-	if fakeClock.HasWaiters() {
-		fakeClock.Step(15 * time.Second)
+	Eventually(func() bool { return env.Clock.HasWaiters() || len(result) > 0 }, 10*time.Second).Should(BeTrue())
+	if env.Clock.HasWaiters() {
+		env.Clock.Step(15 * time.Second)
 	}
 	Eventually(func() bool { return len(result) > 0 }, 10*time.Second).Should(BeTrue())
 	<-result

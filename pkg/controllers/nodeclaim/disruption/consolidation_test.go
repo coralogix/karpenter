@@ -137,7 +137,7 @@ var _ = Describe("Underutilized", func() {
 			nodePool.Annotations = map[string]string{}
 		}
 		nodePool.Annotations[v1.ScoreBasedConsolidationAnnotationKey] = ""
-		nodeClaim.Status.LastPodEventTime.Time = fakeClock.Now()
+		nodeClaim.Status.LastPodEventTime.Time = env.Clock.Now()
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
 
 		ExpectObjectReconciled(ctx, env.Client, nodeClaimDisruptionController, nodeClaim)

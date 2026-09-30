@@ -77,6 +77,7 @@ func TestNodePriorityScore(t *testing.T) {
 	candidate := &Candidate{
 		StateNode:    node,
 		instanceType: instanceType,
+		Price:        0.40,
 	}
 
 	if nodePriorityScore(nil) != 0 {
@@ -139,6 +140,7 @@ func TestNodePriorityScore(t *testing.T) {
 	loadedCandidate := &Candidate{
 		StateNode:    loadedNode,
 		instanceType: instanceType,
+		Price:        0.40,
 	}
 	if got := nodePriorityScore(loadedCandidate); got != want {
 		t.Fatalf("loaded workload: nodePriorityScore() = %v, want %v", got, want)
@@ -190,6 +192,7 @@ func TestMoveSetCostEfficiencyMilliPerVCPUHour(t *testing.T) {
 	candidate := &Candidate{
 		StateNode:    node,
 		instanceType: instanceType,
+		Price:        0.12,
 	}
 	cmd := Command{Candidates: []*Candidate{candidate}}
 	if got := moveSetCostEfficiencyMilliPerVCPUHour(cmd); got != 30 {

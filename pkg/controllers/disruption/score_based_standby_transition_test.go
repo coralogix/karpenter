@@ -155,6 +155,7 @@ func TestStandbyActionHasNoConsolidationSavings(t *testing.T) {
 				corev1.LabelTopologyZone: "us-east-1a",
 			}),
 		}}},
+		Price: 1.25,
 	}
 	deleteCommand := Command{Candidates: []*Candidate{candidate}, Action: DeleteAction}
 	if got := deleteCommand.EstimatedSavings(); got != 1.25 {
@@ -246,7 +247,7 @@ func newStandbyTransitionHarness(t *testing.T) *standbyTransitionHarness {
 	if err := cluster.UpdateNode(ctx, node.DeepCopy()); err != nil {
 		t.Fatalf("initializing cluster state: %v", err)
 	}
-	provisioner := provisioning.NewProvisioner(base, ctxRecorder, nil, cluster, clk)
+	provisioner := provisioning.NewProvisioner(base, ctxRecorder, nil, cluster, clk, nil, nil)
 	provisioner.SetAPIReader(base)
 	queue := NewQueue(wrapped, ctxRecorder, cluster, clk, provisioner)
 	queue.SetAPIReader(base)

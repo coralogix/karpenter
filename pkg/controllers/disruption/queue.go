@@ -435,7 +435,7 @@ func (q *Queue) queueEvacuationPods(ctx context.Context, cmd *Command) (int, err
 		}
 		nonDaemonPods := nonDaemonPods(pods)
 		waiting += len(nonDaemonPods)
-		evictable := lo.Filter(nonDaemonPods, func(p *corev1.Pod, _ int) bool { return podutils.IsEvictable(p) })
+		evictable := lo.Filter(nonDaemonPods, func(p *corev1.Pod, _ int) bool { return podutils.IsEvictable(p, q.clock, q.recorder) })
 		q.addEvictablePods(cmd, queued, evictable)
 	}
 	return waiting, nil

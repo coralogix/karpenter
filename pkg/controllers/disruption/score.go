@@ -96,7 +96,7 @@ func moveSetUtilisationScore(cmd Command) float64 {
 // consolidationSavingsUSDPerHour mirrors EstimatedSavings for commands produced by scheduling simulation,
 // without treating evacuation as zero savings.
 func consolidationSavingsUSDPerHour(cmd Command) float64 {
-	sourcePrice := getCandidatePrices(cmd.Candidates)
+	sourcePrice := sumCandidatePrices(cmd.Candidates)
 	if len(cmd.Replacements) == 0 {
 		return sourcePrice
 	}

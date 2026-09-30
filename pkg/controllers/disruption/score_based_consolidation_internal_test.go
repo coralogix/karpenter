@@ -494,12 +494,14 @@ func scoreBasedBatchTestCandidate(name, pool string) *Candidate {
 	stateNode.Node = node
 	stateNode.NodeClaim = claim
 	return &Candidate{
-		StateNode:         stateNode,
-		instanceType:      instanceType,
-		NodePool:          &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: pool}},
-		capacityType:      v1.CapacityTypeOnDemand,
-		zone:              "us-east-1a",
-		reschedulablePods: []*corev1.Pod{{}},
+		StateNode:                stateNode,
+		instanceType:             instanceType,
+		Price:                    0.2,
+		NodePool:                 &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: pool}},
+		capacityType:             v1.CapacityTypeOnDemand,
+		zone:                     "us-east-1a",
+		reschedulablePods:        []*corev1.Pod{{}},
+		RescheduleDisruptionCost: PerNodeBaseDisruptionCost + 1,
 	}
 }
 
@@ -826,6 +828,7 @@ func candidateWithPrice(t *testing.T, price float64) *Candidate {
 	return &Candidate{
 		StateNode:    node,
 		instanceType: instanceType,
+		Price:        price,
 	}
 }
 
@@ -860,7 +863,8 @@ func scoreBasedTestCandidate(scoreBasedConsolidation bool) *Candidate {
 	node.NodeClaim = nodeClaim
 
 	return &Candidate{
-		StateNode: node,
+		StateNode:                node,
+		RescheduleDisruptionCost: PerNodeBaseDisruptionCost + 1,
 		NodePool: &v1.NodePool{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        "default",

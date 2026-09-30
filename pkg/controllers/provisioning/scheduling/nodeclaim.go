@@ -254,7 +254,10 @@ func (n *NodeClaim) Add(ctx context.Context, pod *corev1.Pod, podData *PodData, 
 	n.Requirements = nodeClaimRequirements
 	n.topology.Register(corev1.LabelHostname, n.hostname)
 	n.topology.Record(pod, n.Spec.Taints, nodeClaimRequirements, scheduling.AllowUndefinedWellKnownLabels)
-	hostPorts := scheduling.GetHostPorts(pod)
+	var hostPorts []scheduling.HostPort
+	if pod != nil {
+		hostPorts = scheduling.GetHostPorts(pod)
+	}
 	for _, group := range n.daemonOverheadGroups {
 		group.HostPortUsage.Add(pod, hostPorts)
 	}
@@ -556,8 +559,17 @@ func filterInstanceTypesByRequirements(instanceTypes []*cloudprovider.InstanceTy
 		podRequests:  podRequests,
 	}
 	remaining := cloudprovider.InstanceTypes{}
+	if len(daemonOverheadGroups) == 0 {
+		daemonOverheadGroups = []DaemonOverheadGroup{{
+			InstanceTypes: instanceTypes,
+			HostPortUsage: scheduling.NewHostPortUsage(),
+		}}
+	}
 	// exposed host ports on the pod
-	hostPorts := scheduling.GetHostPorts(pod)
+	var hostPorts []scheduling.HostPort
+	if pod != nil {
+		hostPorts = scheduling.GetHostPorts(pod)
+	}
 	eligibleInstanceTypes := sets.New(instanceTypes...)
 
 	for _, group := range daemonOverheadGroups {

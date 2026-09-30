@@ -348,11 +348,11 @@ var _ = Describe("Queue", func() {
 			queue.SetEvictionQueue(evictionQueue)
 			pod := test.Pod(test.PodOptions{NodeName: node1.Name})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1, pod)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
 			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
 			cmd := &disruption.Command{
-				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder),
-				CreationTimestamp: fakeClock.Now(),
+				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+				CreationTimestamp: env.Clock.Now(),
 				ID:                uuid.New(),
 				Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
 				Action:            disruption.EvacuateAction,
@@ -407,14 +407,14 @@ var _ = Describe("Queue", func() {
 			evictionQueue := terminator.NewQueue(env.Client, recorder)
 			queue.SetEvictionQueue(evictionQueue)
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1, nodeClaim2, node2)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
 			stateNode1 := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
 			stateNode2 := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim2)
 			cmd := &disruption.Command{
 				Method: disruption.NewScoreBasedConsolidation(disruption.MakeConsolidation(
-					fakeClock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil,
+					env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil,
 				)),
-				CreationTimestamp: fakeClock.Now(),
+				CreationTimestamp: env.Clock.Now(),
 				ID:                uuid.New(),
 				Candidates: []*disruption.Candidate{
 					{StateNode: stateNode1, NodePool: nodePool},
@@ -440,11 +440,11 @@ var _ = Describe("Queue", func() {
 		It("should count evacuation failures without replacements", func() {
 			queue.SetEvictionQueue(nil)
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
 			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
 			cmd := &disruption.Command{
-				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder),
-				CreationTimestamp: fakeClock.Now(),
+				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+				CreationTimestamp: env.Clock.Now(),
 				ID:                uuid.New(),
 				Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
 				Action:            disruption.EvacuateAction,

@@ -392,10 +392,8 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		// Reclamation normally refreshes its inventory while computing commands.
 		// Refresh here as well because this controller skips ComputeCommands when there are no
 		// candidates, but configured pools must still publish zero-valued inventory series.
-		if scoreBased, ok := disruption.(*ScoreBasedReclamation); ok {
-			if _, err := scoreBased.emptyReclamationNodeCounts(ctx); err != nil {
-				return false, fmt.Errorf("updating score-based reclamation inventory, %w", err)
-			}
+		if err := c.refreshEmptyReclamationInventory(ctx, disruption); err != nil {
+			return false, err
 		}
 		return false, nil
 	}
@@ -430,6 +428,17 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		return started > 0, err
 	}
 	return started > 0, nil
+}
+
+func (c *Controller) refreshEmptyReclamationInventory(ctx context.Context, disruption Method) error {
+	scoreBased, ok := disruption.(*ScoreBasedReclamation)
+	if !ok {
+		return nil
+	}
+	if _, err := scoreBased.emptyReclamationNodeCounts(ctx); err != nil {
+		return fmt.Errorf("updating score-based reclamation inventory, %w", err)
+	}
+	return nil
 }
 
 func (c *Controller) budgetMappingForMethod(ctx context.Context, disruption Method) (map[string]int, error) {
