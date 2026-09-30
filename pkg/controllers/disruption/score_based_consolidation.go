@@ -60,9 +60,19 @@ type moveSet struct {
 	Nodes []*Candidate
 }
 
+type scoreBasedMoveSetSearchPath string
+
+const (
+	scoreBasedSearchPathSingleNode scoreBasedMoveSetSearchPath = "single_node"
+	scoreBasedSearchPathBatch      scoreBasedMoveSetSearchPath = "batch"
+	scoreBasedSearchPathPair2To1   scoreBasedMoveSetSearchPath = "pair_2_to_1"
+)
+
 type moveSetEvaluation struct {
-	Command Command
-	Score   float64
+	Command                    Command
+	Score                      float64
+	searchPath                 scoreBasedMoveSetSearchPath
+	sourceNodeSingleMoveScores []float64
 }
 
 type moveSetSearchResult struct {
@@ -368,6 +378,10 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 	if err != nil {
 		return result, err
 	}
+	for _, eval := range singles {
+		eval.searchPath = scoreBasedSearchPathSingleNode
+		eval.sourceNodeSingleMoveScores = []float64{eval.Score}
+	}
 	if timedOut {
 		result.evals = retainScoreBasedMoveSetResults(singles, nil, scoreBasedMoveSetResultLimit)
 		return result, nil
@@ -407,6 +421,9 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 		func(cmd Command) bool { return len(cmd.Candidates) == 2 && len(cmd.Replacements) == 1 }, nil, stats)
 	if err != nil {
 		return result, err
+	}
+	for _, eval := range pairEvals {
+		eval.searchPath = scoreBasedSearchPathPair2To1
 	}
 	result.evals = pairEvals
 	result.evaluated += pairEvaluated

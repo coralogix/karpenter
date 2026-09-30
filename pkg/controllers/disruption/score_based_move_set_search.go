@@ -152,6 +152,13 @@ func growScoreBasedBatches(
 					seenSets[key] = feasible
 					knownSets[key] = struct{}{}
 					eval = moveEval
+					if eval != nil {
+						eval.searchPath = scoreBasedSearchPathBatch
+						eval.sourceNodeSingleMoveScores = make([]float64, 0, len(eval.Command.Candidates))
+						for _, member := range eval.Command.Candidates {
+							eval.sourceNodeSingleMoveScores = append(eval.sourceNodeSingleMoveScores, scoreByCandidate[candidateMoveSetKey([]*Candidate{member})])
+						}
+					}
 					retainBatch(eval)
 					if ctx.Err() != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 						break

@@ -18,7 +18,6 @@ package disruption
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -192,39 +191,68 @@ func logScoreBasedCompactionMoveSelected(
 	ctx context.Context,
 	evals []*moveSetEvaluation,
 	selectedEvalIdx int,
-	candidatesEvaluated int,
-	compactionCandidateCount int,
+	evaluatedMoveSetCount int,
+	eligibleCandidateCount int,
 ) {
 	if selectedEvalIdx < 0 || selectedEvalIdx >= len(evals) {
 		return
 	}
 	eval := evals[selectedEvalIdx]
 	cmd := eval.Command
-	candidate := cmd.Candidates[0]
-
-	selectionReason := "highest priority score among move sets with positive simulated savings"
-	if selectedEvalIdx > 0 {
-		selectionReason = fmt.Sprintf(
-			"validated fallback after %d higher-priority move set(s) failed post-simulation validation",
-			selectedEvalIdx,
-		)
+	sourceNodes := make([]map[string]any, 0, len(cmd.Candidates))
+	sourceCostUSDPerHour := sumCandidatePrices(cmd.Candidates)
+	for i, candidate := range cmd.Candidates {
+		sourceNode := map[string]any{
+			"nodeName":       candidate.Name(),
+			"nodeClaimName":  candidate.NodeClaim.Name,
+			"nodePoolName":   candidate.NodePool.Name,
+			"instanceType":   candidate.Labels()[corev1.LabelInstanceTypeStable],
+			"capacityType":   candidate.Labels()[v1.CapacityTypeLabelKey],
+			"costUSDPerHour": candidate.Price,
+		}
+		nodeScores := map[string]any{"searchPriorityScore": nodePriorityScore(candidate)}
+		if i < len(eval.sourceNodeSingleMoveScores) {
+			nodeScores["singleNodeMoveScore"] = eval.sourceNodeSingleMoveScores[i]
+		}
+		sourceNode["score"] = nodeScores
+		sourceNodes = append(sourceNodes, sourceNode)
 	}
-
+	estimatedSavingsUSDPerHour := consolidationSavingsUSDPerHour(cmd)
+	scoreMethod := "joint_move_set_score"
+	if eval.searchPath == scoreBasedSearchPathBatch {
+		scoreMethod = "sum_single_node_scores"
+	}
+	selectionReason := "highest_ranked_validated_move"
+	if selectedEvalIdx > 0 {
+		selectionReason = "fallback_after_validation"
+	}
 	log.FromContext(ctx).Info("score-based consolidation move selected",
-		"selectionReason", selectionReason,
-		"priorityScore", eval.Score,
-		"estimatedSavingsUSD", cmd.EstimatedSavings(),
-		"simulatedDecision", cmd.Decision(),
-		"validMoveSetCount", len(evals),
-		"priorityRank", selectedEvalIdx+1,
-		"moveSetsEvaluated", candidatesEvaluated,
-		"compactionCandidateCount", compactionCandidateCount,
-		"candidateNodeCount", len(cmd.Candidates),
-		"node", candidate.Name(),
-		"nodePool", candidate.NodePool.Name,
-		"instanceType", candidate.Labels()[corev1.LabelInstanceTypeStable],
-		"capacityType", candidate.Labels()[v1.CapacityTypeLabelKey],
-		"replacementNodeCount", len(cmd.Replacements),
+		"move", map[string]any{
+			"searchPath":           eval.searchPath,
+			"simulatedDecision":    cmd.Decision(),
+			"sourceNodeCount":      len(cmd.Candidates),
+			"replacementNodeCount": len(cmd.Replacements),
+			"sourceNodes":          sourceNodes,
+			"score": map[string]any{
+				"rankingScore": eval.Score,
+				"method":       scoreMethod,
+			},
+			"cost": map[string]any{
+				"sourceUSDPerHour":               sourceCostUSDPerHour,
+				"estimatedReplacementUSDPerHour": sourceCostUSDPerHour - estimatedSavingsUSDPerHour,
+				"estimatedSavingsUSDPerHour":     estimatedSavingsUSDPerHour,
+			},
+		},
+		"search", map[string]any{
+			"eligibleCandidateCount": eligibleCandidateCount,
+			"evaluatedMoveSetCount":  evaluatedMoveSetCount,
+			"retainedMoveSetCount":   len(evals),
+		},
+		"selection", map[string]any{
+			"rank":                             selectedEvalIdx + 1,
+			"rejectedHigherRankedMoveSetCount": selectedEvalIdx,
+			"reason":                           selectionReason,
+		},
 	)
 }
 
