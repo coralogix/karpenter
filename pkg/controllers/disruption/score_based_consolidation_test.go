@@ -98,20 +98,6 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 		ExpectCleanedUp(ctx, env.Client)
 	})
 
-	Context("Candidate sorting", func() {
-		It("should sort candidates by score descending", func() {
-			cheapCandidates, err := createScoreBasedCandidatesForPool(scoreBasedNodePool, leastExpensiveInstance)
-			Expect(err).To(BeNil())
-			expensiveCandidates, err := createScoreBasedCandidatesForPool(scoreBasedNodePool, mostExpensiveInstance)
-			Expect(err).To(BeNil())
-
-			sorted := scoreBased.SortCandidates(append(cheapCandidates, expensiveCandidates...))
-			Expect(sorted).To(HaveLen(2))
-			Expect(sorted[0].Labels()[corev1.LabelInstanceTypeStable]).To(Equal(mostExpensiveInstance.Name))
-			Expect(sorted[1].Labels()[corev1.LabelInstanceTypeStable]).To(Equal(leastExpensiveInstance.Name))
-		})
-	})
-
 	Context("Reclamation", func() {
 		It("should reclaim all empty nodes despite zero or one NodePool budget", func() {
 			Expect(scoreBasedReclamation.Reason()).To(Equal(v1.DisruptionReasonEmpty))

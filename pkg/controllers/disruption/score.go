@@ -27,11 +27,6 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
-// memoryGiBWeight weights memory relative to CPU cores in the workload-size denominator.
-const memoryGiBWeight = 0.125
-
-const gibibyte = 1024 * 1024 * 1024
-
 // defaultScoreBasedUtilisationWeight is a dimensionless weight for each
 // source node's CPU slack ratio.
 const defaultScoreBasedUtilisationWeight = 1.0
@@ -48,26 +43,6 @@ type scoreBasedSourceScore struct {
 	CPUSlackFraction        float64 `json:"cpuSlackFraction"`
 	UtilisationWeight       float64 `json:"utilisationWeight"`
 	UtilisationContribution float64 `json:"utilisationContribution"`
-}
-
-// nodePriorityScore is a search-guidance heuristic.
-// Uses non-daemon pod CPU/memory requests from cluster state via PodRequests().
-func nodePriorityScore(c *Candidate) float64 {
-	if c == nil || c.StateNode == nil {
-		return 0
-	}
-	nodePrice := c.Price
-	workloadSize := nonDaemonWorkloadSize(c.PodRequests())
-	if workloadSize <= 0 {
-		return nodePrice
-	}
-	return nodePrice / workloadSize
-}
-
-func nonDaemonWorkloadSize(requests corev1.ResourceList) float64 {
-	cores := requests.Cpu().AsApproximateFloat64()
-	gibibytes := requests.Memory().AsApproximateFloat64() / gibibyte
-	return cores + gibibytes*memoryGiBWeight
 }
 
 // moveSetPriorityScore combines the normalized cost contribution with the

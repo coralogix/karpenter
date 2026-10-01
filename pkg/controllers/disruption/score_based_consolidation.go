@@ -221,7 +221,6 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	_, stopFilter := cxtracing.Measure(ctx, nil, scoreBasedConsolidationFilterSpan,
 		attribute.Int("compaction_candidate_count", len(candidates)),
 	)
-	candidates = s.SortCandidates(candidates)
 	var validCandidates []*Candidate
 	for _, candidate := range candidates {
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
@@ -360,8 +359,13 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 	result := moveSetSearchResult{stats: &moveSetSearchStats{}}
 	searchCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
+	searchCandidates := append([]*Candidate(nil), validCandidates...)
+	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // Random order only guides this non-security-sensitive search.
+	rng.Shuffle(len(searchCandidates), func(i, j int) {
+		searchCandidates[i], searchCandidates[j] = searchCandidates[j], searchCandidates[i]
+	})
 	singleNodeMoveSets := make([]moveSet, len(validCandidates))
-	for i, candidate := range validCandidates {
+	for i, candidate := range searchCandidates {
 		singleNodeMoveSets[i] = moveSet{Nodes: []*Candidate{candidate}}
 	}
 	memoryConfigs := scoreBasedMemoryConfigs(validCandidates)
@@ -448,8 +452,7 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 
 	// If every singleton completed without a positive feasible move, sample pairs with higher
 	// probability for lower-utilization nodes. Pair generation is bounded and deadline-aware.
-	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // Random order only guides this non-security-sensitive search.
-	pairs, exhaustive, constrained := scoreBasedPairMoveSets(searchCtx, validCandidates, budgets, s.underutilizedPace, scoreBasedPairSearchLimit, rng)
+	pairs, exhaustive, constrained := scoreBasedPairMoveSets(searchCtx, searchCandidates, budgets, s.underutilizedPace, scoreBasedPairSearchLimit, rng)
 	result.constrained = constrained
 	if searchCtx.Err() != nil {
 		if !errors.Is(searchCtx.Err(), context.DeadlineExceeded) {
@@ -585,12 +588,4 @@ func (s *ScoreBasedConsolidation) Class() string {
 
 func (s *ScoreBasedConsolidation) ConsolidationType() string {
 	return ScoreBasedConsolidationType
-}
-
-// SortCandidates orders candidates by nodePriority (highest first).
-func (s *ScoreBasedConsolidation) SortCandidates(candidates []*Candidate) []*Candidate {
-	sort.Slice(candidates, func(i, j int) bool {
-		return nodePriorityScore(candidates[i]) > nodePriorityScore(candidates[j])
-	})
-	return candidates
 }
