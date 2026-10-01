@@ -29,9 +29,10 @@ const (
 	ConsolidationApproved      = "ConsolidationApproved"
 
 	// provisioning/scheduling
-	FailedScheduling          = "FailedScheduling"
-	NoCompatibleInstanceTypes = "NoCompatibleInstanceTypes"
-	Nominated                 = "Nominated"
+	FailedScheduling             = "FailedScheduling"
+	NoCompatibleInstanceTypes    = "NoCompatibleInstanceTypes"
+	InvalidSimulationMaxCapacity = "InvalidSimulationMaxCapacity"
+	Nominated                    = "Nominated"
 
 	// node/health
 	NodeRepairBlocked = "NodeRepairBlocked"
