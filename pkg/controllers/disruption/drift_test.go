@@ -909,12 +909,13 @@ var _ = Describe("Drift", func() {
 			// Cascade any deletion of the nodeClaim to the node
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 
-			// we should delete the empty node via drift (drift runs before consolidation)
+			// Emptiness claims the empty node before Drift, so it is reported with
+			// the Empty reason even though the NodeClaim is drifted.
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(0))
 			Expect(ExpectNodes(ctx, env.Client)).To(HaveLen(0))
 			ExpectNotFound(ctx, env.Client, nodeClaim, node)
 			ExpectMetricGaugeValue(disruption.EligibleNodes, 1, map[string]string{
-				metrics.ReasonLabel: "drifted",
+				metrics.ReasonLabel: "empty",
 			})
 		})
 		It("should untaint nodes when drift replacement fails", func() {

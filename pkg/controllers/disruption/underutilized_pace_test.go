@@ -205,12 +205,12 @@ var _ = Describe("Underutilized consolidation pace", func() {
 		nodeClaims[1].StatusConditions().SetTrue(v1.ConditionTypeDrifted)
 		pods := paceReplicaSetPods(rs, 2)
 		ExpectApplied(ctx, env.Client, nodePool)
-		ExpectApplied(ctx, env.Client, asObjects(nodeClaims)...)
-		ExpectApplied(ctx, env.Client, asObjects(nodes)...)
+		ExpectApplied(ctx, env.Client, asObjects(nodeClaims[:2])...)
+		ExpectApplied(ctx, env.Client, asObjects(nodes[:2])...)
 		ExpectApplied(ctx, env.Client, asObjects(pods)...)
 		ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
 		ExpectManualBinding(ctx, env.Client, pods[1], nodes[1])
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes[:2], nodeClaims[:2])
 
 		// Isolate drift so this test exercises its empty-candidate path directly.
 		underutilizedPace = disruption.NewUnderutilizedConsolidationPace(env.Clock)
@@ -226,10 +226,11 @@ var _ = Describe("Underutilized consolidation pace", func() {
 		Expect(queue.GetCommands()).To(HaveLen(1))
 
 		// A newly drifted empty node can still proceed while this NodePool's
-		// non-empty drift cooldown is active.
+		// non-empty drift cooldown is active. Add it after the initial scheduling
+		// simulation so it cannot be nominated as a destination for the evicted pods.
 		nodeClaims[2].StatusConditions().SetTrue(v1.ConditionTypeDrifted)
-		ExpectApplied(ctx, env.Client, nodeClaims[2])
-		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+		ExpectApplied(ctx, env.Client, nodeClaims[2], nodes[2])
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{nodes[2]}, []*v1.NodeClaim{nodeClaims[2]})
 		ExpectSingletonReconciled(ctx, disruptionController)
 		Expect(queue.GetCommands()).To(HaveLen(2))
 

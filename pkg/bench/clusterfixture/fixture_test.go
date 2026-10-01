@@ -23,6 +23,8 @@ import (
 	"runtime"
 	"testing"
 
+	// The shared make test target supplies Ginkgo flags to every package.
+	_ "github.com/onsi/ginkgo/v2"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"

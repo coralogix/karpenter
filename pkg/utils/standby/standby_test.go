@@ -19,6 +19,8 @@ package standby
 import (
 	"testing"
 
+	// The shared make test target supplies Ginkgo flags to every package.
+	_ "github.com/onsi/ginkgo/v2"
 	corev1 "k8s.io/api/core/v1"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"

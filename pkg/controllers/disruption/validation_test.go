@@ -60,7 +60,6 @@ func NewMethodsWithNopValidator(paces ...*disruption.UnderutilizedConsolidationP
 		scoreBasedReclamation,
 		disruption.NewStaticDrift(cluster, prov, cloudProvider, pace),
 		disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock, pace),
-		emptiness,
 		multiNodeConsolidation,
 		scoreBasedConsolidation,
 		singleNodeConsolidation,

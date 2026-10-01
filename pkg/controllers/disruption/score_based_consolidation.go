@@ -157,6 +157,9 @@ func (s *ScoreBasedConsolidation) compactionCandidateEligible(cn *Candidate) boo
 	if !NodePoolUsesScoreBasedConsolidation(cn.NodePool) {
 		return false
 	}
+	if cn.NodePool.Spec.Disruption.ConsolidationPolicy != v1.ConsolidationPolicyWhenEmptyOrUnderutilized {
+		return false
+	}
 	if standby.IsNodeClaimActivating(cn.NodeClaim) || standby.IsNodeClaimStandby(cn.NodeClaim) || standby.HasNodeTaint(cn.Node) {
 		return false
 	}

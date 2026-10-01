@@ -138,6 +138,14 @@ func TestScoreBasedConsolidationCandidateFiltering(t *testing.T) {
 			t.Fatal("expected multi-node consolidation to accept unannotated pool")
 		}
 	})
+
+	t.Run("balanced score-based pool", func(t *testing.T) {
+		candidate := makeCandidate(true)
+		candidate.NodePool.Spec.Disruption.ConsolidationPolicy = v1.ConsolidationPolicyBalanced
+		if scoreBased.ShouldDisrupt(ctx, candidate) {
+			t.Fatal("expected score-based consolidation to reject Balanced policy")
+		}
+	})
 }
 
 func TestScoreBasedCompactionIgnoresConsolidateAfter(t *testing.T) {

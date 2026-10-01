@@ -102,9 +102,8 @@ func (c *consolidation) markConsolidated() {
 	c.lastConsolidationState = c.cluster.ConsolidationState()
 }
 
-// shouldDisruptIgnoringConsolidateAfter applies the common consolidation gates that are also
-// required by score-based compaction. Score-based mode controls compaction eligibility itself,
-// so it does not use consolidateAfter or the upstream Consolidatable condition.
+// shouldDisruptIgnoringConsolidateAfter applies shared node metadata and policy checks. Balanced
+// pools use the upstream gate; score-based compaction applies its own policy and timing eligibility.
 func (c *consolidation) shouldDisruptIgnoringConsolidateAfter(cn *Candidate) bool {
 	// Disable consolidation for static NodePool
 	if cn.OwnedByStaticNodePool() {
@@ -127,10 +126,9 @@ func (c *consolidation) shouldDisruptIgnoringConsolidateAfter(cn *Candidate) boo
 		c.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("Node does not have label %q", corev1.LabelTopologyZone))...)
 		return false
 	}
-	// If we don't have the "WhenEmptyOrUnderutilized" policy set, we should not do any of the consolidation methods, but
-	// we should also not fire an event here to users since this can be confusing when the field on the NodePool
-	// is named "consolidationPolicy"
-	if cn.NodePool.Spec.Disruption.ConsolidationPolicy != v1.ConsolidationPolicyWhenEmptyOrUnderutilized {
+	// Only WhenEmptyOrUnderutilized and Balanced allow non-empty consolidation.
+	policy := cn.NodePool.Spec.Disruption.ConsolidationPolicy
+	if policy != v1.ConsolidationPolicyWhenEmptyOrUnderutilized && !policy.IsBalanced() {
 		c.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("NodePool %q has non-empty consolidation disabled", cn.NodePool.Name))...)
 		return false
 	}

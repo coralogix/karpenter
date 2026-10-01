@@ -19,6 +19,8 @@ package cxtracing
 import (
 	"testing"
 
+	// The shared make test target supplies Ginkgo flags to every package.
+	_ "github.com/onsi/ginkgo/v2"
 	"github.com/stretchr/testify/require"
 )
 
