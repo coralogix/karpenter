@@ -76,8 +76,12 @@ type moveSetEvaluation struct {
 	BaseScore                  float64
 	Cost                       scoreBasedCostScore
 	MemoryBalance              scoreBasedMemoryScore
+	SourceNodeScores           []scoreBasedSourceScore
+	UtilisationContribution    float64
 	searchPath                 scoreBasedMoveSetSearchPath
 	sourceNodeSingleMoveScores []float64
+	validationStatus           string
+	validationReason           string
 }
 
 type moveSetSearchResult struct {
@@ -345,7 +349,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		})
 		return []Command{}, nil
 	}
-	logScoreBasedCompactionMoveSelected(ctx, evals, selectedEvalIdx, evaluated, len(validCandidates))
+	logScoreBasedCompactionMoveSelected(ctx, evals, selectedEvalIdx, evaluated, len(validCandidates), timedOut)
 	cmd.EmitCandidateEvents(s.recorder)
 	cmd.Action = EvacuateAction
 	return []Command{cmd}, nil
@@ -395,13 +399,15 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 		return cmd, err
 	}
 	scoreMoveSet := func(cmd Command) moveSetScoring {
-		baseScore, costScore := scoreMoveSetPriority(cmd, priceSnapshot)
-		memoryBalance := memorySnapshot.score(cmd)
+		baseScore, costScore, utilisationContribution, sourceNodeScores := scoreMoveSetPriorityDetails(cmd, priceSnapshot)
+		memoryBalance := scoreBasedMemoryScoreForCommand(cmd, memorySnapshot, memoryConfigs)
 		return moveSetScoring{
-			Score:         baseScore + memoryBalance.Correction,
-			BaseScore:     baseScore,
-			Cost:          costScore,
-			MemoryBalance: memoryBalance,
+			Score:                   baseScore + memoryBalance.Correction,
+			BaseScore:               baseScore,
+			Cost:                    costScore,
+			MemoryBalance:           memoryBalance,
+			SourceNodeScores:        sourceNodeScores,
+			UtilisationContribution: utilisationContribution,
 		}
 	}
 
@@ -468,14 +474,21 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 }
 
 func selectFirstStillValidCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation) (Command, int, error) {
+	for _, eval := range evals {
+		eval.validationStatus = "not_attempted"
+		eval.validationReason = ""
+	}
 	for i, eval := range evals {
 		if _, err := validator.Validate(ctx, eval.Command, 0); err != nil {
 			if IsValidationError(err) {
-				eval.Command.EmitRejectedEvents(recorder, getValidationFailureReason(err))
+				eval.validationStatus = "failed"
+				eval.validationReason = getValidationFailureReason(err)
+				eval.Command.EmitRejectedEvents(recorder, eval.validationReason)
 				continue
 			}
 			return Command{}, -1, fmt.Errorf("validating score-based consolidation, %w", err)
 		}
+		eval.validationStatus = "validated"
 		return eval.Command, i, nil
 	}
 	return Command{}, -1, nil

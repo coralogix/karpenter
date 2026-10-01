@@ -56,12 +56,16 @@ type scoreBasedPriceGroupScore struct {
 }
 
 type scoreBasedCostScore struct {
-	Enabled              bool                                 `json:"enabled"`
-	Valid                bool                                 `json:"valid"`
-	SavingsFraction      float64                              `json:"savingsFraction"`
-	NormalizedSourceCost float64                              `json:"normalizedSourceCost"`
-	Contribution         float64                              `json:"contribution"`
-	Groups               map[string]scoreBasedPriceGroupScore `json:"groups,omitempty"`
+	Enabled               bool                                 `json:"enabled"`
+	Valid                 bool                                 `json:"valid"`
+	SourceUSDPerHour      float64                              `json:"sourceUSDPerHour"`
+	SavingsUSDPerHour     float64                              `json:"savingsUSDPerHour"`
+	ReplacementUSDPerHour float64                              `json:"replacementUSDPerHour"`
+	SavingsFraction       float64                              `json:"savingsFraction"`
+	NormalizedSourceCost  float64                              `json:"normalizedSourceCost"`
+	Contribution          float64                              `json:"contribution"`
+	Groups                map[string]scoreBasedPriceGroupScore `json:"groups,omitempty"`
+	SourceNodes           []scoreBasedSourceScore              `json:"-"`
 }
 
 type scoreBasedPriceSnapshot struct {
@@ -170,7 +174,8 @@ func (snapshot *scoreBasedPriceSnapshot) score(command Command) scoreBasedCostSc
 	if sourcePrice <= 0 || !finiteScoreValue(sourcePrice) {
 		return details
 	}
-	savingsFraction := consolidationSavingsUSDPerHour(command) / sourcePrice
+	savingsUSDPerHour := consolidationSavingsUSDPerHour(command)
+	savingsFraction := savingsUSDPerHour / sourcePrice
 	if !finiteScoreValue(savingsFraction) {
 		return details
 	}
@@ -181,13 +186,25 @@ func (snapshot *scoreBasedPriceSnapshot) score(command Command) scoreBasedCostSc
 		}
 		addScoreBasedCostGroup(details.Groups, nodePrice.group, group, normalizedPrice)
 		details.NormalizedSourceCost += normalizedPrice
+		details.SourceNodes = append(details.SourceNodes, scoreBasedSourceScore{
+			PriceUSDPerHour:       nodePrice.price,
+			AllocatableCPU:        nodePrice.cpu,
+			BaselineUSDPerCPUHour: group.baseline,
+			NormalizedSourceCost:  normalizedPrice,
+		})
 	}
 	contribution := savingsFraction * details.NormalizedSourceCost
 	if !finiteScoreValue(contribution) {
 		return scoreBasedCostScore{Enabled: true}
 	}
 	details.SavingsFraction = savingsFraction
+	details.SourceUSDPerHour = sourcePrice
+	details.SavingsUSDPerHour = savingsUSDPerHour
+	details.ReplacementUSDPerHour = sourcePrice - savingsUSDPerHour
 	details.Contribution = contribution
+	for i := range details.SourceNodes {
+		details.SourceNodes[i].CostContribution = savingsFraction * details.SourceNodes[i].NormalizedSourceCost
+	}
 	details.Valid = true
 	return details
 }

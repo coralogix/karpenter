@@ -88,10 +88,19 @@ func TestLogScoreBasedCompactionMoveSelectedJSON(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			eval := &moveSetEvaluation{
-				Command:                    tc.command,
-				Score:                      tc.score,
+				Command: tc.command,
+				Score:   tc.score,
+				Cost: scoreBasedCostScore{
+					SourceUSDPerHour:      tc.wantSourceCost,
+					SavingsUSDPerHour:     tc.wantSavings,
+					ReplacementUSDPerHour: tc.wantReplacement,
+				},
+				SourceNodeScores:           make([]scoreBasedSourceScore, len(tc.command.Candidates)),
 				searchPath:                 tc.path,
 				sourceNodeSingleMoveScores: tc.singleScores,
+			}
+			for i, candidate := range tc.command.Candidates {
+				eval.SourceNodeScores[i].PriceUSDPerHour = candidate.Price
 			}
 			evals := []*moveSetEvaluation{eval}
 			if tc.selectedIndex > 0 {
@@ -107,7 +116,7 @@ func TestLogScoreBasedCompactionMoveSelectedJSON(t *testing.T) {
 			logger := zap.New(zapcore.NewCore(zapcore.NewJSONEncoder(encoder), zapcore.AddSync(&output), zapcore.InfoLevel))
 			defer func() { _ = logger.Sync() }()
 			ctx := log.IntoContext(context.Background(), zapr.NewLogger(logger))
-			logScoreBasedCompactionMoveSelected(ctx, evals, tc.selectedIndex, 44, 7)
+			logScoreBasedCompactionMoveSelected(ctx, evals, tc.selectedIndex, 44, 7, false)
 
 			var record map[string]any
 			if err := json.Unmarshal(output.Bytes(), &record); err != nil {
@@ -141,8 +150,8 @@ func TestLogScoreBasedCompactionMoveSelectedJSON(t *testing.T) {
 					t.Errorf("sourceNodes[%d] = %v, missing expected identity/type/cost for %s", i, node, candidate.Name())
 				}
 				nodeScore := nestedLogMap(t, node, "score")
-				if nodeScore["searchPriorityScore"] != candidate.Price {
-					t.Errorf("sourceNodes[%d].score.searchPriorityScore = %v, want %v", i, nodeScore["searchPriorityScore"], candidate.Price)
+				if _, exists := nodeScore["searchPriorityScore"]; exists {
+					t.Errorf("sourceNodes[%d] unexpectedly logs searchPriorityScore: %v", i, nodeScore)
 				}
 				if i < len(tc.singleScores) {
 					if nodeScore["singleNodeMoveScore"] != tc.singleScores[i] {

@@ -614,11 +614,13 @@ func evaluateMoveSetWith(
 		return nil
 	}
 	return &moveSetEvaluation{
-		Command:       cmd,
-		Score:         scoring.Score,
-		BaseScore:     scoring.BaseScore,
-		Cost:          scoring.Cost,
-		MemoryBalance: scoring.MemoryBalance,
+		Command:                 cmd,
+		Score:                   scoring.Score,
+		BaseScore:               scoring.BaseScore,
+		Cost:                    scoring.Cost,
+		MemoryBalance:           scoring.MemoryBalance,
+		SourceNodeScores:        scoring.SourceNodeScores,
+		UtilisationContribution: scoring.UtilisationContribution,
 	}
 }
 

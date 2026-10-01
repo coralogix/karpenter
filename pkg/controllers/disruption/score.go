@@ -36,6 +36,20 @@ const gibibyte = 1024 * 1024 * 1024
 // source node's CPU slack ratio.
 const defaultScoreBasedUtilisationWeight = 1.0
 
+// scoreBasedSourceScore records the exact per-source values consumed by the
+// cost and CPU-slack terms while a move set is evaluated.
+type scoreBasedSourceScore struct {
+	PriceUSDPerHour         float64 `json:"priceUSDPerHour"`
+	AllocatableCPU          float64 `json:"allocatableCPU"`
+	RequestedCPU            float64 `json:"requestedCPU"`
+	BaselineUSDPerCPUHour   float64 `json:"baselineUSDPerCPUHour"`
+	NormalizedSourceCost    float64 `json:"normalizedSourceCost"`
+	CostContribution        float64 `json:"costContribution"`
+	CPUSlackFraction        float64 `json:"cpuSlackFraction"`
+	UtilisationWeight       float64 `json:"utilisationWeight"`
+	UtilisationContribution float64 `json:"utilisationContribution"`
+}
+
 // nodePriorityScore is a search-guidance heuristic.
 // Uses non-daemon pod CPU/memory requests from cluster state via PodRequests().
 func nodePriorityScore(c *Candidate) float64 {
@@ -64,18 +78,41 @@ func moveSetPriorityScore(cmd Command, prices *scoreBasedPriceSnapshot) float64 
 }
 
 func scoreMoveSetPriority(cmd Command, prices *scoreBasedPriceSnapshot) (float64, scoreBasedCostScore) {
+	score, cost, _, _ := scoreMoveSetPriorityDetails(cmd, prices)
+	return score, cost
+}
+
+func scoreMoveSetPriorityDetails(cmd Command, prices *scoreBasedPriceSnapshot) (float64, scoreBasedCostScore, float64, []scoreBasedSourceScore) {
 	cost := prices.score(cmd)
 	if !cost.Valid {
-		return math.NaN(), cost
+		return math.NaN(), cost, 0, cost.SourceNodes
 	}
-	return cost.Contribution + moveSetUtilisationScore(cmd), cost
+	utilisation, utilisationScores := moveSetUtilisationScoreDetails(cmd)
+	for i := range cost.SourceNodes {
+		if i >= len(utilisationScores) {
+			break
+		}
+		cost.SourceNodes[i].RequestedCPU = utilisationScores[i].RequestedCPU
+		cost.SourceNodes[i].AllocatableCPU = utilisationScores[i].AllocatableCPU
+		cost.SourceNodes[i].CPUSlackFraction = utilisationScores[i].CPUSlackFraction
+		cost.SourceNodes[i].UtilisationWeight = utilisationScores[i].UtilisationWeight
+		cost.SourceNodes[i].UtilisationContribution = utilisationScores[i].UtilisationContribution
+	}
+	return cost.Contribution + utilisation, cost, utilisation, cost.SourceNodes
 }
 
 func moveSetUtilisationScore(cmd Command) float64 {
+	score, _ := moveSetUtilisationScoreDetails(cmd)
+	return score
+}
+
+func moveSetUtilisationScoreDetails(cmd Command) (float64, []scoreBasedSourceScore) {
 	var score float64
+	details := make([]scoreBasedSourceScore, 0, len(cmd.Candidates))
 	for _, candidate := range cmd.Candidates {
 		allocatableCPU := candidateAllocatableCPU(candidate)
 		if allocatableCPU <= 0 {
+			details = append(details, scoreBasedSourceScore{})
 			continue
 		}
 		requestedCPU := candidateRequestedCPU(candidate)
@@ -87,9 +124,18 @@ func moveSetUtilisationScore(cmd Command) float64 {
 		if candidate.NodePool != nil {
 			weight = scoreBasedUtilisationWeight(candidate.NodePool)
 		}
-		score += weight * (unallocatedCPU / allocatableCPU)
+		slackFraction := unallocatedCPU / allocatableCPU
+		contribution := weight * slackFraction
+		score += contribution
+		details = append(details, scoreBasedSourceScore{
+			AllocatableCPU:          allocatableCPU,
+			RequestedCPU:            requestedCPU,
+			CPUSlackFraction:        slackFraction,
+			UtilisationWeight:       weight,
+			UtilisationContribution: contribution,
+		})
 	}
-	return score
+	return score, details
 }
 
 // consolidationSavingsUSDPerHour mirrors EstimatedSavings for commands produced by scheduling simulation,

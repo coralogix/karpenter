@@ -207,42 +207,14 @@ func logScoreBasedCompactionMoveSelected(
 	selectedEvalIdx int,
 	evaluatedMoveSetCount int,
 	eligibleCandidateCount int,
+	timedOut bool,
 ) {
 	if selectedEvalIdx < 0 || selectedEvalIdx >= len(evals) {
 		return
 	}
 	eval := evals[selectedEvalIdx]
 	cmd := eval.Command
-	sourceNodes := make([]map[string]any, 0, len(cmd.Candidates))
-	sourceCostUSDPerHour := sumCandidatePrices(cmd.Candidates)
-	for i, candidate := range cmd.Candidates {
-		sourceNode := map[string]any{
-			"nodeName":       candidate.Name(),
-			"nodeClaimName":  candidate.NodeClaim.Name,
-			"nodePoolName":   candidate.NodePool.Name,
-			"instanceType":   candidate.Labels()[corev1.LabelInstanceTypeStable],
-			"capacityType":   candidate.Labels()[v1.CapacityTypeLabelKey],
-			"costUSDPerHour": candidate.Price,
-		}
-		nodeScores := map[string]any{"searchPriorityScore": nodePriorityScore(candidate)}
-		if i < len(eval.sourceNodeSingleMoveScores) {
-			nodeScores["singleNodeMoveScore"] = eval.sourceNodeSingleMoveScores[i]
-		}
-		sourceNode["score"] = nodeScores
-		sourceNodes = append(sourceNodes, sourceNode)
-	}
-	estimatedSavingsUSDPerHour := consolidationSavingsUSDPerHour(cmd)
-	scoreMethod := "joint_move_set_score"
-	if eval.searchPath == scoreBasedSearchPathBatch {
-		scoreMethod = "additive_single_node_scores"
-		if eval.MemoryBalance.Enabled {
-			scoreMethod = "additive_base_plus_joint_memory_balance"
-		}
-	}
-	selectionReason := "highest_ranked_validated_move"
-	if selectedEvalIdx > 0 {
-		selectionReason = "fallback_after_validation"
-	}
+	sourceNodes := scoreBasedSelectedSourceNodeLogs(eval)
 	log.FromContext(ctx).Info("score-based consolidation move selected",
 		"move", map[string]any{
 			"searchPath":           eval.searchPath,
@@ -253,29 +225,139 @@ func logScoreBasedCompactionMoveSelected(
 			"score": map[string]any{
 				"rankingScore":            eval.Score,
 				"baseScore":               eval.BaseScore,
-				"method":                  scoreMethod,
+				"method":                  scoreBasedMoveScoreMethod(eval),
 				"normalizedCost":          eval.Cost,
-				"utilisationContribution": moveSetUtilisationScore(cmd),
+				"costContribution":        eval.Cost.Contribution,
+				"utilisationContribution": eval.UtilisationContribution,
 				"memoryBalance":           eval.MemoryBalance,
 				"memoryBalanceCorrection": eval.MemoryBalance.Correction,
 			},
 			"cost": map[string]any{
-				"sourceUSDPerHour":               sourceCostUSDPerHour,
-				"estimatedReplacementUSDPerHour": sourceCostUSDPerHour - estimatedSavingsUSDPerHour,
-				"estimatedSavingsUSDPerHour":     estimatedSavingsUSDPerHour,
+				"sourceUSDPerHour":               eval.Cost.SourceUSDPerHour,
+				"estimatedReplacementUSDPerHour": eval.Cost.ReplacementUSDPerHour,
+				"estimatedSavingsUSDPerHour":     eval.Cost.SavingsUSDPerHour,
 			},
 		},
 		"search", map[string]any{
 			"eligibleCandidateCount": eligibleCandidateCount,
 			"evaluatedMoveSetCount":  evaluatedMoveSetCount,
 			"retainedMoveSetCount":   len(evals),
+			"timedOut":               timedOut,
 		},
 		"selection", map[string]any{
 			"rank":                             selectedEvalIdx + 1,
 			"rejectedHigherRankedMoveSetCount": selectedEvalIdx,
-			"reason":                           selectionReason,
+			"reason":                           scoreBasedSelectionReason(selectedEvalIdx),
+			"validationStatus":                 selectedValidationStatus(eval),
+			"validationReason":                 eval.validationReason,
 		},
+		"alternatives", scoreBasedAlternativeLogs(evals, selectedEvalIdx),
 	)
+}
+
+func scoreBasedSelectedSourceNodeLogs(eval *moveSetEvaluation) []map[string]any {
+	sourceNodes := make([]map[string]any, 0, len(eval.Command.Candidates))
+	for i, candidate := range eval.Command.Candidates {
+		var sourcePrice any
+		if i < len(eval.SourceNodeScores) {
+			sourcePrice = eval.SourceNodeScores[i].PriceUSDPerHour
+		}
+		sourceNode := map[string]any{
+			"nodeName":       candidate.Name(),
+			"nodeClaimName":  candidate.NodeClaim.Name,
+			"nodePoolName":   candidate.NodePool.Name,
+			"instanceType":   candidate.Labels()[corev1.LabelInstanceTypeStable],
+			"capacityType":   candidate.Labels()[v1.CapacityTypeLabelKey],
+			"costUSDPerHour": sourcePrice,
+		}
+		nodeScores := scoreBasedSourceNodeScoreLog(eval, i)
+		if i < len(eval.sourceNodeSingleMoveScores) {
+			nodeScores["singleNodeMoveScore"] = eval.sourceNodeSingleMoveScores[i]
+		}
+		sourceNode["score"] = nodeScores
+		sourceNodes = append(sourceNodes, sourceNode)
+	}
+	return sourceNodes
+}
+
+func scoreBasedMoveScoreMethod(eval *moveSetEvaluation) string {
+	if eval.searchPath != scoreBasedSearchPathBatch {
+		return "joint_move_set_score"
+	}
+	if eval.MemoryBalance.Enabled {
+		return "additive_base_plus_joint_memory_balance"
+	}
+	return "additive_single_node_scores"
+}
+
+func scoreBasedSelectionReason(selectedEvalIdx int) string {
+	if selectedEvalIdx > 0 {
+		return "fallback_after_validation"
+	}
+	return "highest_ranked_validated_move"
+}
+
+func scoreBasedAlternativeLogs(evals []*moveSetEvaluation, selectedEvalIdx int) []map[string]any {
+	var alternatives []map[string]any
+	for i, alternative := range evals {
+		if i == selectedEvalIdx || len(alternatives) >= 3 {
+			continue
+		}
+		alternatives = append(alternatives, scoreBasedAlternativeLog(alternative, i+1))
+	}
+	return alternatives
+}
+
+func scoreBasedSourceNodeScoreLog(eval *moveSetEvaluation, sourceIndex int) map[string]any {
+	if eval == nil || sourceIndex >= len(eval.SourceNodeScores) {
+		return map[string]any{}
+	}
+	score := eval.SourceNodeScores[sourceIndex]
+	return map[string]any{
+		"allocatableCPU":          score.AllocatableCPU,
+		"requestedCPU":            score.RequestedCPU,
+		"baselineUSDPerCPUHour":   score.BaselineUSDPerCPUHour,
+		"normalizedSourceCost":    score.NormalizedSourceCost,
+		"costContribution":        score.CostContribution,
+		"cpuSlackFraction":        score.CPUSlackFraction,
+		"utilisationWeight":       score.UtilisationWeight,
+		"utilisationContribution": score.UtilisationContribution,
+	}
+}
+
+func scoreBasedAlternativeLog(eval *moveSetEvaluation, rank int) map[string]any {
+	sourceNodes := make([]map[string]any, 0, len(eval.Command.Candidates))
+	for _, candidate := range eval.Command.Candidates {
+		sourceNodes = append(sourceNodes, map[string]any{"nodeName": candidate.Name()})
+	}
+	return map[string]any{
+		"rank":                       rank,
+		"searchPath":                 eval.searchPath,
+		"simulatedDecision":          eval.Command.Decision(),
+		"sourceNodes":                sourceNodes,
+		"estimatedSavingsUSDPerHour": eval.Cost.SavingsUSDPerHour,
+		"score": map[string]any{
+			"rankingScore":            eval.Score,
+			"costContribution":        eval.Cost.Contribution,
+			"utilisationContribution": eval.UtilisationContribution,
+			"memoryBalanceCorrection": eval.MemoryBalance.Correction,
+		},
+		"memoryBalance": map[string]any{
+			"status": eval.MemoryBalance.Status,
+			"reason": eval.MemoryBalance.Reason,
+		},
+		"validation": map[string]any{
+			"status": selectedValidationStatus(eval),
+			"reason": eval.validationReason,
+		},
+	}
+}
+
+func selectedValidationStatus(eval *moveSetEvaluation) string {
+	if eval == nil || eval.validationStatus == "" {
+		return "not_attempted"
+	}
+	return eval.validationStatus
 }
 
 func logScoreBasedCompactionNoMove(ctx context.Context, reason scoreBasedNoMoveReason, details scoreBasedNoMoveDetails) {

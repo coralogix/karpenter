@@ -703,6 +703,9 @@ func TestSelectFirstValidatedCommand_validationFallbackReportsRejectedAttempt(t 
 	if cmd.Candidates[0] != lowScoreCandidate {
 		t.Fatal("expected fallback to lower-scored command after validation rejection")
 	}
+	if evals[0].validationStatus != "failed" || evals[0].validationReason != "scheduling" || evals[1].validationStatus != "validated" {
+		t.Fatalf("validation outcomes = %s/%s then %s/%s, want failed/scheduling then validated", evals[0].validationStatus, evals[0].validationReason, evals[1].validationStatus, evals[1].validationReason)
+	}
 	rejectedEvents := collectFakeRecorderEvents(fakeRecorder)
 	if !eventsMentioningNode(rejectedEvents, "high-score") {
 		t.Fatal("expected rejected events for the failed high-score command")
@@ -736,6 +739,11 @@ func TestSelectFirstValidatedCommand_emitsRejectedEventForEachAttemptWhenAllFail
 	}
 	if len(cmd.Candidates) != 0 {
 		t.Fatalf("command candidates = %d, want 0", len(cmd.Candidates))
+	}
+	for _, eval := range evals {
+		if eval.validationStatus != "failed" || eval.validationReason != "scheduling" {
+			t.Errorf("validation outcome = %s/%s, want failed/scheduling", eval.validationStatus, eval.validationReason)
+		}
 	}
 
 	rejectedEvents := collectFakeRecorderEvents(fakeRecorder)

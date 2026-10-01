@@ -142,6 +142,18 @@ func TestScoreBasedMemoryInternalReplacementAndStandbyDeltasAreBatched(t *testin
 	if withStandby.Correction != -1 || withStandby.RemovedCPU != sourceShape.cpu {
 		t.Fatalf("batched source/replacement/standby score = correction %v, removed CPU %v; want -1 and %v", withStandby.Correction, withStandby.RemovedCPU, sourceShape.cpu)
 	}
+	if got := withStandby.Pools[poolName].AddedShapeAssessment; got != "conservative_replacement_and_measured_standby_shapes" {
+		t.Fatalf("combined replacement/standby assessment = %q", got)
+	}
+
+	shapes["second-standby"] = sourceShape
+	standbyOnly := snapshot.score(Command{Candidates: []*Candidate{candidate}, Results: scheduling.Results{
+		ExistingNodes: []*scheduling.ExistingNode{standbyNode, scoreMemoryStandbyNodeForTest(poolName, "second-standby")},
+	}})
+	poolScore := standbyOnly.Pools[poolName]
+	if poolScore.AddedShapeAssessment != "measured_standby_allocatable_shape" || poolScore.AddedShape.CPUCores != 2*sourceShape.cpu || poolScore.AddedShape.MemoryBytes != 2*sourceShape.memory {
+		t.Fatalf("multiple standby additions = %+v, want measured aggregate shapes", poolScore)
+	}
 }
 
 func TestScoreBasedMemoryInternalReplacementUsesConservativeOptions(t *testing.T) {
@@ -156,6 +168,45 @@ func TestScoreBasedMemoryInternalReplacementUsesConservativeOptions(t *testing.T
 	score := snapshot.score(Command{Candidates: []*Candidate{source}, Replacements: []*Replacement{{NodeClaim: replacement}}})
 	if score.Correction != -1 {
 		t.Fatalf("correction using the most adverse replacement option = %v, want -1", score.Correction)
+	}
+	poolScore := score.Pools[poolName]
+	if poolScore.AddedShape.CPUCores != 2 || poolScore.AddedShape.MemoryBytes != 16 {
+		t.Fatalf("logged conservative added shape = %+v, want 2 CPU and 16 bytes", poolScore.AddedShape)
+	}
+	if poolScore.AddedShapeAssessment != "conservatively_assessed_worst_case_compatible_offering" {
+		t.Fatalf("added shape assessment = %q, want conservative compatible offering", poolScore.AddedShapeAssessment)
+	}
+	if poolScore.RemovedShape.CPUCores != 2 || poolScore.RemovedShape.MemoryBytes != 8 {
+		t.Fatalf("logged removed shape = %+v, want 2 CPU and 8 bytes", poolScore.RemovedShape)
+	}
+}
+
+func TestScoreBasedMemoryDetailsReportDisabledState(t *testing.T) {
+	const poolName = "memory-pool"
+	candidate := scoreMemoryCandidateForTest(poolName, "source")
+	command := Command{Candidates: []*Candidate{candidate}}
+
+	disabled := scoreBasedMemoryScoreForCommand(command, nil, map[string]scoreBasedMemoryConfig{
+		poolName: {surplus: 0.35, weight: 0},
+	})
+	if disabled.Enabled || disabled.Status != "disabled" || disabled.Pools[poolName].Status != "disabled" || disabled.Pools[poolName].MemorySurplus != 0.35 || disabled.Pools[poolName].Weight != 0 {
+		t.Fatalf("disabled memory details = %+v, want disabled status with effective annotations", disabled)
+	}
+}
+
+func TestScoreBasedMemoryDetailsReportUnavailableStateWithZeroCorrection(t *testing.T) {
+	const poolName = "memory-pool"
+	candidate := scoreMemoryCandidateForTest(poolName, "source")
+	command := Command{Candidates: []*Candidate{candidate}}
+	snapshot := scoreMemorySnapshotForTest(poolName, 10, 40, 1, 2,
+		map[string]scoreBasedMemoryShape{"source": {cpu: 1, memory: 8}})
+	snapshot.pools[poolName].valid = false
+	unavailable := scoreBasedMemoryScoreForCommand(command, snapshot, snapshot.configs)
+	if unavailable.Status != "unavailable" || unavailable.Reason != "source_pool_baseline_unavailable" || unavailable.Correction != 0 {
+		t.Fatalf("unavailable memory details = %+v, want zero correction and source baseline reason", unavailable)
+	}
+	if got := unavailable.Pools[poolName]; got.Status != "unavailable" || got.Contribution != 0 || got.NormalizedDelta != 0 {
+		t.Fatalf("unavailable pool details = %+v, want no partial correction", got)
 	}
 }
 
