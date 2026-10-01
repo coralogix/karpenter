@@ -33,16 +33,22 @@ import (
 
 // StaticDrift is a subreconciler that deletes drifted static candidates.
 type StaticDrift struct {
-	cluster       *state.Cluster
-	provisioner   *provisioning.Provisioner
-	cloudprovider cloudprovider.CloudProvider
+	cluster           *state.Cluster
+	provisioner       *provisioning.Provisioner
+	cloudprovider     cloudprovider.CloudProvider
+	underutilizedPace *UnderutilizedConsolidationPace
 }
 
-func NewStaticDrift(cluster *state.Cluster, provisioner *provisioning.Provisioner, cloudprovider cloudprovider.CloudProvider) *StaticDrift {
+func NewStaticDrift(cluster *state.Cluster, provisioner *provisioning.Provisioner, cloudprovider cloudprovider.CloudProvider, paces ...*UnderutilizedConsolidationPace) *StaticDrift {
+	var pace *UnderutilizedConsolidationPace
+	if len(paces) > 0 {
+		pace = paces[0]
+	}
 	return &StaticDrift{
-		cluster:       cluster,
-		provisioner:   provisioner,
-		cloudprovider: cloudprovider,
+		cluster:           cluster,
+		provisioner:       provisioner,
+		cloudprovider:     cloudprovider,
+		underutilizedPace: pace,
 	}
 }
 
@@ -60,6 +66,20 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 	var cmds []Command
 	for npName, npCandidates := range candidatesByNodePool {
 		np := npCandidates[0].NodePool
+		pacedCandidates := make([]*Candidate, 0, len(npCandidates))
+		selectedNonEmpty := 0
+		for _, candidate := range npCandidates {
+			if len(candidate.reschedulablePods) > 0 && !d.underutilizedPace.candidateAllowed(np, selectedNonEmpty) {
+				continue
+			}
+			pacedCandidates = append(pacedCandidates, candidate)
+			if len(candidate.reschedulablePods) > 0 {
+				selectedNonEmpty++
+			}
+		}
+		if len(pacedCandidates) == 0 {
+			continue
+		}
 
 		if disruptionBudgetMapping[npName] == 0 {
 			continue
@@ -77,7 +97,7 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 
 		maxDrifts := lo.Min([]int64{
 			int64(disruptionBudgetMapping[np.Name]),
-			int64(len(npCandidates)),
+			int64(len(pacedCandidates)),
 		})
 
 		// Acquire limits from cluster state without bursting over
@@ -89,7 +109,7 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 		}
 
 		// Select candidates up to maxAllowedDrifts
-		for _, c := range npCandidates[:maxAllowedDrifts] {
+		for _, c := range pacedCandidates[:maxAllowedDrifts] {
 			nct := scheduling.NewNodeClaimTemplate(np)
 			result := scheduling.Results{
 				NewNodeClaims: []*scheduling.NodeClaim{{NodeClaimTemplate: *nct}},

@@ -37,20 +37,26 @@ import (
 
 // Drift is a subreconciler that deletes drifted candidates.
 type Drift struct {
-	kubeClient  client.Client
-	cluster     *state.Cluster
-	provisioner *provisioning.Provisioner
-	recorder    events.Recorder
-	clock       clock.Clock
+	kubeClient        client.Client
+	cluster           *state.Cluster
+	provisioner       *provisioning.Provisioner
+	recorder          events.Recorder
+	clock             clock.Clock
+	underutilizedPace *UnderutilizedConsolidationPace
 }
 
-func NewDrift(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, recorder events.Recorder, clk clock.Clock) *Drift {
+func NewDrift(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, recorder events.Recorder, clk clock.Clock, paces ...*UnderutilizedConsolidationPace) *Drift {
+	var pace *UnderutilizedConsolidationPace
+	if len(paces) > 0 {
+		pace = paces[0]
+	}
 	return &Drift{
-		kubeClient:  kubeClient,
-		cluster:     cluster,
-		provisioner: provisioner,
-		recorder:    recorder,
-		clock:       clk,
+		kubeClient:        kubeClient,
+		cluster:           cluster,
+		provisioner:       provisioner,
+		recorder:          recorder,
+		clock:             clk,
+		underutilizedPace: pace,
 	}
 }
 
@@ -82,6 +88,9 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 		// continue to the next candidate. We don't need to decrement any budget
 		// counter since drift commands can only have one candidate.
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
+			continue
+		}
+		if len(candidate.reschedulablePods) > 0 && !d.underutilizedPace.candidateAllowed(candidate.NodePool, 0) {
 			continue
 		}
 		// Check if we need to create any NodeClaims.

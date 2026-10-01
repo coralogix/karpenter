@@ -195,6 +195,52 @@ var _ = Describe("Underutilized consolidation pace", func() {
 		Expect(queue.GetCommands()).To(HaveLen(1))
 	})
 
+	It("should pace non-empty drift while allowing empty drift", func() {
+		nodePool.Annotations = paceAnnotations("1", "")
+		rs := test.ReplicaSet()
+		ExpectApplied(ctx, env.Client, rs)
+		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+		nodeClaims, nodes := paceConsolidatableNodes(nodePool, 3)
+		nodeClaims[0].StatusConditions().SetTrue(v1.ConditionTypeDrifted)
+		nodeClaims[1].StatusConditions().SetTrue(v1.ConditionTypeDrifted)
+		pods := paceReplicaSetPods(rs, 2)
+		ExpectApplied(ctx, env.Client, nodePool)
+		ExpectApplied(ctx, env.Client, asObjects(nodeClaims)...)
+		ExpectApplied(ctx, env.Client, asObjects(nodes)...)
+		ExpectApplied(ctx, env.Client, asObjects(pods)...)
+		ExpectManualBinding(ctx, env.Client, pods[0], nodes[0])
+		ExpectManualBinding(ctx, env.Client, pods[1], nodes[1])
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+
+		// Isolate drift so this test exercises its empty-candidate path directly.
+		underutilizedPace = disruption.NewUnderutilizedConsolidationPace(env.Clock)
+		drift := disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock, underutilizedPace)
+		disruptionController = disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+			disruption.WithMethods(drift), disruption.WithUnderutilizedPace(underutilizedPace))
+
+		ExpectSingletonReconciled(ctx, disruptionController)
+		Expect(queue.GetCommands()).To(HaveLen(1))
+		// The first non-empty drift start is charged through the same limiter used
+		// by the drift method, so another candidate waits for the configured pace.
+		ExpectSingletonReconciled(ctx, disruptionController)
+		Expect(queue.GetCommands()).To(HaveLen(1))
+
+		// A newly drifted empty node can still proceed while this NodePool's
+		// non-empty drift cooldown is active.
+		nodeClaims[2].StatusConditions().SetTrue(v1.ConditionTypeDrifted)
+		ExpectApplied(ctx, env.Client, nodeClaims[2])
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+		ExpectSingletonReconciled(ctx, disruptionController)
+		Expect(queue.GetCommands()).To(HaveLen(2))
+
+		ExpectSingletonReconciled(ctx, disruptionController)
+		Expect(queue.GetCommands()).To(HaveLen(2))
+		cluster.MarkUnconsolidated()
+		env.Clock.Step(61 * time.Second)
+		ExpectSingletonReconciled(ctx, disruptionController)
+		Expect(queue.GetCommands()).To(HaveLen(3))
+	})
+
 	It("should cap the batch and fall back to single-node consolidation", func() {
 		nodePool.Annotations = paceAnnotations("100", "1")
 		currentInstanceType := paceOnDemandInstanceType("current-on-demand", 0.5)

@@ -78,6 +78,7 @@ var nodeStateController *informer.NodeController
 var nodeClaimStateController *informer.NodeClaimController
 var recorder *test.EventRecorder
 var queue *disruption.Queue
+var underutilizedPace *disruption.UnderutilizedConsolidationPace
 var allKnownDisruptionReasons []v1.DisruptionReason
 
 var onDemandInstances []*cloudprovider.InstanceType
@@ -127,7 +128,9 @@ var _ = BeforeEach(func() {
 	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client))
 
 	// Ensure that we reset the disruption controller's methods after each test run
-	disruptionController = disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(NewMethodsWithNopValidator()...))
+	underutilizedPace = disruption.NewUnderutilizedConsolidationPace(env.Clock)
+	disruptionController = disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
+		disruption.WithMethods(NewMethodsWithNopValidator(underutilizedPace)...), disruption.WithUnderutilizedPace(underutilizedPace))
 	env.Clock.SetTime(time.Now())
 	cluster.Reset()
 	*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov))

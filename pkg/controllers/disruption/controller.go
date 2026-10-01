@@ -136,9 +136,9 @@ func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Clien
 		// Reclaim empty capacity in NodePools that opt in to score-based consolidation.
 		NewScoreBasedReclamation(c),
 		// Terminate and create replacement for drifted NodeClaims in Static NodePool
-		NewStaticDrift(cluster, provisioner, cp),
+		NewStaticDrift(cluster, provisioner, cp, pace),
 		// Terminate any NodeClaims that have drifted from provisioning specifications, allowing the pods to reschedule.
-		NewDrift(kubeClient, cluster, provisioner, recorder, clk),
+		NewDrift(kubeClient, cluster, provisioner, recorder, clk, pace),
 		// Attempt to identify multiple NodeClaims that we can consolidate simultaneously to reduce pod churn
 		NewMultiNodeConsolidation(c),
 		// Compact non-empty nodes in NodePools that opt in via annotation.
@@ -454,7 +454,7 @@ func (c *Controller) budgetMappingForMethod(ctx context.Context, disruption Meth
 func (c *Controller) startCommands(ctx context.Context, disruption Method, cmds []Command) (int, error) {
 	var started atomic.Int64
 	errs := make([]error, len(cmds))
-	paced := disruption.Reason() == v1.DisruptionReasonUnderutilized
+	paced := disruption.Reason() == v1.DisruptionReasonUnderutilized || disruption.Reason() == v1.DisruptionReasonDrifted
 	workqueue.ParallelizeUntil(ctx, len(cmds), len(cmds), func(i int) {
 		cmd := cmds[i]
 

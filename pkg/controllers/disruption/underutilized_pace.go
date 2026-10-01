@@ -32,7 +32,7 @@ type underutilizedPaceConfig struct {
 	configured         bool
 }
 
-// UnderutilizedConsolidationPace tracks per-NodePool eligibility for underutilized consolidation.
+// UnderutilizedConsolidationPace tracks per-NodePool pacing for non-empty consolidation and drift candidates.
 type UnderutilizedConsolidationPace struct {
 	clock        clock.Clock
 	mu           sync.Mutex
@@ -122,7 +122,7 @@ func (p *UnderutilizedConsolidationPace) candidateAllowed(np *v1.NodePool, selec
 	return p.canAdmitLocked(np)
 }
 
-// Charge records a successfully started consolidation command against participating NodePools.
+// Charge records a successfully started consolidation or drift command against participating NodePools.
 func (p *UnderutilizedConsolidationPace) Charge(cmd *Command) {
 	if p == nil {
 		return
