@@ -43,10 +43,11 @@ type PreparedTopology struct {
 	preferencePolicy PreferencePolicy
 	domainGroups     map[string]TopologyDomainGroup
 
-	nodes         map[string]*state.StateNode
-	activeNodes   []*state.StateNode
-	apiPodsByNS   map[string][]*corev1.Pod
-	namespaceLabs map[string]map[string]string
+	nodes            map[string]*state.StateNode
+	activeNodes      []*state.StateNode
+	nodeRequirements map[*state.StateNode]scheduling.Requirements
+	apiPodsByNS      map[string][]*corev1.Pod
+	namespaceLabs    map[string]map[string]string
 
 	topologyGroups        map[uint64]*preparedTopologyGroup
 	inverseTopologyGroups map[uint64]*preparedInverseTopologyGroup
@@ -116,6 +117,7 @@ func newPreparedTopology(inputs *NodePoolInputs, opts ...Options) *PreparedTopol
 		preferencePolicy:      optionPreference(opts...),
 		domainGroups:          inputs.domainGroups,
 		nodes:                 map[string]*state.StateNode{},
+		nodeRequirements:      map[*state.StateNode]scheduling.Requirements{},
 		apiPodsByNS:           map[string][]*corev1.Pod{},
 		namespaceLabs:         map[string]map[string]string{},
 		topologyGroups:        map[uint64]*preparedTopologyGroup{},
@@ -130,6 +132,9 @@ func (p *PreparedTopology) captureNodes(stateNodes []*state.StateNode) {
 		}
 		copy := n.DeepCopy()
 		p.nodes[copy.Name()] = copy
+		if copy.Node != nil {
+			p.nodeRequirements[copy] = scheduling.NewLabelRequirements(copy.Node.Labels)
+		}
 		if !copy.MarkedForDeletion() {
 			p.activeNodes = append(p.activeNodes, copy)
 		}
@@ -283,7 +288,7 @@ func (p *PreparedTopology) prepareTopologyGroup(group *TopologyGroup) *preparedT
 		if node.Node == nil {
 			continue
 		}
-		domain, ok := topologyPodDomain(group, node.Node, scheduling.NewLabelRequirements(node.Node.Labels))
+		domain, ok := topologyPodDomain(group, node.Node, p.labelRequirements(node))
 		if !ok {
 			continue
 		}
@@ -316,7 +321,7 @@ func (p *PreparedTopology) prepareInverseTopologyGroup(group *TopologyGroup) *pr
 }
 
 func (p *PreparedTopology) addNodeProvider(group *TopologyGroup, providers map[string]sets.Set[string], node *state.StateNode) {
-	if node == nil || node.Node == nil || !group.nodeFilter.Matches(node.Node.Spec.Taints, scheduling.NewLabelRequirements(node.Node.Labels)) {
+	if node == nil || node.Node == nil || !group.nodeFilter.Matches(node.Node.Spec.Taints, p.labelRequirements(node)) {
 		return
 	}
 	domain, ok := topologyDomain(group.Key, node.Node)
@@ -331,6 +336,15 @@ func (p *PreparedTopology) addNodeProvider(group *TopologyGroup, providers map[s
 		providers[domain].Insert(nodeName)
 	}
 	group.Register(domain)
+}
+
+func (p *PreparedTopology) labelRequirements(node *state.StateNode) scheduling.Requirements {
+	if requirements, ok := p.nodeRequirements[node]; ok {
+		return requirements
+	}
+	// countDomains normally receives captured nodes. Preserve its behavior for
+	// any additional state nodes supplied by a caller.
+	return scheduling.NewLabelRequirements(node.Node.Labels)
 }
 
 func (p *PreparedTopology) matchingPods(group *TopologyGroup) []*corev1.Pod {
@@ -598,7 +612,7 @@ func (p *PreparedTopology) countDomains(ctx context.Context, group *TopologyGrou
 		if node == nil || node.Node == nil {
 			continue
 		}
-		if domain, ok := topologyPodDomain(group, node.Node, scheduling.NewLabelRequirements(node.Node.Labels)); ok {
+		if domain, ok := topologyPodDomain(group, node.Node, p.labelRequirements(node)); ok {
 			group.Record(domain)
 		}
 	}
