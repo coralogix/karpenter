@@ -34,15 +34,16 @@ const defaultScoreBasedUtilisationWeight = 1.0
 // scoreBasedSourceScore records the exact per-source values consumed by the
 // cost and CPU-slack terms while a move set is evaluated.
 type scoreBasedSourceScore struct {
-	PriceUSDPerHour         float64 `json:"priceUSDPerHour"`
-	AllocatableCPU          float64 `json:"allocatableCPU"`
-	RequestedCPU            float64 `json:"requestedCPU"`
-	BaselineUSDPerCPUHour   float64 `json:"baselineUSDPerCPUHour"`
-	NormalizedSourceCost    float64 `json:"normalizedSourceCost"`
-	CostContribution        float64 `json:"costContribution"`
-	CPUSlackFraction        float64 `json:"cpuSlackFraction"`
-	UtilisationWeight       float64 `json:"utilisationWeight"`
-	UtilisationContribution float64 `json:"utilisationContribution"`
+	PriceUSDPerHour           float64                                        `json:"priceUSDPerHour"`
+	AllocatableCPU            float64                                        `json:"allocatableCPU"`
+	RequestedCPU              float64                                        `json:"requestedCPU"`
+	BaselineUSDPerCPUHour     float64                                        `json:"baselineUSDPerCPUHour"`
+	NormalizedSourceCost      float64                                        `json:"normalizedSourceCost"`
+	CostContribution          float64                                        `json:"costContribution"`
+	CPUSlackFraction          float64                                        `json:"cpuSlackFraction"`
+	UtilisationWeight         float64                                        `json:"utilisationWeight"`
+	UtilisationContribution   float64                                        `json:"utilisationContribution"`
+	InstanceTypeConcentration scoreBasedInstanceTypeConcentrationSourceScore `json:"instanceTypeConcentration"`
 }
 
 // moveSetPriorityScore combines the normalized cost contribution with the

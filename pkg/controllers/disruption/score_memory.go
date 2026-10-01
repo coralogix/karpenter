@@ -95,12 +95,13 @@ type scoreBasedMemoryScore struct {
 }
 
 type moveSetScoring struct {
-	Score                   float64
-	BaseScore               float64
-	Cost                    scoreBasedCostScore
-	MemoryBalance           scoreBasedMemoryScore
-	SourceNodeScores        []scoreBasedSourceScore
-	UtilisationContribution float64
+	Score                     float64
+	BaseScore                 float64
+	Cost                      scoreBasedCostScore
+	MemoryBalance             scoreBasedMemoryScore
+	InstanceTypeConcentration scoreBasedInstanceTypeConcentrationScore
+	SourceNodeScores          []scoreBasedSourceScore
+	UtilisationContribution   float64
 }
 
 type scoreBasedMemorySnapshot struct {

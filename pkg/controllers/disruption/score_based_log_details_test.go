@@ -44,12 +44,20 @@ func TestSelectedMoveJSONUsesCapturedJointScoreDetails(t *testing.T) {
 	candidates, priceSnapshot := scoreBasedLogDetailCandidates(poolName)
 	for _, candidate := range candidates {
 		candidate.NodePool.Annotations = map[string]string{
-			v1.ScoreBasedUtilisationWeightAnnotationKey:   "2",
-			v1.ScoreBasedMemorySurplusAnnotationKey:       "0",
-			v1.ScoreBasedMemoryBalanceWeightAnnotationKey: "1",
+			v1.ScoreBasedUtilisationWeightAnnotationKey:                  "2",
+			v1.ScoreBasedMemorySurplusAnnotationKey:                      "0",
+			v1.ScoreBasedMemoryBalanceWeightAnnotationKey:                "1",
+			v1.ScoreBasedInstanceTypeConcentrationThresholdAnnotationKey: "0.3",
+			v1.ScoreBasedInstanceTypeConcentrationWeightAnnotationKey:    "2",
 		}
 	}
 	configs := map[string]scoreBasedMemoryConfig{poolName: {surplus: 0, weight: 1}}
+	concentrationConfigs := scoreBasedInstanceTypeConcentrationConfigs(candidates)
+	nodeSnapshot := make(state.StateNodes, 0, len(candidates))
+	for _, candidate := range candidates {
+		nodeSnapshot = append(nodeSnapshot, candidate.StateNode)
+	}
+	concentrationSnapshot := newScoreBasedInstanceTypeConcentrationSnapshot(nodeSnapshot, concentrationConfigs)
 	memorySnapshot := scoreMemorySnapshotForTest(poolName, 100, 400, 100, 100, map[string]scoreBasedMemoryShape{
 		candidates[0].Name(): {cpu: 2, memory: 16},
 		candidates[1].Name(): {cpu: 4, memory: 16},
@@ -66,7 +74,7 @@ func TestSelectedMoveJSONUsesCapturedJointScoreDetails(t *testing.T) {
 	}
 	evals := make([]*moveSetEvaluation, 0, len(commands))
 	for _, test := range commands {
-		eval := scoreBasedLogDetailEvaluation(test.cmd, test.path, priceSnapshot, memorySnapshot, configs)
+		eval := scoreBasedLogDetailEvaluation(test.cmd, test.path, priceSnapshot, memorySnapshot, configs, concentrationSnapshot)
 		evals = append(evals, eval)
 		assertScoreBasedLogDetailReconciliation(t, eval)
 	}
@@ -79,6 +87,9 @@ func TestSelectedMoveJSONUsesCapturedJointScoreDetails(t *testing.T) {
 	if math.Abs(evals[0].MemoryBalance.Correction-1) > 1e-12 || math.Abs(evals[2].MemoryBalance.Correction-0.6) > 1e-12 {
 		t.Fatalf("single/batch memory corrections = %v/%v, want 1/0.6", evals[0].MemoryBalance.Correction, evals[2].MemoryBalance.Correction)
 	}
+	if math.Abs(evals[0].InstanceTypeConcentration.Correction-2) > 1e-12 || math.Abs(evals[2].InstanceTypeConcentration.Correction-6) > 1e-12 {
+		t.Fatalf("single/batch concentration corrections = %v/%v, want 2/6", evals[0].InstanceTypeConcentration.Correction, evals[2].InstanceTypeConcentration.Correction)
+	}
 
 	// The emitted summary must describe the values used when scoring completed,
 	// even if mutable candidates and their annotations change before logging.
@@ -87,6 +98,8 @@ func TestSelectedMoveJSONUsesCapturedJointScoreDetails(t *testing.T) {
 		candidate.Node.Status.Allocatable[corev1.ResourceCPU] = resource.MustParse("99")
 		candidate.NodePool.Annotations[v1.ScoreBasedUtilisationWeightAnnotationKey] = "9"
 		candidate.NodePool.Annotations[v1.ScoreBasedMemoryBalanceWeightAnnotationKey] = "9"
+		candidate.NodePool.Annotations[v1.ScoreBasedInstanceTypeConcentrationThresholdAnnotationKey] = "0.9"
+		candidate.NodePool.Annotations[v1.ScoreBasedInstanceTypeConcentrationWeightAnnotationKey] = "9"
 	}
 	for i, test := range commands {
 		t.Run(test.name, func(t *testing.T) {
@@ -96,8 +109,12 @@ func TestSelectedMoveJSONUsesCapturedJointScoreDetails(t *testing.T) {
 				t.Errorf("searchPath = %v, want %q", move["searchPath"], test.path)
 			}
 			score := scoreBasedTestLogMap(t, move, "score")
-			if score["rankingScore"] != evals[i].Score || score["baseScore"] != evals[i].BaseScore || score["costContribution"] != evals[i].Cost.Contribution || score["utilisationContribution"] != evals[i].UtilisationContribution || score["memoryBalanceCorrection"] != evals[i].MemoryBalance.Correction {
+			if score["rankingScore"] != evals[i].Score || score["baseScore"] != evals[i].BaseScore || score["costContribution"] != evals[i].Cost.Contribution || score["utilisationContribution"] != evals[i].UtilisationContribution || score["memoryBalanceCorrection"] != evals[i].MemoryBalance.Correction || score["instanceTypeConcentrationCorrection"] != evals[i].InstanceTypeConcentration.Correction {
 				t.Errorf("selected score summary = %v, want captured eval details", score)
+			}
+			concentration := scoreBasedTestLogMap(t, score, "instanceTypeConcentration")
+			if concentration["correction"] != evals[i].InstanceTypeConcentration.Correction || concentration["sourceNodes"] != nil {
+				t.Errorf("aggregate concentration score = %v, want captured aggregate without duplicate source details", concentration)
 			}
 			if _, found := score["selectedMinusAlternative"]; found {
 				t.Errorf("selected score unexpectedly has selectedMinusAlternative: %v", score)
@@ -167,7 +184,7 @@ func TestSelectedMoveAlternativesAreCappedAndShowValidationOutcome(t *testing.T)
 			t.Errorf("failed alternative validation.reason = %v, want scheduling", validation["reason"])
 		}
 		score := scoreBasedTestLogMap(t, alternative, "score")
-		for _, key := range []string{"rankingScore", "costContribution", "utilisationContribution", "memoryBalanceCorrection"} {
+		for _, key := range []string{"rankingScore", "costContribution", "utilisationContribution", "memoryBalanceCorrection", "instanceTypeConcentrationCorrection"} {
 			if _, found := score[key]; !found {
 				t.Errorf("alternative score is missing %q: %v", key, score)
 			}
@@ -222,18 +239,25 @@ func scoreBasedLogDetailReplacementCommand(t *testing.T, poolName string, candid
 	}
 }
 
-func scoreBasedLogDetailEvaluation(command Command, path scoreBasedMoveSetSearchPath, prices *scoreBasedPriceSnapshot, memory *scoreBasedMemorySnapshot, configs map[string]scoreBasedMemoryConfig) *moveSetEvaluation {
+func scoreBasedLogDetailEvaluation(command Command, path scoreBasedMoveSetSearchPath, prices *scoreBasedPriceSnapshot, memory *scoreBasedMemorySnapshot, configs map[string]scoreBasedMemoryConfig, concentrationSnapshot *scoreBasedInstanceTypeConcentrationSnapshot) *moveSetEvaluation {
 	baseScore, cost, utilisation, sourceScores := scoreMoveSetPriorityDetails(command, prices)
 	memoryBalance := scoreBasedMemoryScoreForCommand(command, memory, configs)
+	concentration := concentrationSnapshot.score(command)
+	for i := range sourceScores {
+		if i < len(concentration.SourceNodes) {
+			sourceScores[i].InstanceTypeConcentration = concentration.SourceNodes[i]
+		}
+	}
 	return &moveSetEvaluation{
-		Command:                 command,
-		Score:                   baseScore + memoryBalance.Correction,
-		BaseScore:               baseScore,
-		Cost:                    cost,
-		MemoryBalance:           memoryBalance,
-		SourceNodeScores:        sourceScores,
-		UtilisationContribution: utilisation,
-		searchPath:              path,
+		Command:                   command,
+		Score:                     baseScore + memoryBalance.Correction + concentration.Correction,
+		BaseScore:                 baseScore,
+		Cost:                      cost,
+		MemoryBalance:             memoryBalance,
+		InstanceTypeConcentration: concentration,
+		SourceNodeScores:          sourceScores,
+		UtilisationContribution:   utilisation,
+		searchPath:                path,
 	}
 }
 
@@ -256,8 +280,15 @@ func assertScoreBasedLogDetailReconciliation(t *testing.T, eval *moveSetEvaluati
 	if math.Abs(costContribution-eval.Cost.Contribution) > 1e-12 || math.Abs(utilisationContribution-eval.UtilisationContribution) > 1e-12 {
 		t.Errorf("per-source cost/utilisation totals = %v/%v, want move totals %v/%v", costContribution, utilisationContribution, eval.Cost.Contribution, eval.UtilisationContribution)
 	}
-	if math.Abs(eval.BaseScore-(eval.Cost.Contribution+eval.UtilisationContribution)) > 1e-12 || math.Abs(eval.Score-(eval.BaseScore+eval.MemoryBalance.Correction)) > 1e-12 {
-		t.Errorf("base/total scores = %v/%v, want cost + utilisation %v and base + memory %v", eval.BaseScore, eval.Score, eval.Cost.Contribution+eval.UtilisationContribution, eval.BaseScore+eval.MemoryBalance.Correction)
+	var concentrationContribution float64
+	for _, source := range eval.SourceNodeScores {
+		concentrationContribution += source.InstanceTypeConcentration.Contribution
+	}
+	if math.Abs(concentrationContribution-eval.InstanceTypeConcentration.Correction) > 1e-12 {
+		t.Errorf("per-source concentration contributions = %v, want aggregate %v", concentrationContribution, eval.InstanceTypeConcentration.Correction)
+	}
+	if math.Abs(eval.BaseScore-(eval.Cost.Contribution+eval.UtilisationContribution)) > 1e-12 || math.Abs(eval.Score-(eval.BaseScore+eval.MemoryBalance.Correction+eval.InstanceTypeConcentration.Correction)) > 1e-12 {
+		t.Errorf("base/total scores = %v/%v, want cost + utilisation %v and base + memory + concentration %v", eval.BaseScore, eval.Score, eval.Cost.Contribution+eval.UtilisationContribution, eval.BaseScore+eval.MemoryBalance.Correction+eval.InstanceTypeConcentration.Correction)
 	}
 }
 
@@ -286,6 +317,23 @@ func assertSelectedMoveSourceScores(t *testing.T, move map[string]any, command C
 		for key, want := range checks {
 			if got := score[key]; got != want {
 				t.Errorf("sourceNodes[%d].score.%s = %v, want captured value %v", i, key, got, want)
+			}
+		}
+		concentration := scoreBasedTestLogMap(t, score, "instanceTypeConcentration")
+		concentrationChecks := map[string]any{
+			"nodePool":              source.InstanceTypeConcentration.NodePool,
+			"instanceType":          source.InstanceTypeConcentration.InstanceType,
+			"poolNodeCount":         float64(source.InstanceTypeConcentration.PoolNodeCount),
+			"instanceTypeNodeCount": float64(source.InstanceTypeConcentration.InstanceTypeNodeCount),
+			"share":                 source.InstanceTypeConcentration.Share,
+			"threshold":             source.InstanceTypeConcentration.Threshold,
+			"weight":                source.InstanceTypeConcentration.Weight,
+			"qualifies":             source.InstanceTypeConcentration.Qualifies,
+			"contribution":          source.InstanceTypeConcentration.Contribution,
+		}
+		for key, want := range concentrationChecks {
+			if got := concentration[key]; got != want {
+				t.Errorf("sourceNodes[%d].score.instanceTypeConcentration.%s = %v, want captured value %v", i, key, got, want)
 			}
 		}
 	}

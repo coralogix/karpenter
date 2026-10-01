@@ -223,14 +223,16 @@ func logScoreBasedCompactionMoveSelected(
 			"replacementNodeCount": len(cmd.Replacements),
 			"sourceNodes":          sourceNodes,
 			"score": map[string]any{
-				"rankingScore":            eval.Score,
-				"baseScore":               eval.BaseScore,
-				"method":                  scoreBasedMoveScoreMethod(eval),
-				"normalizedCost":          eval.Cost,
-				"costContribution":        eval.Cost.Contribution,
-				"utilisationContribution": eval.UtilisationContribution,
-				"memoryBalance":           eval.MemoryBalance,
-				"memoryBalanceCorrection": eval.MemoryBalance.Correction,
+				"rankingScore":                        eval.Score,
+				"baseScore":                           eval.BaseScore,
+				"method":                              scoreBasedMoveScoreMethod(eval),
+				"normalizedCost":                      eval.Cost,
+				"costContribution":                    eval.Cost.Contribution,
+				"utilisationContribution":             eval.UtilisationContribution,
+				"memoryBalance":                       eval.MemoryBalance,
+				"memoryBalanceCorrection":             eval.MemoryBalance.Correction,
+				"instanceTypeConcentration":           eval.InstanceTypeConcentration,
+				"instanceTypeConcentrationCorrection": eval.InstanceTypeConcentration.Correction,
 			},
 			"cost": map[string]any{
 				"sourceUSDPerHour":               eval.Cost.SourceUSDPerHour,
@@ -284,8 +286,14 @@ func scoreBasedMoveScoreMethod(eval *moveSetEvaluation) string {
 	if eval.searchPath != scoreBasedSearchPathBatch {
 		return "joint_move_set_score"
 	}
+	if eval.MemoryBalance.Enabled && eval.InstanceTypeConcentration.Enabled {
+		return "additive_base_plus_joint_memory_balance_and_instance_type_concentration"
+	}
 	if eval.MemoryBalance.Enabled {
 		return "additive_base_plus_joint_memory_balance"
+	}
+	if eval.InstanceTypeConcentration.Enabled {
+		return "additive_base_plus_instance_type_concentration"
 	}
 	return "additive_single_node_scores"
 }
@@ -314,14 +322,15 @@ func scoreBasedSourceNodeScoreLog(eval *moveSetEvaluation, sourceIndex int) map[
 	}
 	score := eval.SourceNodeScores[sourceIndex]
 	return map[string]any{
-		"allocatableCPU":          score.AllocatableCPU,
-		"requestedCPU":            score.RequestedCPU,
-		"baselineUSDPerCPUHour":   score.BaselineUSDPerCPUHour,
-		"normalizedSourceCost":    score.NormalizedSourceCost,
-		"costContribution":        score.CostContribution,
-		"cpuSlackFraction":        score.CPUSlackFraction,
-		"utilisationWeight":       score.UtilisationWeight,
-		"utilisationContribution": score.UtilisationContribution,
+		"allocatableCPU":            score.AllocatableCPU,
+		"requestedCPU":              score.RequestedCPU,
+		"baselineUSDPerCPUHour":     score.BaselineUSDPerCPUHour,
+		"normalizedSourceCost":      score.NormalizedSourceCost,
+		"costContribution":          score.CostContribution,
+		"cpuSlackFraction":          score.CPUSlackFraction,
+		"utilisationWeight":         score.UtilisationWeight,
+		"utilisationContribution":   score.UtilisationContribution,
+		"instanceTypeConcentration": score.InstanceTypeConcentration,
 	}
 }
 
@@ -337,10 +346,11 @@ func scoreBasedAlternativeLog(eval *moveSetEvaluation, rank int) map[string]any 
 		"sourceNodes":                sourceNodes,
 		"estimatedSavingsUSDPerHour": eval.Cost.SavingsUSDPerHour,
 		"score": map[string]any{
-			"rankingScore":            eval.Score,
-			"costContribution":        eval.Cost.Contribution,
-			"utilisationContribution": eval.UtilisationContribution,
-			"memoryBalanceCorrection": eval.MemoryBalance.Correction,
+			"rankingScore":                        eval.Score,
+			"costContribution":                    eval.Cost.Contribution,
+			"utilisationContribution":             eval.UtilisationContribution,
+			"memoryBalanceCorrection":             eval.MemoryBalance.Correction,
+			"instanceTypeConcentrationCorrection": eval.InstanceTypeConcentration.Correction,
 		},
 		"memoryBalance": map[string]any{
 			"status": eval.MemoryBalance.Status,

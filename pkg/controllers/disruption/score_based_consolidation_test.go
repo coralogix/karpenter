@@ -38,6 +38,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	fakeprovider "sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/metrics"
@@ -559,6 +560,116 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			Expect(recorder.DetectedEvent(fmt.Sprintf("Underutilized consolidation is waiting for NodePool pace limit %s=1 disruptions per minute", v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey))).To(BeTrue())
 			Expect(recorder.Calls("DisruptionBlocked")).To(Equal(1))
 			Expect(logOutput.String()).To(ContainSubstring(`"paceBlockedNodePools"=["score-based-pool"]`))
+		})
+	})
+
+	Context("Instance type concentration scoring", func() {
+		It("adds a source bonus above the pool's strict concentration threshold", func() {
+			scoreBasedNodePool.Annotations[v1.ScoreBasedInstanceTypeConcentrationThresholdAnnotationKey] = "0.5"
+			scoreBasedNodePool.Annotations[v1.ScoreBasedInstanceTypeConcentrationWeightAnnotationKey] = "0"
+			scoreBasedNodePool.Annotations[v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey] = "100"
+			scoreBasedNodePool.Annotations[v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey] = "1"
+			ExpectApplied(ctx, env.Client, scoreBasedNodePool)
+
+			resources := corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("8"),
+				corev1.ResourceMemory: resource.MustParse("32Gi"),
+				corev1.ResourcePods:   resource.MustParse("10"),
+			}
+			typeA := fakeprovider.NewInstanceType("balanced-type-a", fakeprovider.WithResources(resources))
+			typeB := fakeprovider.NewInstanceType("balanced-type-b", fakeprovider.WithResources(resources))
+			for i := range typeB.Offerings {
+				typeB.Offerings[i].Price *= 2
+			}
+			previousTypes, hadPreviousTypes := cloudProvider.InstanceTypesForNodePool[scoreBasedNodePool.Name]
+			cloudProvider.InstanceTypesForNodePool[scoreBasedNodePool.Name] = []*cloudprovider.InstanceType{typeA, typeB}
+			DeferCleanup(func() {
+				if hadPreviousTypes {
+					cloudProvider.InstanceTypesForNodePool[scoreBasedNodePool.Name] = previousTypes
+				} else {
+					delete(cloudProvider.InstanceTypesForNodePool, scoreBasedNodePool.Name)
+				}
+			})
+			scoreBasedInstanceTypeMap[scoreBasedNodePool.Name] = map[string]*cloudprovider.InstanceType{
+				typeA.Name: typeA,
+				typeB.Name: typeB,
+			}
+
+			makeNode := func(name string, instanceType *cloudprovider.InstanceType, withPod bool) (*v1.NodeClaim, *corev1.Node, *corev1.Pod) {
+				labels := map[string]string{
+					v1.NodePoolLabelKey:            scoreBasedNodePool.Name,
+					corev1.LabelInstanceTypeStable: instanceType.Name,
+					v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
+					corev1.LabelTopologyZone:       "test-zone-1",
+				}
+				nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+					Status: v1.NodeClaimStatus{
+						Capacity:    resources,
+						Allocatable: resources,
+					},
+				})
+				node.Name = name + "-node"
+				nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+				var pod *corev1.Pod
+				if withPod {
+					pod = test.Pod(test.PodOptions{
+						ObjectMeta: metav1.ObjectMeta{Name: name + "-pod"},
+						ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("100m"),
+							corev1.ResourceMemory: resource.MustParse("128Mi"),
+						}},
+					})
+				}
+				return nodeClaim, node, pod
+			}
+			aSourceClaim, aSourceNode, aSourcePod := makeNode("concentration-a-source", typeA, true)
+			aAnchorClaim, aAnchorNode, _ := makeNode("concentration-a-anchor", typeA, false)
+			bSourceClaim, bSourceNode, bSourcePod := makeNode("concentration-b-source", typeB, true)
+			objects := []client.Object{aSourceClaim, aSourceNode, aAnchorClaim, aAnchorNode, bSourceClaim, bSourceNode, aSourcePod, bSourcePod}
+			ExpectApplied(ctx, env.Client, objects...)
+			ExpectManualBinding(ctx, env.Client, aSourcePod, aSourceNode)
+			ExpectManualBinding(ctx, env.Client, bSourcePod, bSourceNode)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController,
+				[]*corev1.Node{aSourceNode, aAnchorNode, bSourceNode}, []*v1.NodeClaim{aSourceClaim, aAnchorClaim, bSourceClaim})
+			for _, nodeClaim := range []*v1.NodeClaim{aSourceClaim, bSourceClaim} {
+				nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+				ExpectApplied(ctx, env.Client, nodeClaim)
+				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
+			}
+
+			pace := disruption.NewUnderutilizedConsolidationPace(env.Clock)
+			scoringMethod := disruption.NewScoreBasedConsolidation(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, pace))
+			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, scoringMethod.ShouldDisrupt, scoringMethod.Class(), queue)
+			Expect(err).To(Succeed())
+			Expect(candidates).To(HaveLen(2), "the empty type-a anchor belongs in the pool inventory but is not a compaction source")
+			budgets := map[string]int{scoreBasedNodePool.Name: 3}
+			computeCommands := func() []disruption.Command {
+				var commands []disruption.Command
+				ExpectParallelized(
+					func() { commands, err = scoringMethod.ComputeCommands(ctx, budgets, candidates...) },
+					func() {
+						Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
+						env.Clock.Step(15 * time.Second)
+					},
+				)
+				Expect(err).To(Succeed())
+				return commands
+			}
+			commands := computeCommands()
+			Expect(commands).To(HaveLen(1))
+			Expect(commands[0].Candidates).To(HaveLen(1))
+			Expect(commands[0].Candidates[0].Name()).To(Equal(bSourceNode.Name), "without the bonus, the more expensive type-b source has better savings")
+
+			// Type A represents two of the three pool nodes, so the configured bonus should reverse
+			// the cost-based ranking. Recomputing uses the updated annotation.
+			for _, candidate := range candidates {
+				candidate.NodePool.Annotations[v1.ScoreBasedInstanceTypeConcentrationWeightAnnotationKey] = "5"
+			}
+			commands = computeCommands()
+			Expect(commands).To(HaveLen(1))
+			Expect(commands[0].Candidates).To(HaveLen(1))
+			Expect(commands[0].Candidates[0].Name()).To(Equal(aSourceNode.Name), "the two type-a nodes exceed the strict 50%% threshold, while type-b does not")
 		})
 	})
 

@@ -74,6 +74,12 @@ const (
 	// ScoreBasedMemoryBalanceWeightAnnotationKey is a dimensionless weight for memory balance correction.
 	// Invalid values use the default of 0, which disables memory-aware scoring.
 	ScoreBasedMemoryBalanceWeightAnnotationKey = "karpenter.coralogix.net/memory-balance-weight"
+	// ScoreBasedInstanceTypeConcentrationThresholdAnnotationKey sets the per-pool instance-type share above which source nodes receive a score bonus.
+	// Invalid values use the default threshold of 0.5.
+	ScoreBasedInstanceTypeConcentrationThresholdAnnotationKey = "karpenter.coralogix.net/instance-type-concentration-threshold"
+	// ScoreBasedInstanceTypeConcentrationWeightAnnotationKey sets the dimensionless bonus for each source node above the concentration threshold.
+	// Invalid values use the default of 0, which disables this score term.
+	ScoreBasedInstanceTypeConcentrationWeightAnnotationKey = "karpenter.coralogix.net/instance-type-concentration-weight"
 )
 
 // Karpenter specific finalizers

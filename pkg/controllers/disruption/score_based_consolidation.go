@@ -76,6 +76,7 @@ type moveSetEvaluation struct {
 	BaseScore                  float64
 	Cost                       scoreBasedCostScore
 	MemoryBalance              scoreBasedMemoryScore
+	InstanceTypeConcentration  scoreBasedInstanceTypeConcentrationScore
 	SourceNodeScores           []scoreBasedSourceScore
 	UtilisationContribution    float64
 	searchPath                 scoreBasedMoveSetSearchPath
@@ -105,8 +106,9 @@ func NodePoolUsesScoreBasedConsolidation(np *v1.NodePool) bool {
 
 type ScoreBasedConsolidation struct {
 	consolidation
-	validator             Validator
-	memoryConfigSignature map[string]string
+	validator                    Validator
+	memoryConfigSignature        map[string]string
+	concentrationConfigSignature map[string]string
 }
 
 func NewScoreBasedConsolidation(c consolidation, opts ...option.Function[MethodOptions]) *ScoreBasedConsolidation {
@@ -175,10 +177,12 @@ func (s *ScoreBasedConsolidation) compactionCandidateNonEmpty(ctx context.Contex
 func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
 	currentMemoryConfigSignature, memoryConfigChanged := scoreBasedMemoryConfigChanged(s.memoryConfigSignature, candidates)
 	s.memoryConfigSignature = currentMemoryConfigSignature
-	if memoryConfigChanged {
+	currentConcentrationConfigSignature, concentrationConfigChanged := scoreBasedInstanceTypeConcentrationConfigChanged(s.concentrationConfigSignature, candidates)
+	s.concentrationConfigSignature = currentConcentrationConfigSignature
+	if memoryConfigChanged || concentrationConfigChanged {
 		s.lastConsolidationState = time.Time{}
 	}
-	if s.IsConsolidated() && !memoryConfigChanged {
+	if s.IsConsolidated() && !memoryConfigChanged && !concentrationConfigChanged {
 		logScoreBasedCompactionNoMove(ctx, scoreBasedNoMoveAlreadyConsolidated, scoreBasedNoMoveDetails{
 			candidateCount:           len(candidates),
 			compactionCandidateCount: -1,
@@ -369,6 +373,7 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 		singleNodeMoveSets[i] = moveSet{Nodes: []*Candidate{candidate}}
 	}
 	memoryConfigs := scoreBasedMemoryConfigs(validCandidates)
+	concentrationConfigs := scoreBasedInstanceTypeConcentrationConfigs(validCandidates)
 	simulatorCtx, stopSimulator := cxtracing.Measure(searchCtx, nil, scoreBasedConsolidationNewSimulatorSpan,
 		attribute.Int("valid_candidate_count", len(validCandidates)),
 	)
@@ -386,6 +391,7 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 	}
 	nodeSnapshot := simulator.StateNodesSnapshot()
 	priceSnapshot := newScoreBasedPriceSnapshot(nodeSnapshot, validCandidates)
+	concentrationSnapshot := newScoreBasedInstanceTypeConcentrationSnapshot(nodeSnapshot, concentrationConfigs)
 	memorySnapshotCtx, stopMemorySnapshot := cxtracing.Measure(searchCtx, nil, scoreBasedConsolidationMemorySnapshotSpan,
 		attribute.Bool("enabled", hasScoreBasedMemoryBalanceWeight(memoryConfigs)),
 	)
@@ -404,14 +410,21 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 	}
 	scoreMoveSet := func(cmd Command) moveSetScoring {
 		baseScore, costScore, utilisationContribution, sourceNodeScores := scoreMoveSetPriorityDetails(cmd, priceSnapshot)
+		concentration := concentrationSnapshot.score(cmd)
+		for i := range sourceNodeScores {
+			if i < len(concentration.SourceNodes) {
+				sourceNodeScores[i].InstanceTypeConcentration = concentration.SourceNodes[i]
+			}
+		}
 		memoryBalance := scoreBasedMemoryScoreForCommand(cmd, memorySnapshot, memoryConfigs)
 		return moveSetScoring{
-			Score:                   baseScore + memoryBalance.Correction,
-			BaseScore:               baseScore,
-			Cost:                    costScore,
-			MemoryBalance:           memoryBalance,
-			SourceNodeScores:        sourceNodeScores,
-			UtilisationContribution: utilisationContribution,
+			Score:                     baseScore + memoryBalance.Correction + concentration.Correction,
+			BaseScore:                 baseScore,
+			Cost:                      costScore,
+			MemoryBalance:             memoryBalance,
+			InstanceTypeConcentration: concentration,
+			SourceNodeScores:          sourceNodeScores,
+			UtilisationContribution:   utilisationContribution,
 		}
 	}
 
