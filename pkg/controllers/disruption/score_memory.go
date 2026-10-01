@@ -66,19 +66,22 @@ type scoreBasedMemoryPoolScore struct {
 	Pressure                  float64 `json:"pressure"`
 	NormalizedDelta           float64 `json:"normalizedDelta"`
 	Weight                    float64 `json:"weight"`
+	SourceNodeCount           int     `json:"sourceNodeCount"`
 	Contribution              float64 `json:"contribution"`
 }
 
 type scoreBasedMemoryScore struct {
-	Enabled    bool                                 `json:"enabled"`
-	Correction float64                              `json:"correction"`
-	RemovedCPU float64                              `json:"removedCPU"`
-	Pools      map[string]scoreBasedMemoryPoolScore `json:"pools,omitempty"`
+	Enabled         bool                                 `json:"enabled"`
+	Correction      float64                              `json:"correction"`
+	RemovedCPU      float64                              `json:"removedCPU"`
+	SourceNodeCount int                                  `json:"sourceNodeCount"`
+	Pools           map[string]scoreBasedMemoryPoolScore `json:"pools,omitempty"`
 }
 
 type moveSetScoring struct {
 	Score         float64
 	BaseScore     float64
+	Cost          scoreBasedCostScore
 	MemoryBalance scoreBasedMemoryScore
 }
 
@@ -290,6 +293,7 @@ func (snapshot *scoreBasedMemorySnapshot) score(command Command) scoreBasedMemor
 		return details
 	}
 	details.Enabled = true
+	details.SourceNodeCount = len(command.Candidates)
 	details.Pools = map[string]scoreBasedMemoryPoolScore{}
 	localDelta := map[string]float64{}
 	poolNames := map[string]struct{}{}
@@ -378,13 +382,14 @@ func (snapshot *scoreBasedMemorySnapshot) score(command Command) scoreBasedMemor
 		pool := snapshot.pools[poolName]
 		config := snapshot.configs[poolName]
 		normalizedDelta := clampUnit(localDelta[poolName] / denominator)
-		contribution := config.weight * pool.pressure * normalizedDelta
+		contribution := config.weight * pool.pressure * normalizedDelta * float64(details.SourceNodeCount)
 		details.Pools[poolName] = scoreBasedMemoryPoolScore{
 			CapacityMemoryBytesPerCPU: pool.capacityRatio,
 			TargetMemoryBytesPerCPU:   pool.targetRatio,
 			Pressure:                  pool.pressure,
 			NormalizedDelta:           normalizedDelta,
 			Weight:                    config.weight,
+			SourceNodeCount:           details.SourceNodeCount,
 			Contribution:              contribution,
 		}
 		details.Correction += contribution

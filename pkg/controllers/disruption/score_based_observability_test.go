@@ -69,7 +69,7 @@ func TestLogScoreBasedCompactionMoveSelectedJSON(t *testing.T) {
 			path:    scoreBasedSearchPathBatch,
 			command: Command{Candidates: []*Candidate{first, second, third, fourth}},
 			score:   18, singleScores: []float64{6, 5, 4, 3}, selectedIndex: 1,
-			wantMethod: "sum_single_node_scores", wantDecision: "delete", wantSourceCost: 7.3, wantSavings: 7.3,
+			wantMethod: "additive_single_node_scores", wantDecision: "delete", wantSourceCost: 7.3, wantSavings: 7.3,
 		},
 		{
 			name: "two to one pair search omits singleton score",

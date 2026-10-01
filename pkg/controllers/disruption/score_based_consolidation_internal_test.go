@@ -19,6 +19,7 @@ package disruption
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -264,14 +265,28 @@ func TestMoveSetSearchStats(t *testing.T) {
 func TestMoveSetPriorityScore(t *testing.T) {
 	lowPriceCandidate := candidateWithPrice(t, 0.10)
 	highPriceCandidate := candidateWithPrice(t, 0.50)
+	lowPriceCandidate.NodePool = &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "pool"}}
+	highPriceCandidate.NodePool = lowPriceCandidate.NodePool
+	lowPriceCandidate.Node.Name = "node-low"
+	highPriceCandidate.Node.Name = "node-high"
+	key := scoreBasedPriceGroupKey{nodePool: "pool", capacityType: v1.CapacityTypeOnDemand}
+	prices := &scoreBasedPriceSnapshot{
+		groups: map[scoreBasedPriceGroupKey]*scoreBasedPriceGroup{
+			key: {totalPrice: 0.60, totalCPU: 4, nodeCount: 2, known: true, baseline: 0.15},
+		},
+		nodes: map[string]scoreBasedNodePrice{
+			"node-low":  {group: key, cpu: 2, price: 0.10, known: true},
+			"node-high": {group: key, cpu: 2, price: 0.50, known: true},
+		},
+	}
 
 	lowCmd := Command{Candidates: []*Candidate{lowPriceCandidate}}
-	if got := moveSetPriorityScore(lowCmd); got != 51 {
-		t.Fatalf("single-node move set score = %v, want 51", got)
+	if got := moveSetPriorityScore(lowCmd, prices); math.Abs(got-(1+1.0/3.0)) > 1e-9 {
+		t.Fatalf("single-node move set score = %v, want normalized cost 1/3 plus utilization 1", got)
 	}
 	multiCmd := Command{Candidates: []*Candidate{lowPriceCandidate, highPriceCandidate}}
-	if got := moveSetPriorityScore(multiCmd); got != 152 {
-		t.Fatalf("multi-node move set score = %v, want 152", got)
+	if got := moveSetPriorityScore(multiCmd, prices); got != 4 {
+		t.Fatalf("multi-node move set score = %v, want normalized cost 2 plus utilization 2", got)
 	}
 }
 
@@ -536,7 +551,7 @@ func TestEvaluateMoveSetsPar_respectsOrder(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	winner, evaluated, _, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(time.Second), compute)
+	winner, evaluated, _, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(time.Second), compute, sourcePriceSearchTestScore)
 	if err != nil {
 		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
 	}
@@ -568,7 +583,7 @@ func TestEvaluateMoveSetsPar_stopsOnDeadline(t *testing.T) {
 		}
 	}
 
-	winner, evaluated, timedOut, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(-time.Millisecond), compute)
+	winner, evaluated, timedOut, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(-time.Millisecond), compute, sourcePriceSearchTestScore)
 	if err != nil {
 		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
 	}
@@ -597,7 +612,7 @@ func TestEvaluateMoveSetsPar_returnsTopResultsAfterSearch(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	evals, evaluated, _, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(time.Second), compute)
+	evals, evaluated, _, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(time.Second), compute, sourcePriceSearchTestScore)
 	if err != nil {
 		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
 	}
@@ -641,7 +656,7 @@ func TestEvaluateMoveSetsPar_returnsPartialOnTimeout(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	evals, evaluated, timedOut, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(100*time.Millisecond), compute)
+	evals, evaluated, timedOut, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(100*time.Millisecond), compute, sourcePriceSearchTestScore)
 	if err != nil {
 		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
 	}
@@ -830,6 +845,13 @@ func candidateWithPrice(t *testing.T, price float64) *Candidate {
 		instanceType: instanceType,
 		Price:        price,
 	}
+}
+
+// sourcePriceSearchTestScore makes the parallel-search tests independent of the
+// production price-baseline scorer, whose inputs come from an immutable fleet snapshot.
+func sourcePriceSearchTestScore(command Command) moveSetScoring {
+	score := sumCandidatePrices(command.Candidates)
+	return moveSetScoring{Score: score, BaseScore: score}
 }
 
 func scoreBasedTestCandidate(scoreBasedConsolidation bool) *Candidate {

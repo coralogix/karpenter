@@ -18,6 +18,7 @@ package disruption
 
 import (
 	"context"
+	"math"
 	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
@@ -31,11 +32,9 @@ const memoryGiBWeight = 0.125
 
 const gibibyte = 1024 * 1024 * 1024
 
-// millidollarsPerDollar converts hourly prices from USD/h to m$/h.
-const millidollarsPerDollar = 1000
-
-// defaultScoreBasedUtilisationWeightMilliPerVCPUHour is the default utilization-weight (m$/vCPU/h).
-const defaultScoreBasedUtilisationWeightMilliPerVCPUHour = 1.0
+// defaultScoreBasedUtilisationWeight is a dimensionless weight for each
+// source node's CPU slack ratio.
+const defaultScoreBasedUtilisationWeight = 1.0
 
 // nodePriorityScore is a search-guidance heuristic.
 // Uses non-daemon pod CPU/memory requests from cluster state via PodRequests().
@@ -57,19 +56,19 @@ func nonDaemonWorkloadSize(requests corev1.ResourceList) float64 {
 	return cores + gibibytes*memoryGiBWeight
 }
 
-// moveSetPriorityScore ranks a simulated consolidation command. Hourly costs use m$/h; the cost-efficiency
-// term is in m$/vCPU/h and the utilization term is utilization-weight (m$/vCPU/h) times a unitless CPU slack ratio.
-func moveSetPriorityScore(cmd Command) float64 {
-	return moveSetCostEfficiencyMilliPerVCPUHour(cmd) + moveSetUtilisationScore(cmd)
+// moveSetPriorityScore combines the normalized cost contribution with the
+// additive, dimensionless CPU-slack contribution.
+func moveSetPriorityScore(cmd Command, prices *scoreBasedPriceSnapshot) float64 {
+	score, _ := scoreMoveSetPriority(cmd, prices)
+	return score
 }
 
-func moveSetCostEfficiencyMilliPerVCPUHour(cmd Command) float64 {
-	savingsMilliPerHour := consolidationSavingsUSDPerHour(cmd) * millidollarsPerDollar
-	allocatableCPU := removedCandidatesAllocatableCPU(cmd.Candidates)
-	if allocatableCPU <= 0 {
-		return 0
+func scoreMoveSetPriority(cmd Command, prices *scoreBasedPriceSnapshot) (float64, scoreBasedCostScore) {
+	cost := prices.score(cmd)
+	if !cost.Valid {
+		return math.NaN(), cost
 	}
-	return savingsMilliPerHour / allocatableCPU
+	return cost.Contribution + moveSetUtilisationScore(cmd), cost
 }
 
 func moveSetUtilisationScore(cmd Command) float64 {
@@ -84,7 +83,7 @@ func moveSetUtilisationScore(cmd Command) float64 {
 		if unallocatedCPU < 0 {
 			unallocatedCPU = 0
 		}
-		weight := defaultScoreBasedUtilisationWeightMilliPerVCPUHour
+		weight := defaultScoreBasedUtilisationWeight
 		if candidate.NodePool != nil {
 			weight = scoreBasedUtilisationWeight(candidate.NodePool)
 		}
@@ -110,14 +109,6 @@ func consolidationSavingsUSDPerHour(cmd Command) float64 {
 		}
 	}
 	return sourcePrice - destPrice
-}
-
-func removedCandidatesAllocatableCPU(candidates []*Candidate) float64 {
-	var total float64
-	for _, candidate := range candidates {
-		total += candidateAllocatableCPU(candidate)
-	}
-	return total
 }
 
 func candidateAllocatableCPU(candidate *Candidate) float64 {
@@ -149,20 +140,20 @@ func candidateRequestedCPU(candidate *Candidate) float64 {
 
 func scoreBasedUtilisationWeight(nodePool *v1.NodePool) float64 {
 	if nodePool == nil || nodePool.Annotations == nil {
-		return defaultScoreBasedUtilisationWeightMilliPerVCPUHour
+		return defaultScoreBasedUtilisationWeight
 	}
 	value := nodePool.Annotations[v1.ScoreBasedUtilisationWeightAnnotationKey]
 	if value == "" {
-		return defaultScoreBasedUtilisationWeightMilliPerVCPUHour
+		return defaultScoreBasedUtilisationWeight
 	}
 	weight, err := strconv.ParseFloat(value, 64)
-	if err != nil || weight <= 0 {
+	if err != nil || weight <= 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
 		log.FromContext(context.Background()).V(1).Info("using default score-based utilization weight for invalid value",
 			"NodePool", nodePool.Name,
 			"annotation", v1.ScoreBasedUtilisationWeightAnnotationKey,
 			"value", value,
 		)
-		return defaultScoreBasedUtilisationWeightMilliPerVCPUHour
+		return defaultScoreBasedUtilisationWeight
 	}
 	return weight
 }

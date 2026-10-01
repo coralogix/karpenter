@@ -118,7 +118,7 @@ func TestScoreBasedConsolidationMemoryConfigInvalidatesConsolidatedCache(t *test
 	}
 }
 
-func TestScoreBasedMemoryScoreVetoIsOptIn(t *testing.T) {
+func TestScoreBasedMoveSetScoreMustBePositiveWithOrWithoutMemoryScoring(t *testing.T) {
 	candidate := scoreBasedTestCandidate(true)
 	candidate.Price = 1
 	command := Command{Candidates: []*Candidate{candidate}}
@@ -142,11 +142,36 @@ func TestScoreBasedMemoryScoreVetoIsOptIn(t *testing.T) {
 	}
 
 	disabledStats := &moveSetSearchStats{}
-	if got := evaluateMoveSetWith(context.Background(), moveSet{Nodes: []*Candidate{candidate}}, compute, disabledStats, nil, scoring(false)); got == nil {
-		t.Fatal("disabled memory scoring should preserve the legacy evaluation path")
+	if got := evaluateMoveSetWith(context.Background(), moveSet{Nodes: []*Candidate{candidate}}, compute, disabledStats, nil, scoring(false)); got != nil {
+		t.Fatal("non-positive score should veto a move when memory scoring is disabled too")
 	}
-	if got := disabledStats.nonPositiveScoreMoveSetCount(); got != 0 {
-		t.Fatalf("disabled non-positive score count = %d, want 0", got)
+	if got := disabledStats.nonPositiveScoreMoveSetCount(); got != 1 {
+		t.Fatalf("disabled non-positive score count = %d, want 1", got)
+	}
+}
+
+func TestScoreBasedMoveSetRejectsUnknownPriceDespitePositiveUtilisationAndMemoryDisabled(t *testing.T) {
+	candidate := scoreBasedTestCandidate(true)
+	candidate.Price = 1
+	candidate.instanceType.Capacity = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}
+	command := Command{Candidates: []*Candidate{candidate}}
+	compute := func(context.Context, ...*Candidate) (Command, error) { return command, nil }
+	score := moveSetUtilisationScore(command)
+	if score <= 0 {
+		t.Fatalf("test setup utilization score = %v, want positive", score)
+	}
+	scoring := func(Command) moveSetScoring {
+		return moveSetScoring{
+			Score: score, BaseScore: score,
+			Cost: scoreBasedCostScore{Enabled: true, Valid: false},
+		}
+	}
+	stats := &moveSetSearchStats{}
+	if got := evaluateMoveSetWith(context.Background(), moveSet{Nodes: []*Candidate{candidate}}, compute, stats, nil, scoring); got != nil {
+		t.Fatal("unknown source pricing must reject the move even with positive utilization and memory scoring disabled")
+	}
+	if got := stats.nonPositiveScoreMoveSetCount(); got != 1 {
+		t.Fatalf("invalid-price score count = %d, want 1", got)
 	}
 }
 

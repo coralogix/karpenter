@@ -19,6 +19,7 @@ package disruption
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -51,6 +52,30 @@ func TestScoreBasedMemoryInternalCorrectionIsIndependentOfPoolSize(t *testing.T)
 		if score.Correction != first {
 			t.Fatalf("correction changed with pool size: 5 nodes=%v, 1000 nodes=%v", first, score.Correction)
 		}
+	}
+}
+
+func TestScoreBasedMemoryJointCorrectionScalesWithSourceNodeCount(t *testing.T) {
+	const poolName = "memory-pool"
+	first := scoreMemoryCandidateForTest(poolName, "first-source")
+	second := scoreMemoryCandidateForTest(poolName, "second-source")
+	snapshot := scoreMemorySnapshotForTest(poolName, 10, 40, 1, 2,
+		map[string]scoreBasedMemoryShape{
+			"first-source":  {cpu: 1, memory: 8},
+			"second-source": {cpu: 1, memory: 8},
+		})
+
+	single := snapshot.score(Command{Candidates: []*Candidate{first}})
+	joint := snapshot.score(Command{Candidates: []*Candidate{first, second}})
+	if single.Correction != 1 || single.SourceNodeCount != 1 {
+		t.Fatalf("single-node correction = %+v, want correction 1 with one source", single)
+	}
+	if joint.Correction != 2 || joint.SourceNodeCount != 2 {
+		t.Fatalf("joint correction = %+v, want correction 2 with two sources", joint)
+	}
+	poolScore := joint.Pools[poolName]
+	if poolScore.NormalizedDelta != 1 || poolScore.SourceNodeCount != 2 || poolScore.Contribution != 2 {
+		t.Fatalf("joint pool correction details = %+v, want unscaled delta 1 and doubled contribution 2", poolScore)
 	}
 }
 
@@ -137,45 +162,75 @@ func TestScoreBasedMemoryInternalReplacementUsesConservativeOptions(t *testing.T
 func TestScoreBasedMemoryBatchScoringUsesJointScoreWithOneCorrection(t *testing.T) {
 	first := scoreBasedBatchTestCandidate("memory-first", "memory-pool")
 	second := scoreBasedBatchTestCandidate("memory-second", "memory-pool")
-	singletons := func() []*moveSetEvaluation {
-		return []*moveSetEvaluation{
-			{Command: Command{Candidates: []*Candidate{first}}, Score: 4, BaseScore: 3, MemoryBalance: scoreBasedMemoryScore{Enabled: true, Correction: 1}},
-			{Command: Command{Candidates: []*Candidate{second}}, Score: 6, BaseScore: 4, MemoryBalance: scoreBasedMemoryScore{Enabled: true, Correction: 2}},
-		}
+	first.Price, second.Price = 1, 2
+	for _, candidate := range []*Candidate{first, second} {
+		candidate.Node.Status.Allocatable = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}
 	}
+	priceKey := scoreBasedPriceGroupKey{nodePool: "memory-pool", capacityType: v1.CapacityTypeOnDemand}
+	prices := &scoreBasedPriceSnapshot{
+		groups: map[scoreBasedPriceGroupKey]*scoreBasedPriceGroup{
+			priceKey: {totalPrice: 3, totalCPU: 4, nodeCount: 2, known: true, baseline: 0.75},
+		},
+		nodes: map[string]scoreBasedNodePrice{
+			first.Name():  {group: priceKey, cpu: 2, price: 1, known: true},
+			second.Name(): {group: priceKey, cpu: 2, price: 2, known: true},
+		},
+	}
+	memorySnapshot := scoreMemorySnapshotForTest("memory-pool", 10, 40, 1, 2,
+		map[string]scoreBasedMemoryShape{
+			first.Name():  {cpu: 1, memory: 12}, // Single-node delta clamps to 1.
+			second.Name(): {cpu: 1, memory: 4},
+		})
 	compute := func(_ context.Context, candidates ...*Candidate) (Command, error) {
 		return Command{Candidates: candidates}, nil
 	}
+	baseScorer := func(command Command) moveSetScoring {
+		costScore := prices.score(command)
+		baseScore := costScore.Contribution + moveSetUtilisationScore(command)
+		return moveSetScoring{Score: baseScore, BaseScore: baseScore, Cost: costScore}
+	}
+	withMemoryScorer := func(command Command) moveSetScoring {
+		scoring := baseScorer(command)
+		scoring.MemoryBalance = memorySnapshot.score(command)
+		scoring.Score += scoring.MemoryBalance.Correction
+		return scoring
+	}
+	makeSingletons := func(scorer func(Command) moveSetScoring) []*moveSetEvaluation {
+		out := make([]*moveSetEvaluation, 0, 2)
+		for _, candidate := range []*Candidate{first, second} {
+			command := Command{Candidates: []*Candidate{candidate}}
+			scoring := scorer(command)
+			out = append(out, &moveSetEvaluation{
+				Command: command, Score: scoring.Score, BaseScore: scoring.BaseScore,
+				Cost: scoring.Cost, MemoryBalance: scoring.MemoryBalance,
+			})
+		}
+		return out
+	}
+	disabledSingletons := makeSingletons(baseScorer)
+	enabledSingletons := makeSingletons(withMemoryScorer)
+	constituentBaseScore := disabledSingletons[0].BaseScore + disabledSingletons[1].BaseScore
+	constituentMemoryCorrection := enabledSingletons[0].MemoryBalance.Correction + enabledSingletons[1].MemoryBalance.Correction
 
-	legacyBatches := scoreMemoryGrowBatchesForTest(t, singletons(), compute)
-	legacy := scoreMemoryTwoCandidateBatchForTest(t, legacyBatches)
-	if legacy.Score != 10 {
-		t.Fatalf("disabled batch score = %v, want additive singleton score 10", legacy.Score)
-	}
-	if legacy.BaseScore != 10 {
-		t.Fatalf("disabled batch base score = %v, want additive singleton score 10", legacy.BaseScore)
+	disabledBatches := scoreMemoryGrowBatchesForTest(t, disabledSingletons, compute, baseScorer)
+	disabled := scoreMemoryTwoCandidateBatchForTest(t, disabledBatches)
+	if math.Abs(disabled.BaseScore-constituentBaseScore) > 1e-12 || math.Abs(disabled.Score-constituentBaseScore) > 1e-12 {
+		t.Fatalf("memory-disabled batch base/score = %v/%v, want additive singleton base %v", disabled.BaseScore, disabled.Score, constituentBaseScore)
 	}
 
-	const memoryCorrection = 7.0
-	jointScorer := func(command Command) moveSetScoring {
-		baseScore := moveSetPriorityScore(command)
-		memoryBalance := scoreBasedMemoryScore{Enabled: true, Correction: memoryCorrection}
-		return moveSetScoring{Score: baseScore + memoryBalance.Correction, BaseScore: baseScore, MemoryBalance: memoryBalance}
-	}
-	enabledBatches := scoreMemoryGrowBatchesForTest(t, singletons(), compute, jointScorer)
+	enabledBatches := scoreMemoryGrowBatchesForTest(t, enabledSingletons, compute, withMemoryScorer)
 	enabled := scoreMemoryTwoCandidateBatchForTest(t, enabledBatches)
-	wantBase := moveSetPriorityScore(enabled.Command)
-	if enabled.BaseScore != wantBase {
-		t.Fatalf("enabled batch base score = %v, want joint score %v", enabled.BaseScore, wantBase)
+	if math.Abs(enabled.BaseScore-disabled.BaseScore) > 1e-12 || math.Abs(enabled.BaseScore-constituentBaseScore) > 1e-12 {
+		t.Fatalf("enabled batch base score = %v, want the same additive base %v", enabled.BaseScore, constituentBaseScore)
 	}
-	if enabled.MemoryBalance.Correction != memoryCorrection {
-		t.Fatalf("enabled batch memory correction = %v, want one correction %v", enabled.MemoryBalance.Correction, memoryCorrection)
+	if enabled.MemoryBalance.Correction != 2 || enabled.MemoryBalance.SourceNodeCount != 2 {
+		t.Fatalf("enabled batch memory correction = %+v, want one joint correction 2 for two sources", enabled.MemoryBalance)
 	}
-	if enabled.Score != wantBase+memoryCorrection {
-		t.Fatalf("enabled batch score = %v, want joint score %v plus one correction %v", enabled.Score, wantBase, memoryCorrection)
+	if enabled.Score != constituentBaseScore+enabled.MemoryBalance.Correction {
+		t.Fatalf("enabled batch score = %v, want additive base %v plus joint correction %v", enabled.Score, constituentBaseScore, enabled.MemoryBalance.Correction)
 	}
-	if enabled.Score == legacy.Score {
-		t.Fatalf("enabled joint batch score %v unexpectedly equals additive singleton score %v", enabled.Score, legacy.Score)
+	if enabled.MemoryBalance.Correction == constituentMemoryCorrection {
+		t.Fatalf("joint correction %v unexpectedly equals summed singleton corrections %v", enabled.MemoryBalance.Correction, constituentMemoryCorrection)
 	}
 }
 

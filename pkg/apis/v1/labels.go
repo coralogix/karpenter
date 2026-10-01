@@ -65,13 +65,13 @@ const (
 	ScoreBasedReclamationIntervalAnnotationKey = "karpenter.coralogix.net/reclamation-interval"
 	// ScoreBasedLastReclamationAnnotationKey stores the RFC3339Nano time of the last successful empty-node reclamation.
 	ScoreBasedLastReclamationAnnotationKey = "karpenter.coralogix.net/last-reclamation"
-	// ScoreBasedUtilisationWeightAnnotationKey weights the CPU slack term in move-set priority scoring.
-	// Values are in millidollars per vCPU-hour (m$/vCPU/h); invalid or non-positive values use the default of 1.
+	// ScoreBasedUtilisationWeightAnnotationKey is a dimensionless weight for the additive CPU slack ratio.
+	// Invalid or non-positive values use the default of 1.
 	ScoreBasedUtilisationWeightAnnotationKey = "karpenter.coralogix.net/utilisation-weight"
 	// ScoreBasedMemorySurplusAnnotationKey sets memory surplus over non-DaemonSet requests at which a pool is balanced.
 	// Values are non-negative fractions; invalid values use the score-based memory surplus default of 0.2.
 	ScoreBasedMemorySurplusAnnotationKey = "karpenter.coralogix.net/memory-surplus"
-	// ScoreBasedMemoryBalanceWeightAnnotationKey weights the memory balance correction in m$/vCPU/h.
+	// ScoreBasedMemoryBalanceWeightAnnotationKey is a dimensionless weight for memory balance correction.
 	// Invalid values use the default of 0, which disables memory-aware scoring.
 	ScoreBasedMemoryBalanceWeightAnnotationKey = "karpenter.coralogix.net/memory-balance-weight"
 )

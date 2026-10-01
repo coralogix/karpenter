@@ -147,10 +147,7 @@ func growScoreBasedBatches(
 						func(cmd Command) bool { return len(cmd.Candidates) == len(trial) && len(cmd.Replacements) == 0 },
 						func(cmd Command) moveSetScoring {
 							if scorer != nil {
-								scored := scorer(cmd)
-								if scored.MemoryBalance.Enabled {
-									return scored
-								}
+								return scorer(cmd)
 							}
 							var total float64
 							for _, member := range trial {
@@ -510,8 +507,9 @@ func evaluateMoveSetsPar(
 	moveSets []moveSet,
 	deadline time.Time,
 	compute consolidationComputer,
+	score func(Command) moveSetScoring,
 ) ([]*moveSetEvaluation, int, bool, *moveSetSearchStats, error) {
-	return evaluateMoveSetsParWithStats(ctx, moveSets, deadline, compute, scoreBasedMoveSetResultLimit, nil, nil, nil)
+	return evaluateMoveSetsParWithStats(ctx, moveSets, deadline, compute, scoreBasedMoveSetResultLimit, nil, score, nil)
 }
 
 func evaluateMoveSetsParWithStats(
@@ -608,10 +606,10 @@ func evaluateMoveSetWith(
 	if score != nil {
 		scoring = score(cmd)
 	} else {
-		baseScore := moveSetPriorityScore(cmd)
-		scoring = moveSetScoring{Score: baseScore, BaseScore: baseScore}
+		baseScore, costScore := scoreMoveSetPriority(cmd, nil)
+		scoring = moveSetScoring{Score: baseScore, BaseScore: baseScore, Cost: costScore}
 	}
-	if !scoreBasedMemoryScoreIsValid(scoring) {
+	if !scoreBasedMoveSetScoreIsValid(scoring) {
 		stats.recordNonPositiveScoreMoveSet()
 		return nil
 	}
@@ -619,13 +617,14 @@ func evaluateMoveSetWith(
 		Command:       cmd,
 		Score:         scoring.Score,
 		BaseScore:     scoring.BaseScore,
+		Cost:          scoring.Cost,
 		MemoryBalance: scoring.MemoryBalance,
 	}
 }
 
-func scoreBasedMemoryScoreIsValid(scoring moveSetScoring) bool {
-	if !scoring.MemoryBalance.Enabled {
-		return true
+func scoreBasedMoveSetScoreIsValid(scoring moveSetScoring) bool {
+	if scoring.Cost.Enabled && !scoring.Cost.Valid {
+		return false
 	}
 	return finiteScoreValue(scoring.Score) && scoring.Score > 0
 }

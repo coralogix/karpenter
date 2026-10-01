@@ -74,12 +74,15 @@ type CandidateFilter func(context.Context, *Candidate) bool
 // making that determination
 type Candidate struct {
 	*state.StateNode
-	instanceType      *cloudprovider.InstanceType
-	NodePool          *v1.NodePool
-	zone              string
-	capacityType      string
-	DisruptionCost    float64
-	reschedulablePods []*corev1.Pod
+	instanceType *cloudprovider.InstanceType
+	// nodePoolInstanceTypes is the already-fetched NodePool type map used to
+	// resolve prices for the full scheduling snapshot during score-based search.
+	nodePoolInstanceTypes map[string]*cloudprovider.InstanceType
+	NodePool              *v1.NodePool
+	zone                  string
+	capacityType          string
+	DisruptionCost        float64
+	reschedulablePods     []*corev1.Pod
 
 	// Price is the cheapest compatible offering price for this candidate.
 	// Precomputed at creation to avoid repeated offering lookups.
@@ -197,12 +200,13 @@ func NewCandidate(ctx context.Context, kubeClient client.Client, recorder events
 	}
 	reschedulable := lo.Filter(pods, func(p *corev1.Pod, _ int) bool { return pod.IsReschedulable(p) })
 	return &Candidate{
-		StateNode:         node,
-		instanceType:      instanceType,
-		NodePool:          nodePool,
-		capacityType:      node.Labels()[v1.CapacityTypeLabelKey],
-		zone:              node.Labels()[corev1.LabelTopologyZone],
-		reschedulablePods: reschedulable,
+		StateNode:             node,
+		instanceType:          instanceType,
+		nodePoolInstanceTypes: instanceTypeMap,
+		NodePool:              nodePool,
+		capacityType:          node.Labels()[v1.CapacityTypeLabelKey],
+		zone:                  node.Labels()[corev1.LabelTopologyZone],
+		reschedulablePods:     reschedulable,
 		// We get the disruption cost from all pods in the candidate, not just the reschedulable pods
 		DisruptionCost:           disruptionutils.ReschedulingCost(ctx, pods) * disruptionutils.LifetimeRemaining(clk, nodePool, node.NodeClaim),
 		Price:                    resolveNodePrice(node, instanceType),

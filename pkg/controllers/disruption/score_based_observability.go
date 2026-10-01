@@ -234,9 +234,9 @@ func logScoreBasedCompactionMoveSelected(
 	estimatedSavingsUSDPerHour := consolidationSavingsUSDPerHour(cmd)
 	scoreMethod := "joint_move_set_score"
 	if eval.searchPath == scoreBasedSearchPathBatch {
-		scoreMethod = "sum_single_node_scores"
+		scoreMethod = "additive_single_node_scores"
 		if eval.MemoryBalance.Enabled {
-			scoreMethod = "joint_move_set_score_plus_memory_balance"
+			scoreMethod = "additive_base_plus_joint_memory_balance"
 		}
 	}
 	selectionReason := "highest_ranked_validated_move"
@@ -254,6 +254,8 @@ func logScoreBasedCompactionMoveSelected(
 				"rankingScore":            eval.Score,
 				"baseScore":               eval.BaseScore,
 				"method":                  scoreMethod,
+				"normalizedCost":          eval.Cost,
+				"utilisationContribution": moveSetUtilisationScore(cmd),
 				"memoryBalance":           eval.MemoryBalance,
 				"memoryBalanceCorrection": eval.MemoryBalance.Correction,
 			},

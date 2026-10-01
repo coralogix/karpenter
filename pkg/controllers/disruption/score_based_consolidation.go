@@ -74,6 +74,7 @@ type moveSetEvaluation struct {
 	Command                    Command
 	Score                      float64
 	BaseScore                  float64
+	Cost                       scoreBasedCostScore
 	MemoryBalance              scoreBasedMemoryScore
 	searchPath                 scoreBasedMoveSetSearchPath
 	sourceNodeSingleMoveScores []float64
@@ -375,12 +376,13 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 		}
 		return result, err
 	}
+	nodeSnapshot := simulator.StateNodesSnapshot()
+	priceSnapshot := newScoreBasedPriceSnapshot(nodeSnapshot, validCandidates)
 	memorySnapshotCtx, stopMemorySnapshot := cxtracing.Measure(searchCtx, nil, scoreBasedConsolidationMemorySnapshotSpan,
 		attribute.Bool("enabled", hasScoreBasedMemoryBalanceWeight(memoryConfigs)),
 	)
 	var memorySnapshot *scoreBasedMemorySnapshot
 	if hasScoreBasedMemoryBalanceWeight(memoryConfigs) {
-		nodeSnapshot := simulator.StateNodesSnapshot()
 		memorySnapshot = newScoreBasedMemorySnapshot(nodeSnapshot, memoryConfigs)
 		trace.SpanFromContext(memorySnapshotCtx).SetAttributes(memorySnapshot.spanAttributes(len(nodeSnapshot))...)
 	}
@@ -393,11 +395,12 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 		return cmd, err
 	}
 	scoreMoveSet := func(cmd Command) moveSetScoring {
-		baseScore := moveSetPriorityScore(cmd)
+		baseScore, costScore := scoreMoveSetPriority(cmd, priceSnapshot)
 		memoryBalance := memorySnapshot.score(cmd)
 		return moveSetScoring{
 			Score:         baseScore + memoryBalance.Correction,
 			BaseScore:     baseScore,
+			Cost:          costScore,
 			MemoryBalance: memoryBalance,
 		}
 	}

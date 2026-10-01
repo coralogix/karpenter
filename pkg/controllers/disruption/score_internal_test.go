@@ -148,8 +148,8 @@ func TestNodePriorityScore(t *testing.T) {
 }
 
 func TestScoreBasedUtilisationWeight(t *testing.T) {
-	if got := scoreBasedUtilisationWeight(nil); got != defaultScoreBasedUtilisationWeightMilliPerVCPUHour {
-		t.Fatalf("nil NodePool weight = %v, want %v", got, defaultScoreBasedUtilisationWeightMilliPerVCPUHour)
+	if got := scoreBasedUtilisationWeight(nil); got != defaultScoreBasedUtilisationWeight {
+		t.Fatalf("nil NodePool weight = %v, want %v", got, defaultScoreBasedUtilisationWeight)
 	}
 	np := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
 		v1.ScoreBasedUtilisationWeightAnnotationKey: "2.5",
@@ -158,12 +158,12 @@ func TestScoreBasedUtilisationWeight(t *testing.T) {
 		t.Fatalf("custom weight = %v, want 2.5", got)
 	}
 	np.Annotations[v1.ScoreBasedUtilisationWeightAnnotationKey] = "bad"
-	if got := scoreBasedUtilisationWeight(np); got != defaultScoreBasedUtilisationWeightMilliPerVCPUHour {
-		t.Fatalf("invalid weight = %v, want default %v", got, defaultScoreBasedUtilisationWeightMilliPerVCPUHour)
+	if got := scoreBasedUtilisationWeight(np); got != defaultScoreBasedUtilisationWeight {
+		t.Fatalf("invalid weight = %v, want default %v", got, defaultScoreBasedUtilisationWeight)
 	}
 }
 
-func TestMoveSetCostEfficiencyMilliPerVCPUHour(t *testing.T) {
+func TestMoveSetPriorityScoreUsesNormalizedCostAndDimensionlessUtilisation(t *testing.T) {
 	offering := &cloudprovider.Offering{
 		Price: 0.12,
 		Requirements: scheduling.NewLabelRequirements(map[string]string{
@@ -192,10 +192,20 @@ func TestMoveSetCostEfficiencyMilliPerVCPUHour(t *testing.T) {
 	candidate := &Candidate{
 		StateNode:    node,
 		instanceType: instanceType,
+		NodePool:     &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "pool"}},
 		Price:        0.12,
 	}
 	cmd := Command{Candidates: []*Candidate{candidate}}
-	if got := moveSetCostEfficiencyMilliPerVCPUHour(cmd); got != 30 {
-		t.Fatalf("cost efficiency = %v, want 30 m$/vCPU/h", got)
+	key := scoreBasedPriceGroupKey{nodePool: "pool", capacityType: v1.CapacityTypeOnDemand}
+	prices := &scoreBasedPriceSnapshot{
+		groups: map[scoreBasedPriceGroupKey]*scoreBasedPriceGroup{
+			key: {totalPrice: 0.12, totalCPU: 4, nodeCount: 1, known: true, baseline: 0.03},
+		},
+		nodes: map[string]scoreBasedNodePrice{
+			"node-1": {group: key, cpu: 4, price: 0.12, known: true},
+		},
+	}
+	if got := moveSetPriorityScore(cmd, prices); got != 2 {
+		t.Fatalf("move-set score = %v, want normalized cost 1 plus utilization 1", got)
 	}
 }
