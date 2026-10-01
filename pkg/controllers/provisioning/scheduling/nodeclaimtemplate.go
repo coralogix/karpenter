@@ -61,6 +61,11 @@ type NodeClaimTemplate struct {
 	InstanceTypeOptions cloudprovider.InstanceTypes
 	Requirements        scheduling.Requirements
 	IsStaticNodeClaim   bool
+	// SimulationMaxCapacity caps nominal CPU and memory capacity for fit checks
+	// when constructing new simulated NodeClaims. It is immutable after template
+	// creation because templates are shared across concurrent simulations.
+	SimulationMaxCapacity    corev1.ResourceList
+	SimulationMaxCapacityErr error
 }
 
 func NewNodeClaimTemplate(nodePool *v1.NodePool) *NodeClaimTemplate {
@@ -71,6 +76,11 @@ func NewNodeClaimTemplate(nodePool *v1.NodePool) *NodeClaimTemplate {
 		NodePoolWeight:    lo.FromPtr(nodePool.Spec.Weight),
 		Requirements:      scheduling.NewRequirements(),
 		IsStaticNodeClaim: nodePool.Spec.Replicas != nil,
+	}
+	if !nct.IsStaticNodeClaim {
+		if value, configured := nodePool.Annotations[SimulationMaxCapacityAnnotationKey]; configured {
+			nct.SimulationMaxCapacity, nct.SimulationMaxCapacityErr = parseSimulationMaxCapacity(value)
+		}
 	}
 	nct.Annotations = lo.Assign(nct.Annotations, map[string]string{
 		v1.NodePoolHashAnnotationKey:        nodePool.Hash(),

@@ -61,6 +61,17 @@ func NoCompatibleInstanceTypes(np *v1.NodePool, minValuesIncompatibleError bool)
 	}
 }
 
+func InvalidSimulationMaxCapacity(np *v1.NodePool, err error) events.Event {
+	return events.Event{
+		InvolvedObject: np,
+		Type:           corev1.EventTypeWarning,
+		Reason:         events.InvalidSimulationMaxCapacity,
+		Message:        fmt.Sprintf("NodePool cannot provision new nodes because its %s annotation is invalid: %s", SimulationMaxCapacityAnnotationKey, err),
+		DedupeValues:   []string{string(np.UID)},
+		DedupeTimeout:  time.Minute,
+	}
+}
+
 func PodFailedToScheduleEvent(pod *corev1.Pod, err error) events.Event {
 	return events.Event{
 		InvolvedObject: pod,

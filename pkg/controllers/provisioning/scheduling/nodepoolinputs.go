@@ -76,6 +76,7 @@ func (i *NodePoolInputs) DeepCopy() *NodePoolInputs {
 		}
 		copy := *template
 		copy.NodeClaim = *template.DeepCopy()
+		copy.SimulationMaxCapacity = template.SimulationMaxCapacity.DeepCopy()
 		copy.InstanceTypeOptions = lo.Map(template.InstanceTypeOptions, func(instanceType *cloudprovider.InstanceType, _ int) *cloudprovider.InstanceType {
 			if instanceType == nil {
 				return nil
@@ -117,7 +118,12 @@ func newNodeClaimTemplates(ctx context.Context, recorder events.Recorder, nodePo
 	return lo.FilterMap(nodePools, func(np *v1.NodePool, _ int) (*NodeClaimTemplate, bool) {
 		var err error
 		nct := NewNodeClaimTemplate(np)
-		nct.InstanceTypeOptions, _, err = filterInstanceTypesByRequirements(instanceTypes[np.Name], nct.Requirements, nil, corev1.ResourceList{}, nil, corev1.ResourceList{}, minValuesPolicy == karpopts.MinValuesPolicyBestEffort)
+		if nct.SimulationMaxCapacityErr != nil {
+			recorder.Publish(InvalidSimulationMaxCapacity(np, nct.SimulationMaxCapacityErr))
+			log.FromContext(ctx).Error(nct.SimulationMaxCapacityErr, "skipping NodePool with invalid simulation max capacity", "NodePool", klog.KObj(np))
+			return nil, false
+		}
+		nct.InstanceTypeOptions, _, err = filterInstanceTypesByRequirements(instanceTypes[np.Name], nct.Requirements, nil, corev1.ResourceList{}, nil, corev1.ResourceList{}, minValuesPolicy == karpopts.MinValuesPolicyBestEffort, nil)
 		if len(nct.InstanceTypeOptions) == 0 {
 			if instanceTypeFilterErr, ok := lo.ErrorsAs[InstanceTypeFilterError](err); ok && instanceTypeFilterErr.minValuesIncompatibleErr != nil {
 				recorder.Publish(NoCompatibleInstanceTypes(np, true))
