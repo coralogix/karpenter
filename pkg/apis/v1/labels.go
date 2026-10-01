@@ -68,6 +68,12 @@ const (
 	// ScoreBasedUtilisationWeightAnnotationKey weights the CPU slack term in move-set priority scoring.
 	// Values are in millidollars per vCPU-hour (m$/vCPU/h); invalid or non-positive values use the default of 1.
 	ScoreBasedUtilisationWeightAnnotationKey = "karpenter.coralogix.net/utilisation-weight"
+	// ScoreBasedMemorySurplusAnnotationKey sets memory surplus over non-DaemonSet requests at which a pool is balanced.
+	// Values are non-negative fractions; invalid values use the score-based memory surplus default of 0.2.
+	ScoreBasedMemorySurplusAnnotationKey = "karpenter.coralogix.net/memory-surplus"
+	// ScoreBasedMemoryBalanceWeightAnnotationKey weights the memory balance correction in m$/vCPU/h.
+	// Invalid values use the default of 0, which disables memory-aware scoring.
+	ScoreBasedMemoryBalanceWeightAnnotationKey = "karpenter.coralogix.net/memory-balance-weight"
 )
 
 // Karpenter specific finalizers

@@ -56,14 +56,15 @@ var (
 )
 
 type moveSetSearchStats struct {
-	mu         sync.Mutex
-	count      int
-	sum        time.Duration
-	max        time.Duration
-	errors     int
-	firstError string
-	noOpMoves  int
-	noSavings  int
+	mu                sync.Mutex
+	count             int
+	sum               time.Duration
+	max               time.Duration
+	errors            int
+	firstError        string
+	noOpMoves         int
+	noSavings         int
+	nonPositiveScores int
 }
 
 type scoreBasedNoMoveReason string
@@ -91,6 +92,7 @@ type scoreBasedNoMoveDetails struct {
 	validMoveSetCount              int
 	noOpMoveSetCount               int
 	nonPositiveSavingsMoveSetCount int
+	nonPositiveScoreMoveSetCount   int
 	searchTimedOut                 bool
 	moveSetEvaluationErrorCount    int
 	firstMoveSetEvaluationError    string
@@ -153,6 +155,12 @@ func (s *moveSetSearchStats) recordNonPositiveSavingsMoveSet() {
 	s.noSavings++
 }
 
+func (s *moveSetSearchStats) recordNonPositiveScoreMoveSet() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nonPositiveScores++
+}
+
 func (s *moveSetSearchStats) noOpMoveSetCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -163,6 +171,12 @@ func (s *moveSetSearchStats) nonPositiveSavingsMoveSetCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.noSavings
+}
+
+func (s *moveSetSearchStats) nonPositiveScoreMoveSetCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.nonPositiveScores
 }
 
 func logMoveSetSearchComplete(
@@ -221,6 +235,9 @@ func logScoreBasedCompactionMoveSelected(
 	scoreMethod := "joint_move_set_score"
 	if eval.searchPath == scoreBasedSearchPathBatch {
 		scoreMethod = "sum_single_node_scores"
+		if eval.MemoryBalance.Enabled {
+			scoreMethod = "joint_move_set_score_plus_memory_balance"
+		}
 	}
 	selectionReason := "highest_ranked_validated_move"
 	if selectedEvalIdx > 0 {
@@ -234,8 +251,11 @@ func logScoreBasedCompactionMoveSelected(
 			"replacementNodeCount": len(cmd.Replacements),
 			"sourceNodes":          sourceNodes,
 			"score": map[string]any{
-				"rankingScore": eval.Score,
-				"method":       scoreMethod,
+				"rankingScore":            eval.Score,
+				"baseScore":               eval.BaseScore,
+				"method":                  scoreMethod,
+				"memoryBalance":           eval.MemoryBalance,
+				"memoryBalanceCorrection": eval.MemoryBalance.Correction,
 			},
 			"cost": map[string]any{
 				"sourceUSDPerHour":               sourceCostUSDPerHour,
@@ -274,6 +294,7 @@ func logScoreBasedCompactionNoMove(ctx context.Context, reason scoreBasedNoMoveR
 		"validMoveSetCount", details.validMoveSetCount,
 		"noOpMoveSetCount", details.noOpMoveSetCount,
 		"nonPositiveSavingsMoveSetCount", details.nonPositiveSavingsMoveSetCount,
+		"nonPositiveScoreMoveSetCount", details.nonPositiveScoreMoveSetCount,
 		"searchTimedOut", details.searchTimedOut,
 		"moveSetEvaluationErrorCount", details.moveSetEvaluationErrorCount,
 		"firstMoveSetEvaluationError", details.firstMoveSetEvaluationError,

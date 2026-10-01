@@ -27,6 +27,7 @@ import (
 
 	"github.com/awslabs/operatorpkg/option"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -38,13 +39,14 @@ import (
 )
 
 const (
-	scoreBasedConsolidationSpan              = "karpenter.disruption.score_based_consolidation"
-	scoreBasedConsolidationPrepareSpan       = "karpenter.disruption.score_based_consolidation.prepare_compaction_candidates"
-	scoreBasedConsolidationFilterSpan        = "karpenter.disruption.score_based_consolidation.filter_valid_candidates"
-	scoreBasedConsolidationMoveSetSearchSpan = "karpenter.disruption.score_based_consolidation.move_set_search"
-	scoreBasedConsolidationNewSimulatorSpan  = "karpenter.disruption.score_based_consolidation.new_scheduling_simulator"
-	scoreBasedConsolidationTTLWaitSpan       = "karpenter.disruption.score_based_consolidation.consolidation_ttl_wait"
-	scoreBasedConsolidationValidateSpan      = "karpenter.disruption.score_based_consolidation.validate_command"
+	scoreBasedConsolidationSpan               = "karpenter.disruption.score_based_consolidation"
+	scoreBasedConsolidationPrepareSpan        = "karpenter.disruption.score_based_consolidation.prepare_compaction_candidates"
+	scoreBasedConsolidationFilterSpan         = "karpenter.disruption.score_based_consolidation.filter_valid_candidates"
+	scoreBasedConsolidationMoveSetSearchSpan  = "karpenter.disruption.score_based_consolidation.move_set_search"
+	scoreBasedConsolidationMemorySnapshotSpan = "karpenter.disruption.score_based_consolidation.memory_balance_snapshot"
+	scoreBasedConsolidationNewSimulatorSpan   = "karpenter.disruption.score_based_consolidation.new_scheduling_simulator"
+	scoreBasedConsolidationTTLWaitSpan        = "karpenter.disruption.score_based_consolidation.consolidation_ttl_wait"
+	scoreBasedConsolidationValidateSpan       = "karpenter.disruption.score_based_consolidation.validate_command"
 )
 
 var ScoreBasedConsolidationTimeoutDuration = 15 * time.Second
@@ -71,6 +73,8 @@ const (
 type moveSetEvaluation struct {
 	Command                    Command
 	Score                      float64
+	BaseScore                  float64
+	MemoryBalance              scoreBasedMemoryScore
 	searchPath                 scoreBasedMoveSetSearchPath
 	sourceNodeSingleMoveScores []float64
 }
@@ -96,7 +100,8 @@ func NodePoolUsesScoreBasedConsolidation(np *v1.NodePool) bool {
 
 type ScoreBasedConsolidation struct {
 	consolidation
-	validator Validator
+	validator             Validator
+	memoryConfigSignature map[string]string
 }
 
 func NewScoreBasedConsolidation(c consolidation, opts ...option.Function[MethodOptions]) *ScoreBasedConsolidation {
@@ -163,7 +168,12 @@ func (s *ScoreBasedConsolidation) compactionCandidateNonEmpty(ctx context.Contex
 
 //nolint:gocyclo
 func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
-	if s.IsConsolidated() {
+	currentMemoryConfigSignature, memoryConfigChanged := scoreBasedMemoryConfigChanged(s.memoryConfigSignature, candidates)
+	s.memoryConfigSignature = currentMemoryConfigSignature
+	if memoryConfigChanged {
+		s.lastConsolidationState = time.Time{}
+	}
+	if s.IsConsolidated() && !memoryConfigChanged {
 		logScoreBasedCompactionNoMove(ctx, scoreBasedNoMoveAlreadyConsolidated, scoreBasedNoMoveDetails{
 			candidateCount:           len(candidates),
 			compactionCandidateCount: -1,
@@ -276,6 +286,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 			moveSetsEvaluated:              evaluated,
 			noOpMoveSetCount:               searchStats.noOpMoveSetCount(),
 			nonPositiveSavingsMoveSetCount: searchStats.nonPositiveSavingsMoveSetCount(),
+			nonPositiveScoreMoveSetCount:   searchStats.nonPositiveScoreMoveSetCount(),
 			searchTimedOut:                 timedOut,
 			moveSetEvaluationErrorCount:    searchStats.errorCount(),
 			firstMoveSetEvaluationError:    searchStats.firstErrorMessage(),
@@ -325,6 +336,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 			validMoveSetCount:              len(evals),
 			noOpMoveSetCount:               searchStats.noOpMoveSetCount(),
 			nonPositiveSavingsMoveSetCount: searchStats.nonPositiveSavingsMoveSetCount(),
+			nonPositiveScoreMoveSetCount:   searchStats.nonPositiveScoreMoveSetCount(),
 			searchTimedOut:                 timedOut,
 			moveSetEvaluationErrorCount:    searchStats.errorCount(),
 			firstMoveSetEvaluationError:    searchStats.firstErrorMessage(),
@@ -347,6 +359,7 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 	for i, candidate := range validCandidates {
 		singleNodeMoveSets[i] = moveSet{Nodes: []*Candidate{candidate}}
 	}
+	memoryConfigs := scoreBasedMemoryConfigs(validCandidates)
 	simulatorCtx, stopSimulator := cxtracing.Measure(searchCtx, nil, scoreBasedConsolidationNewSimulatorSpan,
 		attribute.Int("valid_candidate_count", len(validCandidates)),
 	)
@@ -362,6 +375,16 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 		}
 		return result, err
 	}
+	memorySnapshotCtx, stopMemorySnapshot := cxtracing.Measure(searchCtx, nil, scoreBasedConsolidationMemorySnapshotSpan,
+		attribute.Bool("enabled", hasScoreBasedMemoryBalanceWeight(memoryConfigs)),
+	)
+	var memorySnapshot *scoreBasedMemorySnapshot
+	if hasScoreBasedMemoryBalanceWeight(memoryConfigs) {
+		nodeSnapshot := simulator.StateNodesSnapshot()
+		memorySnapshot = newScoreBasedMemorySnapshot(nodeSnapshot, memoryConfigs)
+		trace.SpanFromContext(memorySnapshotCtx).SetAttributes(memorySnapshot.spanAttributes(len(nodeSnapshot))...)
+	}
+	stopMemorySnapshot()
 	searchConsolidation := s.consolidation
 	searchConsolidation.recorder = scoreBasedSearchEventRecorder{recorder: s.recorder}
 	compute := func(computeCtx context.Context, candidates ...*Candidate) (Command, error) {
@@ -369,9 +392,18 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 		publishScoreBasedNoSavingsEvent(s.recorder, cmd, err)
 		return cmd, err
 	}
+	scoreMoveSet := func(cmd Command) moveSetScoring {
+		baseScore := moveSetPriorityScore(cmd)
+		memoryBalance := memorySnapshot.score(cmd)
+		return moveSetScoring{
+			Score:         baseScore + memoryBalance.Correction,
+			BaseScore:     baseScore,
+			MemoryBalance: memoryBalance,
+		}
+	}
 
 	// Search every singleton before deciding whether to batch successes or explore pairs.
-	singles, evaluated, timedOut, stats, err := evaluateMoveSetsParWithStats(searchCtx, singleNodeMoveSets, deadline, compute, 0, nil, nil, result.stats)
+	singles, evaluated, timedOut, stats, err := evaluateMoveSetsParWithStats(searchCtx, singleNodeMoveSets, deadline, compute, 0, nil, scoreMoveSet, result.stats)
 	result.evals = singles
 	result.evaluated += evaluated
 	result.timedOut = timedOut
@@ -394,7 +426,7 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 				zeroReplacementSingles = append(zeroReplacementSingles, single)
 			}
 		}
-		batches, attempted, batchTimedOut, batchErr := growScoreBasedBatches(searchCtx, zeroReplacementSingles, budgets, s.underutilizedPace, compute, result.stats)
+		batches, attempted, batchTimedOut, batchErr := growScoreBasedBatches(searchCtx, zeroReplacementSingles, budgets, s.underutilizedPace, compute, result.stats, scoreMoveSet)
 		if batchErr != nil {
 			return result, batchErr
 		}
@@ -418,7 +450,7 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 		return result, nil
 	}
 	pairEvals, pairEvaluated, pairTimedOut, _, err := evaluateMoveSetsParWithStats(searchCtx, pairs, deadline, compute, scoreBasedMoveSetResultLimit,
-		func(cmd Command) bool { return len(cmd.Candidates) == 2 && len(cmd.Replacements) == 1 }, nil, stats)
+		func(cmd Command) bool { return len(cmd.Candidates) == 2 && len(cmd.Replacements) == 1 }, scoreMoveSet, stats)
 	if err != nil {
 		return result, err
 	}

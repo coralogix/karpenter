@@ -52,6 +52,13 @@ type SchedulingSimulator struct {
 	deletingNodePodKeys map[client.ObjectKey]struct{}
 }
 
+// StateNodesSnapshot returns an owned copy of the node snapshot used by this
+// scheduling search. Callers may aggregate read-only search metadata without
+// consulting the live cluster again.
+func (simulator *SchedulingSimulator) StateNodesSnapshot() state.StateNodes {
+	return simulator.inputs.StateNodesSnapshot()
+}
+
 type schedulingSimulationSnapshot struct {
 	nodes              state.StateNodes
 	pendingPods        []*corev1.Pod

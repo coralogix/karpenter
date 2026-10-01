@@ -50,6 +50,7 @@ func growScoreBasedBatches(
 	pace *UnderutilizedConsolidationPace,
 	compute consolidationComputer,
 	stats *moveSetSearchStats,
+	scorers ...func(Command) moveSetScoring,
 ) ([]*moveSetEvaluation, int, bool, error) {
 	if len(singletons) < 2 {
 		return nil, 0, false, nil
@@ -86,6 +87,10 @@ func growScoreBasedBatches(
 	attempted := 0
 	const perSeedAttemptLimit = 256
 	searchStart := time.Now()
+	var scorer func(Command) moveSetScoring
+	if len(scorers) > 0 {
+		scorer = scorers[0]
+	}
 
 	retainBatch := func(eval *moveSetEvaluation) {
 		if eval == nil {
@@ -140,12 +145,18 @@ func growScoreBasedBatches(
 					attempted++
 					moveEval := evaluateMoveSetWith(ctx, moveSet{Nodes: trial}, compute, stats,
 						func(cmd Command) bool { return len(cmd.Candidates) == len(trial) && len(cmd.Replacements) == 0 },
-						func(Command) float64 {
+						func(cmd Command) moveSetScoring {
+							if scorer != nil {
+								scored := scorer(cmd)
+								if scored.MemoryBalance.Enabled {
+									return scored
+								}
+							}
 							var total float64
 							for _, member := range trial {
 								total += scoreByCandidate[candidateMoveSetKey([]*Candidate{member})]
 							}
-							return total
+							return moveSetScoring{Score: total, BaseScore: total}
 						},
 					)
 					feasible = moveEval != nil
@@ -510,7 +521,7 @@ func evaluateMoveSetsParWithStats(
 	compute consolidationComputer,
 	resultLimit int,
 	accept func(Command) bool,
-	score func(Command) float64,
+	score func(Command) moveSetScoring,
 	stats *moveSetSearchStats,
 ) ([]*moveSetEvaluation, int, bool, *moveSetSearchStats, error) {
 	searchStart := time.Now()
@@ -563,7 +574,7 @@ func evaluateMoveSetWith(
 	compute consolidationComputer,
 	stats *moveSetSearchStats,
 	accept func(Command) bool,
-	score func(Command) float64,
+	score func(Command) moveSetScoring,
 ) *moveSetEvaluation {
 	select {
 	case <-ctx.Done():
@@ -593,14 +604,30 @@ func evaluateMoveSetWith(
 	if accept != nil && !accept(cmd) {
 		return nil
 	}
-	moveSetScore := moveSetPriorityScore(cmd)
+	var scoring moveSetScoring
 	if score != nil {
-		moveSetScore = score(cmd)
+		scoring = score(cmd)
+	} else {
+		baseScore := moveSetPriorityScore(cmd)
+		scoring = moveSetScoring{Score: baseScore, BaseScore: baseScore}
+	}
+	if !scoreBasedMemoryScoreIsValid(scoring) {
+		stats.recordNonPositiveScoreMoveSet()
+		return nil
 	}
 	return &moveSetEvaluation{
-		Command: cmd,
-		Score:   moveSetScore,
+		Command:       cmd,
+		Score:         scoring.Score,
+		BaseScore:     scoring.BaseScore,
+		MemoryBalance: scoring.MemoryBalance,
 	}
+}
+
+func scoreBasedMemoryScoreIsValid(scoring moveSetScoring) bool {
+	if !scoring.MemoryBalance.Enabled {
+		return true
+	}
+	return finiteScoreValue(scoring.Score) && scoring.Score > 0
 }
 
 func collectMoveSetEvaluations(valid <-chan rill.Try[*moveSetEvaluation], limit int) ([]*moveSetEvaluation, error) {

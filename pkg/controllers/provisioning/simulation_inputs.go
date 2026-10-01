@@ -69,6 +69,12 @@ type PreparedSimulationInputs struct {
 	preparedTopology *scheduling.PreparedTopology
 }
 
+// StateNodesSnapshot returns an owned copy of the immutable node snapshot used
+// by every scheduling run created from these inputs.
+func (p *PreparedSimulationInputs) StateNodesSnapshot() state.StateNodes {
+	return cloneStateNodes(p.stateNodes)
+}
+
 // SimulationRun pairs one scheduler with the exact pod copies it was built
 // to solve. The pod slice is private so callers cannot accidentally use a
 // scheduler with pods from another scenario or catalog.
