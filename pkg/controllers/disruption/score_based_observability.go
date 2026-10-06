@@ -24,11 +24,9 @@ import (
 
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
-	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 )
 
@@ -222,23 +220,7 @@ func logScoreBasedCompactionMoveSelected(
 			"sourceNodeCount":      len(cmd.Candidates),
 			"replacementNodeCount": len(cmd.Replacements),
 			"sourceNodes":          sourceNodes,
-			"score": map[string]any{
-				"rankingScore":                        eval.Score,
-				"baseScore":                           eval.BaseScore,
-				"method":                              scoreBasedMoveScoreMethod(eval),
-				"normalizedCost":                      eval.Cost,
-				"costContribution":                    eval.Cost.Contribution,
-				"utilisationContribution":             eval.UtilisationContribution,
-				"memoryBalance":                       eval.MemoryBalance,
-				"memoryBalanceCorrection":             eval.MemoryBalance.Correction,
-				"instanceTypeConcentration":           eval.InstanceTypeConcentration,
-				"instanceTypeConcentrationCorrection": eval.InstanceTypeConcentration.Correction,
-			},
-			"cost": map[string]any{
-				"sourceUSDPerHour":               eval.Cost.SourceUSDPerHour,
-				"estimatedReplacementUSDPerHour": eval.Cost.ReplacementUSDPerHour,
-				"estimatedSavingsUSDPerHour":     eval.Cost.SavingsUSDPerHour,
-			},
+			"score":                newScoreBasedMoveScoreLog(eval.Score, true),
 		},
 		"search", map[string]any{
 			"eligibleCandidateCount": eligibleCandidateCount,
@@ -257,45 +239,182 @@ func logScoreBasedCompactionMoveSelected(
 	)
 }
 
-func scoreBasedSelectedSourceNodeLogs(eval *moveSetEvaluation) []map[string]any {
-	sourceNodes := make([]map[string]any, 0, len(eval.Command.Candidates))
-	for i, candidate := range eval.Command.Candidates {
-		var sourcePrice any
-		if i < len(eval.SourceNodeScores) {
-			sourcePrice = eval.SourceNodeScores[i].PriceUSDPerHour
-		}
-		sourceNode := map[string]any{
-			"nodeName":       candidate.Name(),
-			"nodeClaimName":  candidate.NodeClaim.Name,
-			"nodePoolName":   candidate.NodePool.Name,
-			"instanceType":   candidate.Labels()[corev1.LabelInstanceTypeStable],
-			"capacityType":   candidate.Labels()[v1.CapacityTypeLabelKey],
-			"costUSDPerHour": sourcePrice,
-		}
-		nodeScores := scoreBasedSourceNodeScoreLog(eval, i)
-		if i < len(eval.sourceNodeSingleMoveScores) {
-			nodeScores["singleNodeMoveScore"] = eval.sourceNodeSingleMoveScores[i]
-		}
-		sourceNode["score"] = nodeScores
-		sourceNodes = append(sourceNodes, sourceNode)
-	}
-	return sourceNodes
+type scoreBasedMoveScoreLog struct {
+	Total   float64                       `json:"total"`
+	Factors scoreBasedMoveScoreFactorsLog `json:"factors"`
 }
 
-func scoreBasedMoveScoreMethod(eval *moveSetEvaluation) string {
-	if eval.searchPath != scoreBasedSearchPathBatch {
-		return "joint_move_set_score"
+type scoreBasedMoveScoreFactorsLog struct {
+	Cost                      scoreBasedFactorLog[scoreBasedCostLogDetails]          `json:"cost"`
+	Utilisation               scoreBasedFactorLog[scoreBasedUtilisationLogDetails]   `json:"utilisation"`
+	MemoryBalance             scoreBasedFactorLog[scoreBasedMemoryLogDetails]        `json:"memoryBalance"`
+	InstanceTypeConcentration scoreBasedFactorLog[scoreBasedConcentrationLogDetails] `json:"instanceTypeConcentration"`
+}
+
+type scoreBasedFactorLog[Details any] struct {
+	Contribution float64           `json:"contribution"`
+	Status       scoreFactorStatus `json:"status"`
+	Reason       string            `json:"reason,omitempty"`
+	Details      *Details          `json:"details,omitempty"`
+}
+
+type scoreBasedCostLogDetails struct {
+	Enabled               *bool                                `json:"enabled,omitempty"`
+	Valid                 *bool                                `json:"valid,omitempty"`
+	SourceUSDPerHour      float64                              `json:"sourceUSDPerHour"`
+	SavingsUSDPerHour     float64                              `json:"savingsUSDPerHour"`
+	ReplacementUSDPerHour float64                              `json:"replacementUSDPerHour"`
+	SavingsFraction       *float64                             `json:"savingsFraction,omitempty"`
+	NormalizedSourceCost  *float64                             `json:"normalizedSourceCost,omitempty"`
+	Groups                map[string]scoreBasedPriceGroupScore `json:"groups,omitempty"`
+	Sources               []scoreBasedCostSourceLog            `json:"sources,omitempty"`
+}
+
+type scoreBasedCostSourceLog struct {
+	NodeName              string  `json:"nodeName"`
+	PriceUSDPerHour       float64 `json:"priceUSDPerHour"`
+	AllocatableCPU        float64 `json:"allocatableCPU"`
+	BaselineUSDPerCPUHour float64 `json:"baselineUSDPerCPUHour"`
+	NormalizedSourceCost  float64 `json:"normalizedSourceCost"`
+	Contribution          float64 `json:"contribution"`
+}
+
+type scoreBasedUtilisationLogDetails struct {
+	Sources []scoreBasedUtilisationSourceLog `json:"sources,omitempty"`
+}
+
+type scoreBasedUtilisationSourceLog struct {
+	NodeName       string  `json:"nodeName"`
+	AllocatableCPU float64 `json:"allocatableCPU"`
+	RequestedCPU   float64 `json:"requestedCPU"`
+	SlackFraction  float64 `json:"slackFraction"`
+	Weight         float64 `json:"weight"`
+	Contribution   float64 `json:"contribution"`
+}
+
+type scoreBasedMemoryLogDetails struct {
+	Enabled         bool                                 `json:"enabled"`
+	RemovedCPU      float64                              `json:"removedCPU"`
+	SourceNodeCount int                                  `json:"sourceNodeCount"`
+	Pools           map[string]scoreBasedMemoryPoolScore `json:"pools,omitempty"`
+}
+
+type scoreBasedConcentrationLogDetails struct {
+	Enabled bool                                                    `json:"enabled"`
+	Pools   map[string]scoreBasedInstanceTypeConcentrationPoolScore `json:"pools,omitempty"`
+	Sources []scoreBasedInstanceTypeConcentrationSourceScore        `json:"sources,omitempty"`
+}
+
+type scoreBasedSourceNodeLog struct {
+	NodeName        string   `json:"nodeName"`
+	NodeClaimName   string   `json:"nodeClaimName"`
+	NodePoolName    string   `json:"nodePoolName"`
+	InstanceType    string   `json:"instanceType"`
+	CapacityType    string   `json:"capacityType"`
+	SingleMoveScore *float64 `json:"singleNodeMoveScore,omitempty"`
+}
+
+func newScoreBasedMoveScoreLog(score moveSetScore, includeDetails bool) scoreBasedMoveScoreLog {
+	result := scoreBasedMoveScoreLog{Total: score.Total}
+	factors := score.Factors
+	result.Factors = scoreBasedMoveScoreFactorsLog{
+		Cost: scoreBasedFactorLog[scoreBasedCostLogDetails]{
+			Contribution: factors.Cost.Contribution,
+			Status:       factors.Cost.Status,
+			Reason:       factors.Cost.Reason,
+		},
+		Utilisation: scoreBasedFactorLog[scoreBasedUtilisationLogDetails]{
+			Contribution: factors.Utilisation.Contribution,
+			Status:       factors.Utilisation.Status,
+			Reason:       factors.Utilisation.Reason,
+		},
+		MemoryBalance: scoreBasedFactorLog[scoreBasedMemoryLogDetails]{
+			Contribution: factors.MemoryBalance.Contribution,
+			Status:       factors.MemoryBalance.Status,
+			Reason:       factors.MemoryBalance.Reason,
+		},
+		InstanceTypeConcentration: scoreBasedFactorLog[scoreBasedConcentrationLogDetails]{
+			Contribution: factors.InstanceTypeConcentration.Contribution,
+			Status:       factors.InstanceTypeConcentration.Status,
+			Reason:       factors.InstanceTypeConcentration.Reason,
+		},
 	}
-	if eval.MemoryBalance.Enabled && eval.InstanceTypeConcentration.Enabled {
-		return "additive_base_plus_joint_memory_balance_and_instance_type_concentration"
+	if !includeDetails {
+		result.Factors.Cost.Details = &scoreBasedCostLogDetails{
+			SourceUSDPerHour:      factors.Cost.SourceUSDPerHour,
+			ReplacementUSDPerHour: factors.Cost.ReplacementUSDPerHour,
+			SavingsUSDPerHour:     factors.Cost.SavingsUSDPerHour,
+		}
+		return result
 	}
-	if eval.MemoryBalance.Enabled {
-		return "additive_base_plus_joint_memory_balance"
+
+	costSources := make([]scoreBasedCostSourceLog, 0, len(score.Sources))
+	utilisationSources := make([]scoreBasedUtilisationSourceLog, 0, len(score.Sources))
+	for _, source := range score.Sources {
+		costSources = append(costSources, scoreBasedCostSourceLog{
+			NodeName:              source.NodeName,
+			PriceUSDPerHour:       source.PriceUSDPerHour,
+			AllocatableCPU:        source.AllocatableCPU,
+			BaselineUSDPerCPUHour: source.BaselineUSDPerCPUHour,
+			NormalizedSourceCost:  source.NormalizedSourceCost,
+			Contribution:          source.CostContribution,
+		})
+		utilisationSources = append(utilisationSources, scoreBasedUtilisationSourceLog{
+			NodeName:       source.NodeName,
+			AllocatableCPU: source.AllocatableCPU,
+			RequestedCPU:   source.RequestedCPU,
+			SlackFraction:  source.CPUSlackFraction,
+			Weight:         source.UtilisationWeight,
+			Contribution:   source.UtilisationContribution,
+		})
 	}
-	if eval.InstanceTypeConcentration.Enabled {
-		return "additive_base_plus_instance_type_concentration"
+	enabled := factors.Cost.Enabled
+	valid := factors.Cost.Valid
+	savingsFraction := factors.Cost.SavingsFraction
+	normalizedSourceCost := factors.Cost.NormalizedSourceCost
+	result.Factors.Cost.Details = &scoreBasedCostLogDetails{
+		Enabled:               &enabled,
+		Valid:                 &valid,
+		SourceUSDPerHour:      factors.Cost.SourceUSDPerHour,
+		SavingsUSDPerHour:     factors.Cost.SavingsUSDPerHour,
+		ReplacementUSDPerHour: factors.Cost.ReplacementUSDPerHour,
+		SavingsFraction:       &savingsFraction,
+		NormalizedSourceCost:  &normalizedSourceCost,
+		Groups:                factors.Cost.Groups,
+		Sources:               costSources,
 	}
-	return "additive_single_node_scores"
+	result.Factors.Utilisation.Details = &scoreBasedUtilisationLogDetails{Sources: utilisationSources}
+	result.Factors.MemoryBalance.Details = &scoreBasedMemoryLogDetails{
+		Enabled:         factors.MemoryBalance.Enabled,
+		RemovedCPU:      factors.MemoryBalance.RemovedCPU,
+		SourceNodeCount: factors.MemoryBalance.SourceNodeCount,
+		Pools:           factors.MemoryBalance.Pools,
+	}
+	result.Factors.InstanceTypeConcentration.Details = &scoreBasedConcentrationLogDetails{
+		Enabled: factors.InstanceTypeConcentration.Enabled,
+		Pools:   factors.InstanceTypeConcentration.Pools,
+		Sources: factors.InstanceTypeConcentration.SourceNodes,
+	}
+	return result
+}
+
+func scoreBasedSelectedSourceNodeLogs(eval *moveSetEvaluation) []scoreBasedSourceNodeLog {
+	sourceNodes := make([]scoreBasedSourceNodeLog, 0, len(eval.Score.Sources))
+	for i, source := range eval.Score.Sources {
+		node := scoreBasedSourceNodeLog{
+			NodeName:      source.NodeName,
+			NodeClaimName: source.NodeClaimName,
+			NodePoolName:  source.NodePoolName,
+			InstanceType:  source.InstanceType,
+			CapacityType:  source.CapacityType,
+		}
+		if i < len(eval.sourceNodeSingleMoveScores) {
+			singleMoveScore := eval.sourceNodeSingleMoveScores[i]
+			node.SingleMoveScore = &singleMoveScore
+		}
+		sourceNodes = append(sourceNodes, node)
+	}
+	return sourceNodes
 }
 
 func scoreBasedSelectionReason(selectedEvalIdx int) string {
@@ -316,46 +435,23 @@ func scoreBasedAlternativeLogs(evals []*moveSetEvaluation, selectedEvalIdx int) 
 	return alternatives
 }
 
-func scoreBasedSourceNodeScoreLog(eval *moveSetEvaluation, sourceIndex int) map[string]any {
-	if eval == nil || sourceIndex >= len(eval.SourceNodeScores) {
-		return map[string]any{}
-	}
-	score := eval.SourceNodeScores[sourceIndex]
-	return map[string]any{
-		"allocatableCPU":            score.AllocatableCPU,
-		"requestedCPU":              score.RequestedCPU,
-		"baselineUSDPerCPUHour":     score.BaselineUSDPerCPUHour,
-		"normalizedSourceCost":      score.NormalizedSourceCost,
-		"costContribution":          score.CostContribution,
-		"cpuSlackFraction":          score.CPUSlackFraction,
-		"utilisationWeight":         score.UtilisationWeight,
-		"utilisationContribution":   score.UtilisationContribution,
-		"instanceTypeConcentration": score.InstanceTypeConcentration,
-	}
-}
-
 func scoreBasedAlternativeLog(eval *moveSetEvaluation, rank int) map[string]any {
-	sourceNodes := make([]map[string]any, 0, len(eval.Command.Candidates))
-	for _, candidate := range eval.Command.Candidates {
-		sourceNodes = append(sourceNodes, map[string]any{"nodeName": candidate.Name()})
+	sourceNodes := make([]scoreBasedSourceNodeLog, 0, len(eval.Score.Sources))
+	for _, source := range eval.Score.Sources {
+		sourceNodes = append(sourceNodes, scoreBasedSourceNodeLog{
+			NodeName:      source.NodeName,
+			NodeClaimName: source.NodeClaimName,
+			NodePoolName:  source.NodePoolName,
+			InstanceType:  source.InstanceType,
+			CapacityType:  source.CapacityType,
+		})
 	}
 	return map[string]any{
-		"rank":                       rank,
-		"searchPath":                 eval.searchPath,
-		"simulatedDecision":          eval.Command.Decision(),
-		"sourceNodes":                sourceNodes,
-		"estimatedSavingsUSDPerHour": eval.Cost.SavingsUSDPerHour,
-		"score": map[string]any{
-			"rankingScore":                        eval.Score,
-			"costContribution":                    eval.Cost.Contribution,
-			"utilisationContribution":             eval.UtilisationContribution,
-			"memoryBalanceCorrection":             eval.MemoryBalance.Correction,
-			"instanceTypeConcentrationCorrection": eval.InstanceTypeConcentration.Correction,
-		},
-		"memoryBalance": map[string]any{
-			"status": eval.MemoryBalance.Status,
-			"reason": eval.MemoryBalance.Reason,
-		},
+		"rank":              rank,
+		"searchPath":        eval.searchPath,
+		"simulatedDecision": eval.Command.Decision(),
+		"sourceNodes":       sourceNodes,
+		"score":             newScoreBasedMoveScoreLog(eval.Score, false),
 		"validation": map[string]any{
 			"status": selectedValidationStatus(eval),
 			"reason": eval.validationReason,

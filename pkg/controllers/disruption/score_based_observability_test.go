@@ -51,7 +51,6 @@ func TestLogScoreBasedCompactionMoveSelectedJSON(t *testing.T) {
 		score           float64
 		singleScores    []float64
 		selectedIndex   int
-		wantMethod      string
 		wantDecision    string
 		wantSourceCost  float64
 		wantSavings     float64
@@ -61,7 +60,7 @@ func TestLogScoreBasedCompactionMoveSelectedJSON(t *testing.T) {
 			name:    "single node search",
 			path:    scoreBasedSearchPathSingleNode,
 			command: Command{Candidates: []*Candidate{first}},
-			score:   7.5, singleScores: []float64{7.5}, wantMethod: "joint_move_set_score",
+			score:   7.5, singleScores: []float64{7.5},
 			wantDecision: "delete", wantSourceCost: 2, wantSavings: 2,
 		},
 		{
@@ -69,7 +68,7 @@ func TestLogScoreBasedCompactionMoveSelectedJSON(t *testing.T) {
 			path:    scoreBasedSearchPathBatch,
 			command: Command{Candidates: []*Candidate{first, second, third, fourth}},
 			score:   18, singleScores: []float64{6, 5, 4, 3}, selectedIndex: 1,
-			wantMethod: "additive_single_node_scores", wantDecision: "delete", wantSourceCost: 7.3, wantSavings: 7.3,
+			wantDecision: "delete", wantSourceCost: 7.3, wantSavings: 7.3,
 		},
 		{
 			name: "two to one pair search omits singleton score",
@@ -81,30 +80,49 @@ func TestLogScoreBasedCompactionMoveSelectedJSON(t *testing.T) {
 					NodeClaimTemplate: pscheduling.NodeClaimTemplate{InstanceTypeOptions: cloudprovider.InstanceTypes{replacementType}},
 				}}},
 			},
-			score: 8, wantMethod: "joint_move_set_score", wantDecision: "replace",
+			score: 8, wantDecision: "replace",
 			wantSourceCost: 5, wantSavings: 3.75, wantReplacement: 1.25,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			sources := make([]scoreBasedSourceScore, 0, len(tc.command.Candidates))
+			for _, candidate := range tc.command.Candidates {
+				sources = append(sources, scoreBasedSourceScore{
+					NodeName:        candidate.Name(),
+					NodeClaimName:   candidate.NodeClaim.Name,
+					NodePoolName:    candidate.NodePool.Name,
+					InstanceType:    candidate.Labels()[corev1.LabelInstanceTypeStable],
+					CapacityType:    candidate.Labels()[v1.CapacityTypeLabelKey],
+					PriceUSDPerHour: candidate.Price,
+				})
+			}
 			eval := &moveSetEvaluation{
 				Command: tc.command,
-				Score:   tc.score,
-				Cost: scoreBasedCostScore{
-					SourceUSDPerHour:      tc.wantSourceCost,
-					SavingsUSDPerHour:     tc.wantSavings,
-					ReplacementUSDPerHour: tc.wantReplacement,
+				Score: moveSetScore{
+					Total: tc.score,
+					Factors: moveSetScoreFactors{
+						Cost: scoreBasedCostScore{
+							Enabled:               true,
+							Valid:                 true,
+							Status:                scoreFactorApplied,
+							Contribution:          tc.score,
+							SourceUSDPerHour:      tc.wantSourceCost,
+							SavingsUSDPerHour:     tc.wantSavings,
+							ReplacementUSDPerHour: tc.wantReplacement,
+						},
+						Utilisation:               scoreBasedUtilisationScore{Status: scoreFactorDisabled},
+						MemoryBalance:             scoreBasedMemoryScore{Status: scoreFactorDisabled},
+						InstanceTypeConcentration: scoreBasedInstanceTypeConcentrationScore{Status: scoreFactorDisabled},
+					},
+					Sources: sources,
 				},
-				SourceNodeScores:           make([]scoreBasedSourceScore, len(tc.command.Candidates)),
 				searchPath:                 tc.path,
 				sourceNodeSingleMoveScores: tc.singleScores,
 			}
-			for i, candidate := range tc.command.Candidates {
-				eval.SourceNodeScores[i].PriceUSDPerHour = candidate.Price
-			}
 			evals := []*moveSetEvaluation{eval}
 			if tc.selectedIndex > 0 {
-				evals = append([]*moveSetEvaluation{{Command: Command{Candidates: []*Candidate{first}}, Score: 100}}, evals...)
+				evals = append([]*moveSetEvaluation{{Command: Command{Candidates: []*Candidate{first}}, Score: moveSetScore{Total: 100}}}, evals...)
 			}
 
 			var output bytes.Buffer
@@ -133,12 +151,17 @@ func TestLogScoreBasedCompactionMoveSelectedJSON(t *testing.T) {
 				t.Errorf("move source/replacement counts = %v/%v, want %d/%d", move["sourceNodeCount"], move["replacementNodeCount"], len(tc.command.Candidates), len(tc.command.Replacements))
 			}
 			score := nestedLogMap(t, move, "score")
-			if score["rankingScore"] != tc.score || score["method"] != tc.wantMethod {
-				t.Errorf("move score = %v, want value %v and method %q", score, tc.score, tc.wantMethod)
+			if score["total"] != tc.score {
+				t.Errorf("move score = %v, want total %v", score, tc.score)
 			}
-			cost := nestedLogMap(t, move, "cost")
-			if cost["sourceUSDPerHour"] != tc.wantSourceCost || cost["estimatedSavingsUSDPerHour"] != tc.wantSavings || cost["estimatedReplacementUSDPerHour"] != tc.wantReplacement {
-				t.Errorf("move cost = %v, want source/savings/replacement %v/%v/%v", cost, tc.wantSourceCost, tc.wantSavings, tc.wantReplacement)
+			factors := nestedLogMap(t, score, "factors")
+			cost := nestedLogMap(t, factors, "cost")
+			if cost["contribution"] != tc.score || cost["status"] != string(scoreFactorApplied) {
+				t.Errorf("move cost factor = %v, want contribution/status %v/%s", cost, tc.score, scoreFactorApplied)
+			}
+			costDetails := nestedLogMap(t, cost, "details")
+			if costDetails["sourceUSDPerHour"] != tc.wantSourceCost || costDetails["savingsUSDPerHour"] != tc.wantSavings || costDetails["replacementUSDPerHour"] != tc.wantReplacement {
+				t.Errorf("move cost details = %v, want source/savings/replacement %v/%v/%v", costDetails, tc.wantSourceCost, tc.wantSavings, tc.wantReplacement)
 			}
 			nodes, ok := move["sourceNodes"].([]any)
 			if !ok || len(nodes) != len(tc.command.Candidates) {
@@ -146,19 +169,20 @@ func TestLogScoreBasedCompactionMoveSelectedJSON(t *testing.T) {
 			}
 			for i, candidate := range tc.command.Candidates {
 				node := nodes[i].(map[string]any)
-				if node["nodeName"] != candidate.Name() || node["nodeClaimName"] != candidate.NodeClaim.Name || node["nodePoolName"] != candidate.NodePool.Name || node["instanceType"] != candidate.Labels()[corev1.LabelInstanceTypeStable] || node["capacityType"] != candidate.Labels()[v1.CapacityTypeLabelKey] || node["costUSDPerHour"] != candidate.Price {
+				if node["nodeName"] != candidate.Name() || node["nodeClaimName"] != candidate.NodeClaim.Name || node["nodePoolName"] != candidate.NodePool.Name || node["instanceType"] != candidate.Labels()[corev1.LabelInstanceTypeStable] || node["capacityType"] != candidate.Labels()[v1.CapacityTypeLabelKey] {
 					t.Errorf("sourceNodes[%d] = %v, missing expected identity/type/cost for %s", i, node, candidate.Name())
 				}
-				nodeScore := nestedLogMap(t, node, "score")
-				if _, exists := nodeScore["searchPriorityScore"]; exists {
-					t.Errorf("sourceNodes[%d] unexpectedly logs searchPriorityScore: %v", i, nodeScore)
+				costSources := nestedLogMap(t, nestedLogMap(t, factors, "cost"), "details")["sources"].([]any)
+				costSource := costSources[i].(map[string]any)
+				if costSource["priceUSDPerHour"] != candidate.Price {
+					t.Errorf("score.factors.cost.details.sources[%d] price = %v, want captured %v", i, costSource["priceUSDPerHour"], candidate.Price)
 				}
 				if i < len(tc.singleScores) {
-					if nodeScore["singleNodeMoveScore"] != tc.singleScores[i] {
-						t.Errorf("sourceNodes[%d].score.singleNodeMoveScore = %v, want %v", i, nodeScore["singleNodeMoveScore"], tc.singleScores[i])
+					if node["singleNodeMoveScore"] != tc.singleScores[i] {
+						t.Errorf("sourceNodes[%d].singleNodeMoveScore = %v, want %v", i, node["singleNodeMoveScore"], tc.singleScores[i])
 					}
-				} else if _, exists := nodeScore["singleNodeMoveScore"]; exists {
-					t.Errorf("sourceNodes[%d] unexpectedly has singleNodeMoveScore: %v", i, nodeScore)
+				} else if _, exists := node["singleNodeMoveScore"]; exists {
+					t.Errorf("sourceNodes[%d] unexpectedly has singleNodeMoveScore: %v", i, node)
 				}
 			}
 			search := nestedLogMap(t, record, "search")
@@ -181,8 +205,8 @@ func TestGrowScoreBasedBatchesRetainsOriginalSingletonScoresInCommandOrder(t *te
 	first := scoreBasedLogTestCandidate("node-a", "claim-a", "pool-a", "m5.large", v1.CapacityTypeOnDemand, 2)
 	second := scoreBasedLogTestCandidate("node-b", "claim-b", "pool-a", "c6i.large", v1.CapacityTypeSpot, 3)
 	singletons := []*moveSetEvaluation{
-		{Command: Command{Candidates: []*Candidate{first}}, Score: 4},
-		{Command: Command{Candidates: []*Candidate{second}}, Score: 3},
+		{Command: Command{Candidates: []*Candidate{first}}, Score: scoreBasedLogTestScore(4)},
+		{Command: Command{Candidates: []*Candidate{second}}, Score: scoreBasedLogTestScore(3)},
 	}
 	compute := func(_ context.Context, candidates ...*Candidate) (Command, error) {
 		if len(candidates) == 1 {
@@ -190,7 +214,8 @@ func TestGrowScoreBasedBatchesRetainsOriginalSingletonScoresInCommandOrder(t *te
 		}
 		return Command{Candidates: []*Candidate{second, first}}, nil
 	}
-	batches, _, timedOut, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool-a": 2}, nil, compute, &moveSetSearchStats{})
+	score := func(Command) moveSetScore { return scoreBasedLogTestScore(10) }
+	batches, _, timedOut, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool-a": 2}, nil, compute, &moveSetSearchStats{}, score)
 	if err != nil || timedOut {
 		t.Fatalf("growScoreBasedBatches() error/timedOut = %v/%v, want nil/false", err, timedOut)
 	}
@@ -201,11 +226,23 @@ func TestGrowScoreBasedBatchesRetainsOriginalSingletonScoresInCommandOrder(t *te
 	if batch.searchPath != scoreBasedSearchPathBatch {
 		t.Errorf("batch searchPath = %q, want %q", batch.searchPath, scoreBasedSearchPathBatch)
 	}
-	if batch.Score != 7 {
-		t.Errorf("batch ranking score = %v, want sum of original singleton scores 7", batch.Score)
+	if batch.Score.Total != 10 {
+		t.Errorf("batch ranking score = %v, want joint scorer result 10", batch.Score.Total)
 	}
 	if len(batch.sourceNodeSingleMoveScores) != 2 || batch.sourceNodeSingleMoveScores[0] != 3 || batch.sourceNodeSingleMoveScores[1] != 4 {
 		t.Errorf("batch source-node singleton scores = %v, want [3 4] in returned command order", batch.sourceNodeSingleMoveScores)
+	}
+}
+
+func scoreBasedLogTestScore(total float64) moveSetScore {
+	return moveSetScore{
+		Total: total,
+		Factors: moveSetScoreFactors{
+			Cost:                      scoreBasedCostScore{Enabled: true, Valid: true, Status: scoreFactorApplied, Contribution: total},
+			Utilisation:               scoreBasedUtilisationScore{Status: scoreFactorDisabled},
+			MemoryBalance:             scoreBasedMemoryScore{Status: scoreFactorDisabled},
+			InstanceTypeConcentration: scoreBasedInstanceTypeConcentrationScore{Status: scoreFactorDisabled},
+		},
 	}
 }
 

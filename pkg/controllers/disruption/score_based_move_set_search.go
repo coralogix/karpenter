@@ -50,12 +50,12 @@ func growScoreBasedBatches(
 	pace *UnderutilizedConsolidationPace,
 	compute consolidationComputer,
 	stats *moveSetSearchStats,
-	scorers ...func(Command) moveSetScoring,
+	score func(Command) moveSetScore,
 ) ([]*moveSetEvaluation, int, bool, error) {
 	if len(singletons) < 2 {
 		return nil, 0, false, nil
 	}
-	sort.Slice(singletons, func(i, j int) bool { return singletons[i].Score > singletons[j].Score })
+	sort.Slice(singletons, func(i, j int) bool { return singletons[i].Score.Total > singletons[j].Score.Total })
 	seeds := make([]*moveSetEvaluation, 0, scoreBasedBatchSeedLimit)
 	seedKeys := map[string]struct{}{}
 	for _, singleton := range singletons {
@@ -76,7 +76,7 @@ func growScoreBasedBatches(
 	scoreByCandidate := make(map[string]float64, len(singletons))
 	for _, singleton := range singletons {
 		if len(singleton.Command.Candidates) == 1 {
-			scoreByCandidate[candidateMoveSetKey(singleton.Command.Candidates)] = singleton.Score
+			scoreByCandidate[candidateMoveSetKey(singleton.Command.Candidates)] = singleton.Score.Total
 		}
 	}
 	var bestBatches []*moveSetEvaluation
@@ -87,11 +87,6 @@ func growScoreBasedBatches(
 	attempted := 0
 	const perSeedAttemptLimit = 256
 	searchStart := time.Now()
-	var scorer func(Command) moveSetScoring
-	if len(scorers) > 0 {
-		scorer = scorers[0]
-	}
-
 	retainBatch := func(eval *moveSetEvaluation) {
 		if eval == nil {
 			return
@@ -102,11 +97,11 @@ func growScoreBasedBatches(
 		}
 		retainedSets[key] = struct{}{}
 		if smallestBatch == nil || len(eval.Command.Candidates) < len(smallestBatch.Command.Candidates) ||
-			(len(eval.Command.Candidates) == len(smallestBatch.Command.Candidates) && eval.Score > smallestBatch.Score) {
+			(len(eval.Command.Candidates) == len(smallestBatch.Command.Candidates) && eval.Score.Total > smallestBatch.Score.Total) {
 			smallestBatch = eval
 		}
 		bestBatches = append(bestBatches, eval)
-		sort.Slice(bestBatches, func(i, j int) bool { return bestBatches[i].Score > bestBatches[j].Score })
+		sort.Slice(bestBatches, func(i, j int) bool { return bestBatches[i].Score.Total > bestBatches[j].Score.Total })
 		if len(bestBatches) > scoreBasedMoveSetResultLimit {
 			bestBatches = bestBatches[:scoreBasedMoveSetResultLimit]
 		}
@@ -145,16 +140,7 @@ func growScoreBasedBatches(
 					attempted++
 					moveEval := evaluateMoveSetWith(ctx, moveSet{Nodes: trial}, compute, stats,
 						func(cmd Command) bool { return len(cmd.Candidates) == len(trial) && len(cmd.Replacements) == 0 },
-						func(cmd Command) moveSetScoring {
-							if scorer != nil {
-								return scorer(cmd)
-							}
-							var total float64
-							for _, member := range trial {
-								total += scoreByCandidate[candidateMoveSetKey([]*Candidate{member})]
-							}
-							return moveSetScoring{Score: total, BaseScore: total}
-						},
+						score,
 					)
 					feasible = moveEval != nil
 					seenSets[key] = feasible
@@ -216,7 +202,7 @@ func retainScoreBasedMoveSetResults(singles, batches []*moveSetEvaluation, limit
 			continue
 		}
 		if smallestBatch == nil || len(batch.Command.Candidates) < len(smallestBatch.Command.Candidates) ||
-			(len(batch.Command.Candidates) == len(smallestBatch.Command.Candidates) && batch.Score > smallestBatch.Score) {
+			(len(batch.Command.Candidates) == len(smallestBatch.Command.Candidates) && batch.Score.Total > smallestBatch.Score.Total) {
 			smallestBatch = batch
 		}
 	}
@@ -231,7 +217,7 @@ func retainScoreBasedMoveSetResults(singles, batches []*moveSetEvaluation, limit
 		if len(single.Command.Candidates) != 1 {
 			continue
 		}
-		if bestSingleton == nil || single.Score > bestSingleton.Score {
+		if bestSingleton == nil || single.Score.Total > bestSingleton.Score.Total {
 			bestSingleton = single
 		}
 	}
@@ -247,7 +233,7 @@ func retainScoreBasedMoveSetResults(singles, batches []*moveSetEvaluation, limit
 				occurrences++
 			}
 		}
-		if occurrences < bestIndependentOccurrences || (occurrences == bestIndependentOccurrences && (independentSingleton == nil || single.Score > independentSingleton.Score)) {
+		if occurrences < bestIndependentOccurrences || (occurrences == bestIndependentOccurrences && (independentSingleton == nil || single.Score.Total > independentSingleton.Score.Total)) {
 			bestIndependentOccurrences = occurrences
 			independentSingleton = single
 		}
@@ -272,7 +258,7 @@ func retainScoreBasedMoveSetResults(singles, batches []*moveSetEvaluation, limit
 		reserved := append([]*moveSetEvaluation(nil), selected...)
 		selected = selected[:0]
 		add(bestSingleton)
-		sort.Slice(reserved, func(i, j int) bool { return reserved[i].Score > reserved[j].Score })
+		sort.Slice(reserved, func(i, j int) bool { return reserved[i].Score.Total > reserved[j].Score.Total })
 		for _, eval := range reserved {
 			if len(selected) >= limit {
 				break
@@ -281,14 +267,14 @@ func retainScoreBasedMoveSetResults(singles, batches []*moveSetEvaluation, limit
 		}
 	}
 	combined := append(append([]*moveSetEvaluation(nil), singles...), batches...)
-	sort.Slice(combined, func(i, j int) bool { return combined[i].Score > combined[j].Score })
+	sort.Slice(combined, func(i, j int) bool { return combined[i].Score.Total > combined[j].Score.Total })
 	for _, eval := range combined {
 		if len(selected) >= limit {
 			break
 		}
 		add(eval)
 	}
-	sort.Slice(selected, func(i, j int) bool { return selected[i].Score > selected[j].Score })
+	sort.Slice(selected, func(i, j int) bool { return selected[i].Score.Total > selected[j].Score.Total })
 	return selected
 }
 
@@ -499,16 +485,6 @@ func (r scoreBasedSearchEventRecorder) Publish(evts ...events.Event) {
 	}
 }
 
-func evaluateMoveSetsPar(
-	ctx context.Context,
-	moveSets []moveSet,
-	deadline time.Time,
-	compute consolidationComputer,
-	score func(Command) moveSetScoring,
-) ([]*moveSetEvaluation, int, bool, *moveSetSearchStats, error) {
-	return evaluateMoveSetsParWithStats(ctx, moveSets, deadline, compute, scoreBasedMoveSetResultLimit, nil, score, nil)
-}
-
 func evaluateMoveSetsParWithStats(
 	ctx context.Context,
 	moveSets []moveSet,
@@ -516,7 +492,7 @@ func evaluateMoveSetsParWithStats(
 	compute consolidationComputer,
 	resultLimit int,
 	accept func(Command) bool,
-	score func(Command) moveSetScoring,
+	score func(Command) moveSetScore,
 	stats *moveSetSearchStats,
 ) ([]*moveSetEvaluation, int, bool, *moveSetSearchStats, error) {
 	searchStart := time.Now()
@@ -569,7 +545,7 @@ func evaluateMoveSetWith(
 	compute consolidationComputer,
 	stats *moveSetSearchStats,
 	accept func(Command) bool,
-	score func(Command) moveSetScoring,
+	score func(Command) moveSetScore,
 ) *moveSetEvaluation {
 	select {
 	case <-ctx.Done():
@@ -599,34 +575,15 @@ func evaluateMoveSetWith(
 	if accept != nil && !accept(cmd) {
 		return nil
 	}
-	var scoring moveSetScoring
-	if score != nil {
-		scoring = score(cmd)
-	} else {
-		baseScore, costScore := scoreMoveSetPriority(cmd, nil)
-		scoring = moveSetScoring{Score: baseScore, BaseScore: baseScore, Cost: costScore}
-	}
+	scoring := score(cmd)
 	if !scoreBasedMoveSetScoreIsValid(scoring) {
 		stats.recordNonPositiveScoreMoveSet()
 		return nil
 	}
 	return &moveSetEvaluation{
-		Command:                   cmd,
-		Score:                     scoring.Score,
-		BaseScore:                 scoring.BaseScore,
-		Cost:                      scoring.Cost,
-		MemoryBalance:             scoring.MemoryBalance,
-		InstanceTypeConcentration: scoring.InstanceTypeConcentration,
-		SourceNodeScores:          scoring.SourceNodeScores,
-		UtilisationContribution:   scoring.UtilisationContribution,
+		Command: cmd,
+		Score:   scoring,
 	}
-}
-
-func scoreBasedMoveSetScoreIsValid(scoring moveSetScoring) bool {
-	if scoring.Cost.Enabled && !scoring.Cost.Valid {
-		return false
-	}
-	return finiteScoreValue(scoring.Score) && scoring.Score > 0
 }
 
 func collectMoveSetEvaluations(valid <-chan rill.Try[*moveSetEvaluation], limit int) ([]*moveSetEvaluation, error) {
@@ -640,7 +597,7 @@ func collectMoveSetEvaluations(valid <-chan rill.Try[*moveSetEvaluation], limit 
 		evals = append(evals, a.Value)
 	}
 	sort.Slice(evals, func(i, j int) bool {
-		return evals[i].Score > evals[j].Score
+		return evals[i].Score.Total > evals[j].Score.Total
 	})
 	if limit > 0 && len(evals) > limit {
 		evals = evals[:limit]

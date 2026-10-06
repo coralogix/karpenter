@@ -391,7 +391,7 @@ func TestMoveSetSearchStats(t *testing.T) {
 	}
 }
 
-func TestMoveSetPriorityScore(t *testing.T) {
+func TestMoveSetScorerCombinesNormalizedCostAndUtilisation(t *testing.T) {
 	lowPriceCandidate := candidateWithPrice(t, 0.10)
 	highPriceCandidate := candidateWithPrice(t, 0.50)
 	lowPriceCandidate.NodePool = &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "pool"}}
@@ -410,11 +410,13 @@ func TestMoveSetPriorityScore(t *testing.T) {
 	}
 
 	lowCmd := Command{Candidates: []*Candidate{lowPriceCandidate}}
-	if got := moveSetPriorityScore(lowCmd, prices); math.Abs(got-(1+1.0/3.0)) > 1e-9 {
+	configs := scoreBasedScoringConfig{"pool": {utilisationWeight: defaultScoreBasedUtilisationWeight}}
+	scorer := newMoveSetScorer(prices, configs, nil, newScoreBasedInstanceTypeConcentrationSnapshot(nil, configs))
+	if got := scorer.Score(lowCmd).Total; math.Abs(got-(1+1.0/3.0)) > 1e-9 {
 		t.Fatalf("single-node move set score = %v, want normalized cost 1/3 plus utilization 1", got)
 	}
 	multiCmd := Command{Candidates: []*Candidate{lowPriceCandidate, highPriceCandidate}}
-	if got := moveSetPriorityScore(multiCmd, prices); got != 4 {
+	if got := scorer.Score(multiCmd).Total; got != 4 {
 		t.Fatalf("multi-node move set score = %v, want normalized cost 2 plus utilization 2", got)
 	}
 }
@@ -449,9 +451,26 @@ func TestGrowScoreBasedBatchesUsesAdditiveSingleScoresAndRequiresZeroReplacement
 	second := scoreBasedBatchTestCandidate("second", "pool")
 	third := scoreBasedBatchTestCandidate("third", "pool")
 	singletons := []*moveSetEvaluation{
-		{Command: Command{Candidates: []*Candidate{first}}, Score: 4},
-		{Command: Command{Candidates: []*Candidate{second}}, Score: 3},
-		{Command: Command{Candidates: []*Candidate{third}}, Score: 2},
+		{Command: Command{Candidates: []*Candidate{first}}, Score: moveSetScore{Total: 4}},
+		{Command: Command{Candidates: []*Candidate{second}}, Score: moveSetScore{Total: 3}},
+		{Command: Command{Candidates: []*Candidate{third}}, Score: moveSetScore{Total: 2}},
+	}
+	singletonScores := map[string]float64{
+		candidateMoveSetKey([]*Candidate{first}):  4,
+		candidateMoveSetKey([]*Candidate{second}): 3,
+		candidateMoveSetKey([]*Candidate{third}):  2,
+	}
+	scoreAdditiveFixture := func(command Command) moveSetScore {
+		var total float64
+		for _, candidate := range command.Candidates {
+			total += singletonScores[candidateMoveSetKey([]*Candidate{candidate})]
+		}
+		return moveSetScore{Total: total, Factors: moveSetScoreFactors{
+			Cost:                      scoreBasedCostScore{Enabled: true, Valid: true, Status: scoreFactorApplied, Contribution: total},
+			Utilisation:               scoreBasedUtilisationScore{Status: scoreFactorDisabled, Reason: "test_score_not_calculated"},
+			MemoryBalance:             scoreBasedMemoryScore{Status: scoreFactorDisabled, Reason: "test_score_not_calculated"},
+			InstanceTypeConcentration: scoreBasedInstanceTypeConcentrationScore{Status: scoreFactorDisabled, Reason: "test_score_not_calculated"},
+		}}
 	}
 	compute := func(_ context.Context, candidates ...*Candidate) (Command, error) {
 		if len(candidates) == 1 {
@@ -460,7 +479,7 @@ func TestGrowScoreBasedBatchesUsesAdditiveSingleScoresAndRequiresZeroReplacement
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "result-marker", Namespace: "default"}}
 		return Command{Candidates: candidates, Results: pscheduling.Results{PodErrors: map[*corev1.Pod]error{pod: fmt.Errorf("retained simulation result")}}}, nil
 	}
-	batches, _, timedOut, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 3}, nil, compute, &moveSetSearchStats{})
+	batches, _, timedOut, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 3}, nil, compute, &moveSetSearchStats{}, scoreAdditiveFixture)
 	if err != nil || timedOut {
 		t.Fatalf("growScoreBasedBatches() error/timedOut = %v/%v, want nil/false", err, timedOut)
 	}
@@ -476,7 +495,7 @@ func TestGrowScoreBasedBatchesUsesAdditiveSingleScoresAndRequiresZeroReplacement
 		}
 		return Command{Candidates: candidates}, nil
 	}
-	withoutZeroReplacement, _, _, err := growScoreBasedBatches(context.Background(), singletons[:2], map[string]int{"pool": 2}, nil, replacementCompute, &moveSetSearchStats{})
+	withoutZeroReplacement, _, _, err := growScoreBasedBatches(context.Background(), singletons[:2], map[string]int{"pool": 2}, nil, replacementCompute, &moveSetSearchStats{}, scoreAdditiveFixture)
 	if err != nil {
 		t.Fatalf("growScoreBasedBatches() with replacement error = %v", err)
 	}
@@ -493,8 +512,8 @@ func assertAdditiveBatchResults(t *testing.T, batches []*moveSetEvaluation, scor
 		for _, candidate := range batch.Command.Candidates {
 			wantScore += scoreByCandidate[candidateMoveSetKey([]*Candidate{candidate})]
 		}
-		if batch.Score != wantScore {
-			t.Errorf("batch score = %v, want sum of singleton scores %v", batch.Score, wantScore)
+		if batch.Score.Total != wantScore {
+			t.Errorf("batch score = %v, want sum of singleton scores %v", batch.Score.Total, wantScore)
 		}
 		if len(batch.Command.Results.PodErrors) != 1 {
 			t.Errorf("batch scheduling result PodErrors = %v, want retained simulation result", batch.Command.Results.PodErrors)
@@ -515,8 +534,8 @@ func TestScoreBasedBatchPlanningEnforcesBudgetsPacingAndDeadline(t *testing.T) {
 	first := scoreBasedBatchTestCandidate("first", "pool")
 	second := scoreBasedBatchTestCandidate("second", "pool")
 	singletons := []*moveSetEvaluation{
-		{Command: Command{Candidates: []*Candidate{first}}, Score: 2},
-		{Command: Command{Candidates: []*Candidate{second}}, Score: 1},
+		{Command: Command{Candidates: []*Candidate{first}}, Score: moveSetScore{Total: 2}},
+		{Command: Command{Candidates: []*Candidate{second}}, Score: moveSetScore{Total: 1}},
 	}
 	computeCalls := 0
 	compute := func(_ context.Context, candidates ...*Candidate) (Command, error) {
@@ -524,7 +543,7 @@ func TestScoreBasedBatchPlanningEnforcesBudgetsPacingAndDeadline(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	batches, attempted, _, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 1}, nil, compute, &moveSetSearchStats{})
+	batches, attempted, _, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 1}, nil, compute, &moveSetSearchStats{}, sourcePriceSearchTestScore)
 	if err != nil {
 		t.Fatalf("budget-limited batch search error = %v", err)
 	}
@@ -540,7 +559,7 @@ func TestScoreBasedBatchPlanningEnforcesBudgetsPacingAndDeadline(t *testing.T) {
 	second.reschedulablePods = nil
 	second.NodePool = first.NodePool
 	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
-	batches, attempted, _, err = growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 2}, pace, compute, &moveSetSearchStats{})
+	batches, attempted, _, err = growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 2}, pace, compute, &moveSetSearchStats{}, sourcePriceSearchTestScore)
 	if err != nil {
 		t.Fatalf("pace-limited batch search error = %v", err)
 	}
@@ -550,7 +569,7 @@ func TestScoreBasedBatchPlanningEnforcesBudgetsPacingAndDeadline(t *testing.T) {
 
 	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
-	_, _, timedOut, err := growScoreBasedBatches(expired, singletons, map[string]int{"pool": 2}, nil, compute, &moveSetSearchStats{})
+	_, _, timedOut, err := growScoreBasedBatches(expired, singletons, map[string]int{"pool": 2}, nil, compute, &moveSetSearchStats{}, sourcePriceSearchTestScore)
 	if err != nil || !timedOut {
 		t.Fatalf("expired batch search error/timedOut = %v/%v, want nil/true", err, timedOut)
 	}
@@ -585,14 +604,14 @@ func TestScoreBasedPairSearchSamplesUniqueBoundedPairs(t *testing.T) {
 
 func TestRetainScoreBasedMoveSetResultsKeepsBestSingletonAndSmallBatchWithinLimit(t *testing.T) {
 	single := scoreBasedBatchTestCandidate("best-single", "pool")
-	singles := []*moveSetEvaluation{{Command: Command{Candidates: []*Candidate{single}}, Score: 100}}
+	singles := []*moveSetEvaluation{{Command: Command{Candidates: []*Candidate{single}}, Score: moveSetScore{Total: 100}}}
 	var batches []*moveSetEvaluation
 	for i := 0; i < 12; i++ {
 		candidates := make([]*Candidate, 0, i+2)
 		for j := 0; j < i+2; j++ {
 			candidates = append(candidates, scoreBasedBatchTestCandidate(fmt.Sprintf("batch-%d-node-%d", i, j), fmt.Sprintf("pool-%d", i)))
 		}
-		batches = append(batches, &moveSetEvaluation{Command: Command{Candidates: candidates}, Score: float64(1000 + i)})
+		batches = append(batches, &moveSetEvaluation{Command: Command{Candidates: candidates}, Score: moveSetScore{Total: float64(1000 + i)}})
 	}
 	retained := retainScoreBasedMoveSetResults(singles, batches, 10)
 	if len(retained) > 10 {
@@ -682,9 +701,9 @@ func TestEvaluateMoveSetsPar_respectsOrder(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	winner, evaluated, _, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(time.Second), compute, sourcePriceSearchTestScore)
+	winner, evaluated, _, _, err := evaluateMoveSetsParWithStats(ctx, moveSets, time.Now().Add(time.Second), compute, scoreBasedMoveSetResultLimit, nil, sourcePriceSearchTestScore, nil)
 	if err != nil {
-		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
+		t.Fatalf("evaluateMoveSetsParWithStats() error = %v", err)
 	}
 	if len(winner) != 2 {
 		t.Fatalf("evaluations = %d, want 2", len(winner))
@@ -714,9 +733,9 @@ func TestEvaluateMoveSetsPar_stopsOnDeadline(t *testing.T) {
 		}
 	}
 
-	winner, evaluated, timedOut, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(-time.Millisecond), compute, sourcePriceSearchTestScore)
+	winner, evaluated, timedOut, _, err := evaluateMoveSetsParWithStats(ctx, moveSets, time.Now().Add(-time.Millisecond), compute, scoreBasedMoveSetResultLimit, nil, sourcePriceSearchTestScore, nil)
 	if err != nil {
-		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
+		t.Fatalf("evaluateMoveSetsParWithStats() error = %v", err)
 	}
 	if len(winner) != 0 {
 		t.Fatalf("evaluations = %d, want 0", len(winner))
@@ -743,9 +762,9 @@ func TestEvaluateMoveSetsPar_returnsTopResultsAfterSearch(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	evals, evaluated, _, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(time.Second), compute, sourcePriceSearchTestScore)
+	evals, evaluated, _, _, err := evaluateMoveSetsParWithStats(ctx, moveSets, time.Now().Add(time.Second), compute, scoreBasedMoveSetResultLimit, nil, sourcePriceSearchTestScore, nil)
 	if err != nil {
-		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
+		t.Fatalf("evaluateMoveSetsParWithStats() error = %v", err)
 	}
 	if len(evals) != scoreBasedMoveSetResultLimit {
 		t.Fatalf("evaluations = %d, want %d", len(evals), scoreBasedMoveSetResultLimit)
@@ -787,9 +806,9 @@ func TestEvaluateMoveSetsPar_returnsPartialOnTimeout(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	evals, evaluated, timedOut, _, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(100*time.Millisecond), compute, sourcePriceSearchTestScore)
+	evals, evaluated, timedOut, _, err := evaluateMoveSetsParWithStats(ctx, moveSets, time.Now().Add(100*time.Millisecond), compute, scoreBasedMoveSetResultLimit, nil, sourcePriceSearchTestScore, nil)
 	if err != nil {
-		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
+		t.Fatalf("evaluateMoveSetsParWithStats() error = %v", err)
 	}
 	if len(evals) != 1 {
 		t.Fatalf("evaluations = %d, want 1", len(evals))
@@ -816,8 +835,8 @@ func TestSelectFirstValidatedCommand_validationFallbackReportsRejectedAttempt(t 
 	lowScoreCandidate.Node.Name = "low-score"
 	lowScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "low-score"}}
 	evals := []*moveSetEvaluation{
-		{Command: Command{Candidates: []*Candidate{highScoreCandidate}}, Score: 0.50},
-		{Command: Command{Candidates: []*Candidate{lowScoreCandidate}}, Score: 0.10},
+		{Command: Command{Candidates: []*Candidate{highScoreCandidate}}, Score: moveSetScore{Total: 0.50}},
+		{Command: Command{Candidates: []*Candidate{lowScoreCandidate}}, Score: moveSetScore{Total: 0.10}},
 	}
 	validator := rejectFirstCommandValidator{}
 
@@ -857,8 +876,8 @@ func TestSelectFirstValidatedCommand_emitsRejectedEventForEachAttemptWhenAllFail
 	lowScoreCandidate.Node.Name = "low-score"
 	lowScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "low-score"}}
 	evals := []*moveSetEvaluation{
-		{Command: Command{Candidates: []*Candidate{highScoreCandidate}}, Score: 0.50},
-		{Command: Command{Candidates: []*Candidate{lowScoreCandidate}}, Score: 0.10},
+		{Command: Command{Candidates: []*Candidate{highScoreCandidate}}, Score: moveSetScore{Total: 0.50}},
+		{Command: Command{Candidates: []*Candidate{lowScoreCandidate}}, Score: moveSetScore{Total: 0.10}},
 	}
 
 	cmd, selectedIdx, err := selectFirstStillValidCommand(ctx, rejectAllCommandValidator{}, recorder, evals)
@@ -988,9 +1007,14 @@ func candidateWithPrice(t *testing.T, price float64) *Candidate {
 
 // sourcePriceSearchTestScore makes the parallel-search tests independent of the
 // production price-baseline scorer, whose inputs come from an immutable fleet snapshot.
-func sourcePriceSearchTestScore(command Command) moveSetScoring {
+func sourcePriceSearchTestScore(command Command) moveSetScore {
 	score := sumCandidatePrices(command.Candidates)
-	return moveSetScoring{Score: score, BaseScore: score}
+	return moveSetScore{Total: score, Factors: moveSetScoreFactors{
+		Cost:                      scoreBasedCostScore{Enabled: true, Valid: true, Status: scoreFactorApplied, Contribution: score},
+		Utilisation:               scoreBasedUtilisationScore{Status: scoreFactorDisabled, Reason: "test_score_not_calculated"},
+		MemoryBalance:             scoreBasedMemoryScore{Status: scoreFactorDisabled, Reason: "test_score_not_calculated"},
+		InstanceTypeConcentration: scoreBasedInstanceTypeConcentrationScore{Status: scoreFactorDisabled, Reason: "test_score_not_calculated"},
+	}}
 }
 
 func scoreBasedTestCandidate(scoreBasedConsolidation bool) *Candidate {

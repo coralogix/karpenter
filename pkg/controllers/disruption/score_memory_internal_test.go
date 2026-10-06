@@ -41,16 +41,16 @@ func TestScoreBasedMemoryInternalCorrectionIsIndependentOfPoolSize(t *testing.T)
 	for i, nodeCount := range []float64{5, 1000} {
 		snapshot := scoreMemorySnapshotForTest(poolName, nodeCount*10, nodeCount*40, nodeCount*5, nodeCount*10,
 			map[string]scoreBasedMemoryShape{"source": {cpu: 1, memory: 8}})
-		score := snapshot.score(Command{Candidates: []*Candidate{candidate}})
+		score := scoreMemoryScoreForTest(snapshot, Command{Candidates: []*Candidate{candidate}})
 		if !score.Enabled {
 			t.Fatal("expected memory balance scoring to be enabled")
 		}
 		if i == 0 {
-			first = score.Correction
+			first = score.Contribution
 			continue
 		}
-		if score.Correction != first {
-			t.Fatalf("correction changed with pool size: 5 nodes=%v, 1000 nodes=%v", first, score.Correction)
+		if score.Contribution != first {
+			t.Fatalf("correction changed with pool size: 5 nodes=%v, 1000 nodes=%v", first, score.Contribution)
 		}
 	}
 }
@@ -65,12 +65,12 @@ func TestScoreBasedMemoryJointCorrectionScalesWithSourceNodeCount(t *testing.T) 
 			"second-source": {cpu: 1, memory: 8},
 		})
 
-	single := snapshot.score(Command{Candidates: []*Candidate{first}})
-	joint := snapshot.score(Command{Candidates: []*Candidate{first, second}})
-	if single.Correction != 1 || single.SourceNodeCount != 1 {
+	single := scoreMemoryScoreForTest(snapshot, Command{Candidates: []*Candidate{first}})
+	joint := scoreMemoryScoreForTest(snapshot, Command{Candidates: []*Candidate{first, second}})
+	if single.Contribution != 1 || single.SourceNodeCount != 1 {
 		t.Fatalf("single-node correction = %+v, want correction 1 with one source", single)
 	}
-	if joint.Correction != 2 || joint.SourceNodeCount != 2 {
+	if joint.Contribution != 2 || joint.SourceNodeCount != 2 {
 		t.Fatalf("joint correction = %+v, want correction 2 with two sources", joint)
 	}
 	poolScore := joint.Pools[poolName]
@@ -100,8 +100,8 @@ func TestScoreBasedMemoryInternalPressureReversesShapePreference(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			snapshot := scoreMemorySnapshotForTest(poolName, 10, 40, 1, test.targetRatio, shapes)
-			high := snapshot.score(Command{Candidates: []*Candidate{highMemory}}).Correction
-			low := snapshot.score(Command{Candidates: []*Candidate{lowMemory}}).Correction
+			high := scoreMemoryScoreForTest(snapshot, Command{Candidates: []*Candidate{highMemory}}).Contribution
+			low := scoreMemoryScoreForTest(snapshot, Command{Candidates: []*Candidate{lowMemory}}).Contribution
 			switch test.want {
 			case 1:
 				if high <= low {
@@ -130,24 +130,24 @@ func TestScoreBasedMemoryInternalReplacementAndStandbyDeltasAreBatched(t *testin
 	replacement := scoreMemoryReplacementForTest(poolName, sourceShape)
 	command := Command{Candidates: []*Candidate{candidate}, Replacements: []*Replacement{{NodeClaim: replacement}}}
 
-	withoutStandby := snapshot.score(command)
-	if withoutStandby.Correction != 0 || withoutStandby.RemovedCPU != sourceShape.cpu {
-		t.Fatalf("identical source/replacement score = correction %v, removed CPU %v; want 0 and %v", withoutStandby.Correction, withoutStandby.RemovedCPU, sourceShape.cpu)
+	withoutStandby := scoreMemoryScoreForTest(snapshot, command)
+	if withoutStandby.Contribution != 0 || withoutStandby.RemovedCPU != sourceShape.cpu {
+		t.Fatalf("identical source/replacement score = correction %v, removed CPU %v; want 0 and %v", withoutStandby.Contribution, withoutStandby.RemovedCPU, sourceShape.cpu)
 	}
 
 	standbyNode := scoreMemoryStandbyNodeForTest(poolName, "standby")
 	shapes["standby"] = sourceShape
 	command.Results.ExistingNodes = []*scheduling.ExistingNode{standbyNode}
-	withStandby := snapshot.score(command)
-	if withStandby.Correction != -1 || withStandby.RemovedCPU != sourceShape.cpu {
-		t.Fatalf("batched source/replacement/standby score = correction %v, removed CPU %v; want -1 and %v", withStandby.Correction, withStandby.RemovedCPU, sourceShape.cpu)
+	withStandby := scoreMemoryScoreForTest(snapshot, command)
+	if withStandby.Contribution != -1 || withStandby.RemovedCPU != sourceShape.cpu {
+		t.Fatalf("batched source/replacement/standby score = correction %v, removed CPU %v; want -1 and %v", withStandby.Contribution, withStandby.RemovedCPU, sourceShape.cpu)
 	}
 	if got := withStandby.Pools[poolName].AddedShapeAssessment; got != "conservative_replacement_and_measured_standby_shapes" {
 		t.Fatalf("combined replacement/standby assessment = %q", got)
 	}
 
 	shapes["second-standby"] = sourceShape
-	standbyOnly := snapshot.score(Command{Candidates: []*Candidate{candidate}, Results: scheduling.Results{
+	standbyOnly := scoreMemoryScoreForTest(snapshot, Command{Candidates: []*Candidate{candidate}, Results: scheduling.Results{
 		ExistingNodes: []*scheduling.ExistingNode{standbyNode, scoreMemoryStandbyNodeForTest(poolName, "second-standby")},
 	}})
 	poolScore := standbyOnly.Pools[poolName]
@@ -165,9 +165,9 @@ func TestScoreBasedMemoryInternalReplacementUsesConservativeOptions(t *testing.T
 		scoreBasedMemoryShape{cpu: 2, memory: 16},
 		scoreBasedMemoryShape{cpu: 2, memory: 4},
 	)
-	score := snapshot.score(Command{Candidates: []*Candidate{source}, Replacements: []*Replacement{{NodeClaim: replacement}}})
-	if score.Correction != -1 {
-		t.Fatalf("correction using the most adverse replacement option = %v, want -1", score.Correction)
+	score := scoreMemoryScoreForTest(snapshot, Command{Candidates: []*Candidate{source}, Replacements: []*Replacement{{NodeClaim: replacement}}})
+	if score.Contribution != -1 {
+		t.Fatalf("correction using the most adverse replacement option = %v, want -1", score.Contribution)
 	}
 	poolScore := score.Pools[poolName]
 	if poolScore.AddedShape.CPUCores != 2 || poolScore.AddedShape.MemoryBytes != 16 {
@@ -186,8 +186,8 @@ func TestScoreBasedMemoryDetailsReportDisabledState(t *testing.T) {
 	candidate := scoreMemoryCandidateForTest(poolName, "source")
 	command := Command{Candidates: []*Candidate{candidate}}
 
-	disabled := scoreBasedMemoryScoreForCommand(command, nil, map[string]scoreBasedMemoryConfig{
-		poolName: {surplus: 0.35, weight: 0},
+	disabled := scoreBasedMemoryScoreForCommand(command, nil, scoreBasedScoringConfig{
+		poolName: {memory: scoreBasedMemoryConfig{surplus: 0.35, weight: 0}},
 	})
 	if disabled.Enabled || disabled.Status != "disabled" || disabled.Pools[poolName].Status != "disabled" || disabled.Pools[poolName].MemorySurplus != 0.35 || disabled.Pools[poolName].Weight != 0 {
 		t.Fatalf("disabled memory details = %+v, want disabled status with effective annotations", disabled)
@@ -201,8 +201,8 @@ func TestScoreBasedMemoryDetailsReportUnavailableStateWithZeroCorrection(t *test
 	snapshot := scoreMemorySnapshotForTest(poolName, 10, 40, 1, 2,
 		map[string]scoreBasedMemoryShape{"source": {cpu: 1, memory: 8}})
 	snapshot.pools[poolName].valid = false
-	unavailable := scoreBasedMemoryScoreForCommand(command, snapshot, snapshot.configs)
-	if unavailable.Status != "unavailable" || unavailable.Reason != "source_pool_baseline_unavailable" || unavailable.Correction != 0 {
+	unavailable := scoreMemoryScoreForTest(snapshot, command)
+	if unavailable.Status != "unavailable" || unavailable.Reason != "source_pool_baseline_unavailable" || unavailable.Contribution != 0 {
 		t.Fatalf("unavailable memory details = %+v, want zero correction and source baseline reason", unavailable)
 	}
 	if got := unavailable.Pools[poolName]; got.Status != "unavailable" || got.Contribution != 0 || got.NormalizedDelta != 0 {
@@ -235,53 +235,48 @@ func TestScoreBasedMemoryBatchScoringUsesJointScoreWithOneCorrection(t *testing.
 	compute := func(_ context.Context, candidates ...*Candidate) (Command, error) {
 		return Command{Candidates: candidates}, nil
 	}
-	baseScorer := func(command Command) moveSetScoring {
-		costScore := prices.score(command)
-		baseScore := costScore.Contribution + moveSetUtilisationScore(command)
-		return moveSetScoring{Score: baseScore, BaseScore: baseScore, Cost: costScore}
-	}
-	withMemoryScorer := func(command Command) moveSetScoring {
-		scoring := baseScorer(command)
-		scoring.MemoryBalance = memorySnapshot.score(command)
-		scoring.Score += scoring.MemoryBalance.Correction
-		return scoring
-	}
-	makeSingletons := func(scorer func(Command) moveSetScoring) []*moveSetEvaluation {
+	baseConfigs := scoreBasedScoringConfig{"memory-pool": {
+		utilisationWeight: defaultScoreBasedUtilisationWeight,
+		memory:            scoreBasedMemoryConfig{surplus: defaultScoreBasedMemorySurplus, weight: 0},
+	}}
+	memoryConfigs := scoreBasedScoringConfig{"memory-pool": {
+		utilisationWeight: defaultScoreBasedUtilisationWeight,
+		memory:            scoreBasedMemoryConfig{surplus: defaultScoreBasedMemorySurplus, weight: 1},
+	}}
+	baseScorer := newMoveSetScorer(prices, baseConfigs, nil, newScoreBasedInstanceTypeConcentrationSnapshot(nil, baseConfigs)).Score
+	withMemoryScorer := newMoveSetScorer(prices, memoryConfigs, memorySnapshot, newScoreBasedInstanceTypeConcentrationSnapshot(nil, memoryConfigs)).Score
+	makeSingletons := func(scorer func(Command) moveSetScore) []*moveSetEvaluation {
 		out := make([]*moveSetEvaluation, 0, 2)
 		for _, candidate := range []*Candidate{first, second} {
 			command := Command{Candidates: []*Candidate{candidate}}
 			scoring := scorer(command)
 			out = append(out, &moveSetEvaluation{
-				Command: command, Score: scoring.Score, BaseScore: scoring.BaseScore,
-				Cost: scoring.Cost, MemoryBalance: scoring.MemoryBalance,
+				Command: command, Score: scoring,
 			})
 		}
 		return out
 	}
 	disabledSingletons := makeSingletons(baseScorer)
 	enabledSingletons := makeSingletons(withMemoryScorer)
-	constituentBaseScore := disabledSingletons[0].BaseScore + disabledSingletons[1].BaseScore
-	constituentMemoryCorrection := enabledSingletons[0].MemoryBalance.Correction + enabledSingletons[1].MemoryBalance.Correction
+	constituentBaseScore := disabledSingletons[0].Score.Total + disabledSingletons[1].Score.Total
+	constituentMemoryCorrection := enabledSingletons[0].Score.Factors.MemoryBalance.Contribution + enabledSingletons[1].Score.Factors.MemoryBalance.Contribution
 
 	disabledBatches := scoreMemoryGrowBatchesForTest(t, disabledSingletons, compute, baseScorer)
 	disabled := scoreMemoryTwoCandidateBatchForTest(t, disabledBatches)
-	if math.Abs(disabled.BaseScore-constituentBaseScore) > 1e-12 || math.Abs(disabled.Score-constituentBaseScore) > 1e-12 {
-		t.Fatalf("memory-disabled batch base/score = %v/%v, want additive singleton base %v", disabled.BaseScore, disabled.Score, constituentBaseScore)
+	if math.Abs(disabled.Score.Total-constituentBaseScore) > 1e-12 {
+		t.Fatalf("memory-disabled batch score = %v, want additive singleton score %v", disabled.Score.Total, constituentBaseScore)
 	}
 
 	enabledBatches := scoreMemoryGrowBatchesForTest(t, enabledSingletons, compute, withMemoryScorer)
 	enabled := scoreMemoryTwoCandidateBatchForTest(t, enabledBatches)
-	if math.Abs(enabled.BaseScore-disabled.BaseScore) > 1e-12 || math.Abs(enabled.BaseScore-constituentBaseScore) > 1e-12 {
-		t.Fatalf("enabled batch base score = %v, want the same additive base %v", enabled.BaseScore, constituentBaseScore)
+	if enabled.Score.Factors.MemoryBalance.Contribution != 2 || enabled.Score.Factors.MemoryBalance.SourceNodeCount != 2 {
+		t.Fatalf("enabled batch memory contribution = %+v, want one joint correction 2 for two sources", enabled.Score.Factors.MemoryBalance)
 	}
-	if enabled.MemoryBalance.Correction != 2 || enabled.MemoryBalance.SourceNodeCount != 2 {
-		t.Fatalf("enabled batch memory correction = %+v, want one joint correction 2 for two sources", enabled.MemoryBalance)
+	if math.Abs(enabled.Score.Total-(constituentBaseScore+enabled.Score.Factors.MemoryBalance.Contribution)) > 1e-12 {
+		t.Fatalf("enabled batch score = %v, want additive base %v plus joint correction %v", enabled.Score.Total, constituentBaseScore, enabled.Score.Factors.MemoryBalance.Contribution)
 	}
-	if enabled.Score != constituentBaseScore+enabled.MemoryBalance.Correction {
-		t.Fatalf("enabled batch score = %v, want additive base %v plus joint correction %v", enabled.Score, constituentBaseScore, enabled.MemoryBalance.Correction)
-	}
-	if enabled.MemoryBalance.Correction == constituentMemoryCorrection {
-		t.Fatalf("joint correction %v unexpectedly equals summed singleton corrections %v", enabled.MemoryBalance.Correction, constituentMemoryCorrection)
+	if enabled.Score.Factors.MemoryBalance.Contribution == constituentMemoryCorrection {
+		t.Fatalf("joint correction %v unexpectedly equals summed singleton corrections %v", enabled.Score.Factors.MemoryBalance.Contribution, constituentMemoryCorrection)
 	}
 }
 
@@ -308,9 +303,9 @@ func TestScoreBasedMemoryInternalAnnotationParsing(t *testing.T) {
 	}
 }
 
-func scoreMemoryGrowBatchesForTest(t *testing.T, singletons []*moveSetEvaluation, compute consolidationComputer, scorers ...func(Command) moveSetScoring) []*moveSetEvaluation {
+func scoreMemoryGrowBatchesForTest(t *testing.T, singletons []*moveSetEvaluation, compute consolidationComputer, score func(Command) moveSetScore) []*moveSetEvaluation {
 	t.Helper()
-	batches, _, timedOut, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"memory-pool": 2}, nil, compute, &moveSetSearchStats{}, scorers...)
+	batches, _, timedOut, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"memory-pool": 2}, nil, compute, &moveSetSearchStats{}, score)
 	if err != nil {
 		t.Fatalf("growScoreBasedBatches() error = %v", err)
 	}
@@ -331,11 +326,18 @@ func scoreMemoryTwoCandidateBatchForTest(t *testing.T, batches []*moveSetEvaluat
 	return nil
 }
 
+func scoreMemoryScoreForTest(snapshot *scoreBasedMemorySnapshot, command Command) scoreBasedMemoryScore {
+	configs := scoreBasedScoringConfig{}
+	for poolName := range snapshot.pools {
+		configs[poolName] = scoreBasedNodePoolScoringConfig{memory: scoreBasedMemoryConfig{surplus: defaultScoreBasedMemorySurplus, weight: 1}}
+	}
+	return scoreBasedMemoryScoreForCommand(command, snapshot, configs)
+}
+
 func scoreMemorySnapshotForTest(poolName string, capacityCPU, capacityMemory, requestCPU, requestMemory float64, shapes map[string]scoreBasedMemoryShape) *scoreBasedMemorySnapshot {
 	capacityRatio := capacityMemory / capacityCPU
 	targetRatio := requestMemory / requestCPU
 	return &scoreBasedMemorySnapshot{
-		configs: map[string]scoreBasedMemoryConfig{poolName: {weight: 1}},
 		pools: map[string]*scoreBasedMemoryPool{poolName: {
 			capacityCPU:    capacityCPU,
 			capacityMemory: capacityMemory,

@@ -39,6 +39,7 @@ type scoreBasedInstanceTypeConcentrationConfig struct {
 }
 
 type scoreBasedInstanceTypeConcentrationSourceScore struct {
+	NodeName              string  `json:"nodeName"`
 	NodePool              string  `json:"nodePool"`
 	InstanceType          string  `json:"instanceType"`
 	PoolNodeCount         int     `json:"poolNodeCount"`
@@ -69,12 +70,12 @@ type scoreBasedInstanceTypeConcentrationPoolScore struct {
 }
 
 type scoreBasedInstanceTypeConcentrationScore struct {
-	Enabled     bool                                                    `json:"enabled"`
-	Status      string                                                  `json:"status"`
-	Reason      string                                                  `json:"reason,omitempty"`
-	Correction  float64                                                 `json:"correction"`
-	SourceNodes []scoreBasedInstanceTypeConcentrationSourceScore        `json:"-"`
-	Pools       map[string]scoreBasedInstanceTypeConcentrationPoolScore `json:"pools"`
+	Enabled      bool                                                    `json:"enabled"`
+	Status       scoreFactorStatus                                       `json:"status"`
+	Reason       string                                                  `json:"reason,omitempty"`
+	Contribution float64                                                 `json:"contribution"`
+	SourceNodes  []scoreBasedInstanceTypeConcentrationSourceScore        `json:"-"`
+	Pools        map[string]scoreBasedInstanceTypeConcentrationPoolScore `json:"pools"`
 }
 
 type scoreBasedInstanceTypeConcentrationPool struct {
@@ -83,21 +84,7 @@ type scoreBasedInstanceTypeConcentrationPool struct {
 }
 
 type scoreBasedInstanceTypeConcentrationSnapshot struct {
-	configs map[string]scoreBasedInstanceTypeConcentrationConfig
-	pools   map[string]*scoreBasedInstanceTypeConcentrationPool
-}
-
-func scoreBasedInstanceTypeConcentrationConfigs(candidates []*Candidate) map[string]scoreBasedInstanceTypeConcentrationConfig {
-	configs := make(map[string]scoreBasedInstanceTypeConcentrationConfig)
-	for _, candidate := range candidates {
-		if candidate == nil || candidate.NodePool == nil {
-			continue
-		}
-		if _, found := configs[candidate.NodePool.Name]; !found {
-			configs[candidate.NodePool.Name] = scoreBasedInstanceTypeConcentrationConfigFor(candidate.NodePool)
-		}
-	}
-	return configs
+	pools map[string]*scoreBasedInstanceTypeConcentrationPool
 }
 
 func scoreBasedInstanceTypeConcentrationConfigFor(nodePool *v1.NodePool) scoreBasedInstanceTypeConcentrationConfig {
@@ -167,10 +154,9 @@ func scoreBasedInstanceTypeConcentrationConfigChanged(previous map[string]string
 // newScoreBasedInstanceTypeConcentrationSnapshot counts the full immutable node inventory for
 // each configured pool. Standby, activating, and otherwise ineligible initialized nodes remain
 // part of the inventory; nodes without an instance-type label remain in the denominator.
-func newScoreBasedInstanceTypeConcentrationSnapshot(nodes state.StateNodes, configs map[string]scoreBasedInstanceTypeConcentrationConfig) *scoreBasedInstanceTypeConcentrationSnapshot {
+func newScoreBasedInstanceTypeConcentrationSnapshot(nodes state.StateNodes, configs scoreBasedScoringConfig) *scoreBasedInstanceTypeConcentrationSnapshot {
 	snapshot := &scoreBasedInstanceTypeConcentrationSnapshot{
-		configs: configs,
-		pools:   make(map[string]*scoreBasedInstanceTypeConcentrationPool, len(configs)),
+		pools: make(map[string]*scoreBasedInstanceTypeConcentrationPool, len(configs)),
 	}
 	for poolName := range configs {
 		snapshot.pools[poolName] = &scoreBasedInstanceTypeConcentrationPool{instanceCounts: map[string]int{}}
@@ -193,7 +179,7 @@ func newScoreBasedInstanceTypeConcentrationSnapshot(nodes state.StateNodes, conf
 	return snapshot
 }
 
-func (snapshot *scoreBasedInstanceTypeConcentrationSnapshot) score(command Command) scoreBasedInstanceTypeConcentrationScore {
+func (snapshot *scoreBasedInstanceTypeConcentrationSnapshot) score(command Command, configs scoreBasedScoringConfig) scoreBasedInstanceTypeConcentrationScore {
 	details := scoreBasedInstanceTypeConcentrationScore{
 		Status:      "disabled",
 		Reason:      "instance_type_concentration_weight_zero",
@@ -201,7 +187,7 @@ func (snapshot *scoreBasedInstanceTypeConcentrationSnapshot) score(command Comma
 		Pools:       map[string]scoreBasedInstanceTypeConcentrationPoolScore{},
 	}
 	for _, candidate := range command.Candidates {
-		source, ok := snapshot.sourceScore(candidate)
+		source, ok := snapshot.sourceScore(candidate, configs)
 		if !ok {
 			continue
 		}
@@ -216,15 +202,16 @@ func scoreBasedConcentrationInventoryNode(node *state.StateNode) bool {
 		(node.Node.DeletionTimestamp == nil || node.Node.DeletionTimestamp.IsZero())
 }
 
-func (snapshot *scoreBasedInstanceTypeConcentrationSnapshot) sourceScore(candidate *Candidate) (scoreBasedInstanceTypeConcentrationSourceScore, bool) {
+func (snapshot *scoreBasedInstanceTypeConcentrationSnapshot) sourceScore(candidate *Candidate, configs scoreBasedScoringConfig) (scoreBasedInstanceTypeConcentrationSourceScore, bool) {
 	if candidate == nil || candidate.NodePool == nil {
 		return scoreBasedInstanceTypeConcentrationSourceScore{}, false
 	}
 	poolName := candidate.NodePool.Name
-	config := snapshot.configs[poolName]
+	config := configs[poolName].concentration
 	pool := snapshot.pools[poolName]
 	instanceType := candidate.Labels()[corev1.LabelInstanceTypeStable]
 	source := scoreBasedInstanceTypeConcentrationSourceScore{
+		NodeName:     candidate.Name(),
 		NodePool:     poolName,
 		InstanceType: instanceType,
 		Threshold:    config.threshold,
@@ -250,7 +237,7 @@ func (score *scoreBasedInstanceTypeConcentrationScore) addSource(source scoreBas
 		score.Status = "applied"
 		score.Reason = ""
 	}
-	score.Correction += source.Contribution
+	score.Contribution += source.Contribution
 	poolScore := score.Pools[source.NodePool]
 	if poolScore.InstanceTypes == nil {
 		poolScore = scoreBasedInstanceTypeConcentrationPoolScore{

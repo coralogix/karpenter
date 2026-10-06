@@ -47,7 +47,7 @@ func TestScoreBasedMemorySnapshotUsesWholePoolAndExcludesDaemonSetRequests(t *te
 	first := addScoreBasedMemoryStateNode(t, ctx, cluster, "pool", "first", "4", "16Gi", "0.5", "1Gi", "2", "3Gi")
 	addScoreBasedMemoryStateNode(t, ctx, cluster, "pool", "second", "4", "8Gi", "0.5", "1Gi", "2", "6Gi")
 	config := scoreBasedMemoryConfig{surplus: 0.2, weight: 10}
-	configs := map[string]scoreBasedMemoryConfig{"pool": config}
+	configs := scoreBasedScoringConfig{"pool": {memory: config}}
 
 	// The candidate set can contain only the first node, while the scheduling
 	// simulator snapshot must retain the second node for the pool-wide baseline.
@@ -123,13 +123,16 @@ func TestScoreBasedMoveSetScoreMustBePositiveWithOrWithoutMemoryScoring(t *testi
 	candidate.Price = 1
 	command := Command{Candidates: []*Candidate{candidate}}
 	compute := func(context.Context, ...*Candidate) (Command, error) { return command, nil }
-	scoring := func(enabled bool) func(Command) moveSetScoring {
-		return func(Command) moveSetScoring {
-			return moveSetScoring{
-				Score:         0,
-				BaseScore:     1,
-				MemoryBalance: scoreBasedMemoryScore{Enabled: enabled, Correction: -1},
+	scoring := func(enabled bool) func(Command) moveSetScore {
+		return func(Command) moveSetScore {
+			memory := scoreBasedMemoryScore{Status: scoreFactorDisabled, Reason: "test_disabled"}
+			if enabled {
+				memory = scoreBasedMemoryScore{Enabled: true, Status: scoreFactorApplied, Contribution: -1}
 			}
+			return moveSetScore{Total: 0, Factors: moveSetScoreFactors{
+				Cost:          scoreBasedCostScore{Enabled: true, Valid: true, Status: scoreFactorApplied, Contribution: 1},
+				MemoryBalance: memory,
+			}}
 		}
 	}
 
@@ -156,15 +159,14 @@ func TestScoreBasedMoveSetRejectsUnknownPriceDespitePositiveUtilisationAndMemory
 	candidate.instanceType.Capacity = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}
 	command := Command{Candidates: []*Candidate{candidate}}
 	compute := func(context.Context, ...*Candidate) (Command, error) { return command, nil }
-	score := moveSetUtilisationScore(command)
+	score := scoreMoveSetUtilisation(command, scoreBasedScoringConfigForCandidates([]*Candidate{candidate})).Contribution
 	if score <= 0 {
 		t.Fatalf("test setup utilization score = %v, want positive", score)
 	}
-	scoring := func(Command) moveSetScoring {
-		return moveSetScoring{
-			Score: score, BaseScore: score,
-			Cost: scoreBasedCostScore{Enabled: true, Valid: false},
-		}
+	scoring := func(Command) moveSetScore {
+		return moveSetScore{Total: score, Factors: moveSetScoreFactors{
+			Cost: scoreBasedCostScore{Enabled: true, Valid: false, Status: scoreFactorUnavailable, Reason: "test_price_unavailable"},
+		}}
 	}
 	stats := &moveSetSearchStats{}
 	if got := evaluateMoveSetWith(context.Background(), moveSet{Nodes: []*Candidate{candidate}}, compute, stats, nil, scoring); got != nil {

@@ -35,20 +35,23 @@ import (
 )
 
 func TestScoreBasedInstanceTypeConcentrationSnapshotAndFrozenSourceScore(t *testing.T) {
-	nodePool, nodes, command, snapshot := scoreBasedConcentrationSnapshotFixture()
+	nodePool, nodes, command, snapshot, configs := scoreBasedConcentrationSnapshotFixture()
 	assertConcentrationInventory(t, snapshot)
-	firstScore := snapshot.score(command)
+	firstScore := snapshot.score(command, configs)
 	assertConcentrationScoreAtThreshold(t, firstScore)
 
 	// The current search keeps its captured threshold and weight if live metadata changes later.
 	nodePool.Annotations[v1.ScoreBasedInstanceTypeConcentrationThresholdAnnotationKey] = "0.49"
-	assertConcentrationSnapshotFrozen(t, snapshot.score(command))
-	newConfigs := map[string]scoreBasedInstanceTypeConcentrationConfig{nodePool.Name: scoreBasedInstanceTypeConcentrationConfigFor(nodePool)}
-	updated := newScoreBasedInstanceTypeConcentrationSnapshot(nodes, newConfigs).score(command)
+	assertConcentrationSnapshotFrozen(t, snapshot.score(command, configs))
+	updatedConfigs := scoreBasedScoringConfig{
+		nodePool.Name: {concentration: scoreBasedInstanceTypeConcentrationConfigFor(nodePool)},
+		"other-pool":  {concentration: scoreBasedInstanceTypeConcentrationConfig{threshold: 0.5, weight: 1}},
+	}
+	updated := newScoreBasedInstanceTypeConcentrationSnapshot(nodes, updatedConfigs).score(command, updatedConfigs)
 	assertConcentrationScoreBelowThreshold(t, updated)
 }
 
-func scoreBasedConcentrationSnapshotFixture() (*v1.NodePool, state.StateNodes, Command, *scoreBasedInstanceTypeConcentrationSnapshot) {
+func scoreBasedConcentrationSnapshotFixture() (*v1.NodePool, state.StateNodes, Command, *scoreBasedInstanceTypeConcentrationSnapshot, scoreBasedScoringConfig) {
 	const poolName = "concentrated-pool"
 	nodePool := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: poolName, Annotations: map[string]string{
 		v1.ScoreBasedInstanceTypeConcentrationThresholdAnnotationKey: "0.5",
@@ -75,9 +78,9 @@ func scoreBasedConcentrationSnapshotFixture() (*v1.NodePool, state.StateNodes, C
 	unmanaged.Node = typeA1.Node.DeepCopy()
 
 	nodes := state.StateNodes{typeA1, typeAStandby, typeAActivating, typeB1, typeB2, unknownType, otherPoolNode, deletingByClaim, deletingByNode, uninitialized, unmanaged}
-	configs := map[string]scoreBasedInstanceTypeConcentrationConfig{
-		poolName:     scoreBasedInstanceTypeConcentrationConfigFor(nodePool),
-		"other-pool": {threshold: 0.5, weight: 1},
+	configs := scoreBasedScoringConfig{
+		poolName:     {concentration: scoreBasedInstanceTypeConcentrationConfigFor(nodePool)},
+		"other-pool": {concentration: scoreBasedInstanceTypeConcentrationConfig{threshold: 0.5, weight: 1}},
 	}
 	snapshot := newScoreBasedInstanceTypeConcentrationSnapshot(nodes, configs)
 	candidateA1 := scorePriceCandidate(typeA1, nil)
@@ -89,7 +92,7 @@ func scoreBasedConcentrationSnapshotFixture() (*v1.NodePool, state.StateNodes, C
 	candidateUnknown := scorePriceCandidate(unknownType, nil)
 	candidateUnknown.NodePool = nodePool
 	command := Command{Candidates: []*Candidate{candidateA1, candidateA2, candidateB, candidateUnknown}}
-	return nodePool, nodes, command, snapshot
+	return nodePool, nodes, command, snapshot, configs
 }
 
 func assertConcentrationInventory(t *testing.T, snapshot *scoreBasedInstanceTypeConcentrationSnapshot) {
@@ -106,7 +109,7 @@ func assertConcentrationInventory(t *testing.T, snapshot *scoreBasedInstanceType
 
 func assertConcentrationScoreAtThreshold(t *testing.T, score scoreBasedInstanceTypeConcentrationScore) {
 	t.Helper()
-	if score.Correction != 0 || score.SourceNodes[0].Share != 0.5 || score.SourceNodes[0].Qualifies {
+	if score.Contribution != 0 || score.SourceNodes[0].Share != 0.5 || score.SourceNodes[0].Qualifies {
 		t.Fatalf("a type exactly at the threshold received a bonus: %+v", score)
 	}
 	if score.SourceNodes[3].Contribution != 0 || score.SourceNodes[3].Share != 0 {
@@ -116,14 +119,14 @@ func assertConcentrationScoreAtThreshold(t *testing.T, score scoreBasedInstanceT
 
 func assertConcentrationSnapshotFrozen(t *testing.T, score scoreBasedInstanceTypeConcentrationScore) {
 	t.Helper()
-	if score.Correction != 0 {
-		t.Fatalf("an existing snapshot changed after annotation mutation: correction = %v, want 0", score.Correction)
+	if score.Contribution != 0 {
+		t.Fatalf("an existing snapshot changed after annotation mutation: contribution = %v, want 0", score.Contribution)
 	}
 }
 
 func assertConcentrationScoreBelowThreshold(t *testing.T, score scoreBasedInstanceTypeConcentrationScore) {
 	t.Helper()
-	if score.Correction != 4 || !score.SourceNodes[0].Qualifies || score.SourceNodes[2].Qualifies {
+	if score.Contribution != 4 || !score.SourceNodes[0].Qualifies || score.SourceNodes[2].Qualifies {
 		t.Fatalf("below-threshold additive source score = %+v, want two type-a bonuses totaling 4", score)
 	}
 	if score.SourceNodes[3].Contribution != 0 {

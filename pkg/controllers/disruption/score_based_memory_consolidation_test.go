@@ -109,8 +109,19 @@ var _ = Describe("ScoreBasedMemoryConsolidation", func() {
 		Expect(command.Replacements).To(BeEmpty(), "the remaining nodes have room for every source pod")
 		Expect(command.Candidates[0].Labels()[corev1.LabelInstanceTypeStable]).To(Equal(expectedSourceType))
 		Expect(command.SourceCost()).To(BeNumerically(">", 0))
-		Expect(logOutput.String()).To(ContainSubstring(fmt.Sprintf(`"estimatedSavingsUSDPerHour"=%s`, expectedSavings)), "the selected simulation should report positive hourly savings")
-		Expect(logOutput.String()).To(ContainSubstring(`"memoryBalanceCorrection"=`), "the controller should select using the snapshot-based memory score")
+		output := logOutput.String()
+		Expect(output).To(ContainSubstring(fmt.Sprintf(`"savingsUSDPerHour"=%s`, expectedSavings)), "the selected score breakdown should report positive hourly savings")
+		memoryFactorStart := strings.Index(output, `"memoryBalance"`)
+		Expect(memoryFactorStart).To(BeNumerically(">=", 0), "the controller should report the snapshot-based memory factor; log: %s", output)
+		memoryDetails := output[memoryFactorStart:]
+		if nextFactor := strings.Index(memoryDetails, `"instanceTypeConcentration"`); nextFactor >= 0 {
+			memoryDetails = memoryDetails[:nextFactor]
+		}
+		wantMemoryStatus := `"status"="disabled"`
+		if weight != "0" {
+			wantMemoryStatus = `"status"="applied"`
+		}
+		Expect(memoryDetails).To(ContainSubstring(wantMemoryStatus), "the memory factor should report its status; log: %s", output)
 	},
 		Entry("prefers the higher-priced C-like node when the memory correction is disabled", "0", "memory-c", "0.4"),
 		Entry("reverses that choice when memory surplus is weighted", "100", "memory-r", "0.3"),

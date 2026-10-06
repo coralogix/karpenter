@@ -208,7 +208,7 @@ func selectReclamationCandidates(byPool map[string][]*Candidate, emptyCounts map
 func (s *ScoreBasedReclamation) validateReclamationCommand(ctx context.Context, cmd Command) (*Command, error) {
 	// Reclamation considers only nodes already marked and tainted as standby. Refresh candidates
 	// immediately before admission; the queue performs a final live check and conditional delete.
-	validated, _, err := selectFirstStillValidCommand(ctx, s.validator, s.recorder, []*moveSetEvaluation{{Command: cmd, Score: 1}})
+	validated, _, err := selectFirstStillValidCommand(ctx, s.validator, s.recorder, []*moveSetEvaluation{{Command: cmd, Score: moveSetScore{Total: 1}}})
 	if err != nil {
 		return nil, err
 	}

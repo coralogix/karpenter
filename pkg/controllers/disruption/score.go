@@ -31,9 +31,23 @@ import (
 // source node's CPU slack ratio.
 const defaultScoreBasedUtilisationWeight = 1.0
 
-// scoreBasedSourceScore records the exact per-source values consumed by the
-// cost and CPU-slack terms while a move set is evaluated.
+type scoreFactorStatus string
+
+const (
+	scoreFactorApplied     scoreFactorStatus = "applied"
+	scoreFactorDisabled    scoreFactorStatus = "disabled"
+	scoreFactorUnavailable scoreFactorStatus = "unavailable"
+)
+
+// scoreBasedSourceScore captures the exact source-node values consumed by the
+// factors. The identity and values are copied during evaluation so log output
+// does not depend on mutable Candidate objects.
 type scoreBasedSourceScore struct {
+	NodeName                  string                                         `json:"nodeName"`
+	NodeClaimName             string                                         `json:"nodeClaimName"`
+	NodePoolName              string                                         `json:"nodePoolName"`
+	InstanceType              string                                         `json:"instanceType"`
+	CapacityType              string                                         `json:"capacityType"`
 	PriceUSDPerHour           float64                                        `json:"priceUSDPerHour"`
 	AllocatableCPU            float64                                        `json:"allocatableCPU"`
 	RequestedCPU              float64                                        `json:"requestedCPU"`
@@ -46,49 +60,204 @@ type scoreBasedSourceScore struct {
 	InstanceTypeConcentration scoreBasedInstanceTypeConcentrationSourceScore `json:"instanceTypeConcentration"`
 }
 
-// moveSetPriorityScore combines the normalized cost contribution with the
-// additive, dimensionless CPU-slack contribution.
-func moveSetPriorityScore(cmd Command, prices *scoreBasedPriceSnapshot) float64 {
-	score, _ := scoreMoveSetPriority(cmd, prices)
-	return score
+type scoreBasedUtilisationScore struct {
+	Contribution float64                 `json:"contribution"`
+	Status       scoreFactorStatus       `json:"status"`
+	Reason       string                  `json:"reason,omitempty"`
+	SourceNodes  []scoreBasedSourceScore `json:"-"`
 }
 
-func scoreMoveSetPriority(cmd Command, prices *scoreBasedPriceSnapshot) (float64, scoreBasedCostScore) {
-	score, cost, _, _ := scoreMoveSetPriorityDetails(cmd, prices)
-	return score, cost
+type scoreBasedNodePoolScoringConfig struct {
+	utilisationWeight float64
+	memory            scoreBasedMemoryConfig
+	concentration     scoreBasedInstanceTypeConcentrationConfig
 }
 
-func scoreMoveSetPriorityDetails(cmd Command, prices *scoreBasedPriceSnapshot) (float64, scoreBasedCostScore, float64, []scoreBasedSourceScore) {
-	cost := prices.score(cmd)
-	if !cost.Valid {
-		return math.NaN(), cost, 0, cost.SourceNodes
-	}
-	utilisation, utilisationScores := moveSetUtilisationScoreDetails(cmd)
-	for i := range cost.SourceNodes {
-		if i >= len(utilisationScores) {
-			break
+type scoreBasedScoringConfig map[string]scoreBasedNodePoolScoringConfig
+
+func scoreBasedScoringConfigForCandidates(candidates []*Candidate) scoreBasedScoringConfig {
+	configs := scoreBasedScoringConfig{}
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.NodePool == nil {
+			continue
 		}
-		cost.SourceNodes[i].RequestedCPU = utilisationScores[i].RequestedCPU
-		cost.SourceNodes[i].AllocatableCPU = utilisationScores[i].AllocatableCPU
-		cost.SourceNodes[i].CPUSlackFraction = utilisationScores[i].CPUSlackFraction
-		cost.SourceNodes[i].UtilisationWeight = utilisationScores[i].UtilisationWeight
-		cost.SourceNodes[i].UtilisationContribution = utilisationScores[i].UtilisationContribution
+		if _, found := configs[candidate.NodePool.Name]; found {
+			continue
+		}
+		configs[candidate.NodePool.Name] = scoreBasedNodePoolScoringConfig{
+			utilisationWeight: scoreBasedUtilisationWeight(candidate.NodePool),
+			memory:            scoreBasedMemoryConfigFor(candidate.NodePool),
+			concentration:     scoreBasedInstanceTypeConcentrationConfigFor(candidate.NodePool),
+		}
 	}
-	return cost.Contribution + utilisation, cost, utilisation, cost.SourceNodes
+	return configs
 }
 
-func moveSetUtilisationScore(cmd Command) float64 {
-	score, _ := moveSetUtilisationScoreDetails(cmd)
-	return score
+// moveSetScore is the single canonical breakdown used for ranking, selection,
+// and logs. The total preserves the existing addition order: cost plus CPU
+// utilisation, then the joint memory and concentration terms.
+type moveSetScore struct {
+	Total   float64                 `json:"total"`
+	Factors moveSetScoreFactors     `json:"factors"`
+	Sources []scoreBasedSourceScore `json:"-"`
 }
 
-func moveSetUtilisationScoreDetails(cmd Command) (float64, []scoreBasedSourceScore) {
-	var score float64
-	details := make([]scoreBasedSourceScore, 0, len(cmd.Candidates))
-	for _, candidate := range cmd.Candidates {
+type moveSetScoreFactors struct {
+	Cost                      scoreBasedCostScore                      `json:"cost"`
+	Utilisation               scoreBasedUtilisationScore               `json:"utilisation"`
+	MemoryBalance             scoreBasedMemoryScore                    `json:"memoryBalance"`
+	InstanceTypeConcentration scoreBasedInstanceTypeConcentrationScore `json:"instanceTypeConcentration"`
+}
+
+// moveSetScorer owns the snapshots and parsed configuration used by every
+// single, pair, and batch evaluation in one search.
+type moveSetScorer struct {
+	prices        *scoreBasedPriceSnapshot
+	configs       scoreBasedScoringConfig
+	memory        *scoreBasedMemorySnapshot
+	concentration *scoreBasedInstanceTypeConcentrationSnapshot
+}
+
+func newMoveSetScorer(
+	prices *scoreBasedPriceSnapshot,
+	configs scoreBasedScoringConfig,
+	memory *scoreBasedMemorySnapshot,
+	concentration *scoreBasedInstanceTypeConcentrationSnapshot,
+) *moveSetScorer {
+	return &moveSetScorer{
+		prices:        prices,
+		configs:       configs,
+		memory:        memory,
+		concentration: concentration,
+	}
+}
+
+func (scorer *moveSetScorer) Score(command Command) moveSetScore {
+	cost := scorer.prices.score(command)
+	utilisation := scoreMoveSetUtilisation(command, scorer.configs)
+	memory := scoreBasedMemoryScoreForCommand(command, scorer.memory, scorer.configs)
+	concentration := scorer.concentration.score(command, scorer.configs)
+	baseScore := cost.Contribution + utilisation.Contribution
+	total := baseScore + memory.Contribution + concentration.Contribution
+
+	sources := mergeScoreBasedSourceScores(command, cost, utilisation, concentration)
+	return moveSetScore{
+		Total: total,
+		Factors: moveSetScoreFactors{
+			Cost:                      cost,
+			Utilisation:               utilisation,
+			MemoryBalance:             memory,
+			InstanceTypeConcentration: concentration,
+		},
+		Sources: sources,
+	}
+}
+
+func scoreBasedMoveSetScoreIsValid(scoring moveSetScore) bool {
+	if scoring.Factors.Cost.Status != scoreFactorApplied || !scoring.Factors.Cost.Valid {
+		return false
+	}
+	return finiteScoreValue(scoring.Total) && scoring.Total > 0
+}
+
+func mergeScoreBasedSourceScores(
+	command Command,
+	cost scoreBasedCostScore,
+	utilisation scoreBasedUtilisationScore,
+	concentration scoreBasedInstanceTypeConcentrationScore,
+) []scoreBasedSourceScore {
+	byNode := scoreBasedSourceIdentities(command)
+	mergeScoreBasedCostSources(byNode, cost.SourceNodes)
+	mergeScoreBasedUtilisationSources(byNode, utilisation.SourceNodes)
+	mergeScoreBasedConcentrationSources(byNode, concentration.SourceNodes)
+	ordered := make([]scoreBasedSourceScore, 0, len(command.Candidates))
+	for _, candidate := range command.Candidates {
+		if candidate != nil {
+			ordered = append(ordered, byNode[candidate.Name()])
+		}
+	}
+	return ordered
+}
+
+func scoreBasedSourceIdentities(command Command) map[string]scoreBasedSourceScore {
+	byNode := make(map[string]scoreBasedSourceScore, len(command.Candidates))
+	for _, candidate := range command.Candidates {
+		if candidate != nil {
+			byNode[candidate.Name()] = scoreBasedSourceIdentity(candidate)
+		}
+	}
+	return byNode
+}
+
+func scoreBasedSourceIdentity(candidate *Candidate) scoreBasedSourceScore {
+	source := scoreBasedSourceScore{
+		NodeName:     candidate.Name(),
+		InstanceType: candidate.Labels()[corev1.LabelInstanceTypeStable],
+		CapacityType: candidate.Labels()[v1.CapacityTypeLabelKey],
+	}
+	if candidate.NodePool != nil {
+		source.NodePoolName = candidate.NodePool.Name
+	}
+	if candidate.NodeClaim != nil {
+		source.NodeClaimName = candidate.NodeClaim.Name
+	}
+	return source
+}
+
+func mergeScoreBasedCostSources(byNode map[string]scoreBasedSourceScore, sources []scoreBasedSourceScore) {
+	for _, source := range sources {
+		merged := byNode[source.NodeName]
+		if merged.NodeName != "" {
+			merged.PriceUSDPerHour = source.PriceUSDPerHour
+			merged.AllocatableCPU = source.AllocatableCPU
+			merged.BaselineUSDPerCPUHour = source.BaselineUSDPerCPUHour
+			merged.NormalizedSourceCost = source.NormalizedSourceCost
+			merged.CostContribution = source.CostContribution
+			byNode[source.NodeName] = merged
+		}
+	}
+}
+
+func mergeScoreBasedUtilisationSources(byNode map[string]scoreBasedSourceScore, sources []scoreBasedSourceScore) {
+	for _, source := range sources {
+		merged, found := byNode[source.NodeName]
+		if found {
+			merged.AllocatableCPU = source.AllocatableCPU
+			merged.RequestedCPU = source.RequestedCPU
+			merged.CPUSlackFraction = source.CPUSlackFraction
+			merged.UtilisationWeight = source.UtilisationWeight
+			merged.UtilisationContribution = source.UtilisationContribution
+			byNode[source.NodeName] = merged
+		}
+	}
+}
+
+func mergeScoreBasedConcentrationSources(byNode map[string]scoreBasedSourceScore, sources []scoreBasedInstanceTypeConcentrationSourceScore) {
+	for _, source := range sources {
+		merged, found := byNode[source.NodeName]
+		if found {
+			merged.InstanceTypeConcentration = source
+			byNode[source.NodeName] = merged
+		}
+	}
+}
+
+func scoreMoveSetUtilisation(command Command, configs scoreBasedScoringConfig) scoreBasedUtilisationScore {
+	score := scoreBasedUtilisationScore{
+		Status:      scoreFactorApplied,
+		SourceNodes: make([]scoreBasedSourceScore, 0, len(command.Candidates)),
+	}
+	for _, candidate := range command.Candidates {
 		allocatableCPU := candidateAllocatableCPU(candidate)
 		if allocatableCPU <= 0 {
-			details = append(details, scoreBasedSourceScore{})
+			source := scoreBasedSourceScore{}
+			if candidate != nil {
+				source.NodeName = candidate.Name()
+				if candidate.NodePool != nil {
+					source.NodePoolName = candidate.NodePool.Name
+				}
+			}
+			score.SourceNodes = append(score.SourceNodes, source)
 			continue
 		}
 		requestedCPU := candidateRequestedCPU(candidate)
@@ -97,21 +266,30 @@ func moveSetUtilisationScoreDetails(cmd Command) (float64, []scoreBasedSourceSco
 			unallocatedCPU = 0
 		}
 		weight := defaultScoreBasedUtilisationWeight
-		if candidate.NodePool != nil {
-			weight = scoreBasedUtilisationWeight(candidate.NodePool)
+		if candidate != nil && candidate.NodePool != nil {
+			if configured, found := configs[candidate.NodePool.Name]; found {
+				weight = configured.utilisationWeight
+			}
 		}
 		slackFraction := unallocatedCPU / allocatableCPU
 		contribution := weight * slackFraction
-		score += contribution
-		details = append(details, scoreBasedSourceScore{
+		score.Contribution += contribution
+		source := scoreBasedSourceScore{
 			AllocatableCPU:          allocatableCPU,
 			RequestedCPU:            requestedCPU,
 			CPUSlackFraction:        slackFraction,
 			UtilisationWeight:       weight,
 			UtilisationContribution: contribution,
-		})
+		}
+		if candidate != nil {
+			source.NodeName = candidate.Name()
+			if candidate.NodePool != nil {
+				source.NodePoolName = candidate.NodePool.Name
+			}
+		}
+		score.SourceNodes = append(score.SourceNodes, source)
 	}
-	return score, details
+	return score
 }
 
 // consolidationSavingsUSDPerHour mirrors EstimatedSavings for commands produced by scheduling simulation,

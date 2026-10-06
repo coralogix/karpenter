@@ -58,6 +58,8 @@ type scoreBasedPriceGroupScore struct {
 type scoreBasedCostScore struct {
 	Enabled               bool                                 `json:"enabled"`
 	Valid                 bool                                 `json:"valid"`
+	Status                scoreFactorStatus                    `json:"status"`
+	Reason                string                               `json:"reason,omitempty"`
 	SourceUSDPerHour      float64                              `json:"sourceUSDPerHour"`
 	SavingsUSDPerHour     float64                              `json:"savingsUSDPerHour"`
 	ReplacementUSDPerHour float64                              `json:"replacementUSDPerHour"`
@@ -166,7 +168,12 @@ func scoreBasedOfferingPrice(instanceType *cloudprovider.InstanceType, labels ma
 // A known zero-price source adds zero to the normalized source sum. Unknown
 // source prices and non-zero prices without a valid positive baseline invalidate the move.
 func (snapshot *scoreBasedPriceSnapshot) score(command Command) scoreBasedCostScore {
-	details := scoreBasedCostScore{Enabled: true, Groups: map[string]scoreBasedPriceGroupScore{}}
+	details := scoreBasedCostScore{
+		Enabled: true,
+		Status:  scoreFactorUnavailable,
+		Reason:  "cost_inputs_unavailable",
+		Groups:  map[string]scoreBasedPriceGroupScore{},
+	}
 	if snapshot == nil || len(command.Candidates) == 0 {
 		return details
 	}
@@ -182,11 +189,15 @@ func (snapshot *scoreBasedPriceSnapshot) score(command Command) scoreBasedCostSc
 	for _, candidate := range command.Candidates {
 		normalizedPrice, nodePrice, group, valid := snapshot.normalizedCandidatePrice(candidate)
 		if !valid {
-			return scoreBasedCostScore{Enabled: true}
+			return details
 		}
 		addScoreBasedCostGroup(details.Groups, nodePrice.group, group, normalizedPrice)
 		details.NormalizedSourceCost += normalizedPrice
 		details.SourceNodes = append(details.SourceNodes, scoreBasedSourceScore{
+			NodeName:              candidate.Name(),
+			NodePoolName:          candidate.NodePool.Name,
+			InstanceType:          candidate.Labels()[corev1.LabelInstanceTypeStable],
+			CapacityType:          candidate.Labels()[v1.CapacityTypeLabelKey],
 			PriceUSDPerHour:       nodePrice.price,
 			AllocatableCPU:        nodePrice.cpu,
 			BaselineUSDPerCPUHour: group.baseline,
@@ -195,7 +206,7 @@ func (snapshot *scoreBasedPriceSnapshot) score(command Command) scoreBasedCostSc
 	}
 	contribution := savingsFraction * details.NormalizedSourceCost
 	if !finiteScoreValue(contribution) {
-		return scoreBasedCostScore{Enabled: true}
+		return details
 	}
 	details.SavingsFraction = savingsFraction
 	details.SourceUSDPerHour = sourcePrice
@@ -206,6 +217,8 @@ func (snapshot *scoreBasedPriceSnapshot) score(command Command) scoreBasedCostSc
 		details.SourceNodes[i].CostContribution = savingsFraction * details.SourceNodes[i].NormalizedSourceCost
 	}
 	details.Valid = true
+	details.Status = scoreFactorApplied
+	details.Reason = ""
 	return details
 }
 

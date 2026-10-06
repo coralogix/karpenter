@@ -77,13 +77,7 @@ const (
 
 type moveSetEvaluation struct {
 	Command                    Command
-	Score                      float64
-	BaseScore                  float64
-	Cost                       scoreBasedCostScore
-	MemoryBalance              scoreBasedMemoryScore
-	InstanceTypeConcentration  scoreBasedInstanceTypeConcentrationScore
-	SourceNodeScores           []scoreBasedSourceScore
-	UtilisationContribution    float64
+	Score                      moveSetScore
 	searchPath                 scoreBasedMoveSetSearchPath
 	sourceNodeSingleMoveScores []float64
 	validationStatus           string
@@ -313,7 +307,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	}
 
 	sort.Slice(evals, func(i, j int) bool {
-		return evals[i].Score > evals[j].Score
+		return evals[i].Score.Total > evals[j].Score.Total
 	})
 
 	remainingValidationDelay := commandValidationDelay - s.clock.Since(start)
@@ -382,8 +376,7 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 	for i, candidate := range searchCandidates {
 		singleNodeMoveSets[i] = moveSet{Nodes: []*Candidate{candidate}}
 	}
-	memoryConfigs := scoreBasedMemoryConfigs(validCandidates)
-	concentrationConfigs := scoreBasedInstanceTypeConcentrationConfigs(validCandidates)
+	scoringConfigs := scoreBasedScoringConfigForCandidates(validCandidates)
 	simulatorCtx, stopSimulator := cxtracing.Measure(searchCtx, nil, scoreBasedConsolidationNewSimulatorSpan,
 		attribute.Int("valid_candidate_count", len(validCandidates)),
 	)
@@ -401,13 +394,13 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 	}
 	nodeSnapshot := simulator.StateNodesSnapshot()
 	priceSnapshot := newScoreBasedPriceSnapshot(nodeSnapshot, validCandidates)
-	concentrationSnapshot := newScoreBasedInstanceTypeConcentrationSnapshot(nodeSnapshot, concentrationConfigs)
+	concentrationSnapshot := newScoreBasedInstanceTypeConcentrationSnapshot(nodeSnapshot, scoringConfigs)
 	memorySnapshotCtx, stopMemorySnapshot := cxtracing.Measure(searchCtx, nil, scoreBasedConsolidationMemorySnapshotSpan,
-		attribute.Bool("enabled", hasScoreBasedMemoryBalanceWeight(memoryConfigs)),
+		attribute.Bool("enabled", hasScoreBasedMemoryBalanceWeight(scoringConfigs)),
 	)
 	var memorySnapshot *scoreBasedMemorySnapshot
-	if hasScoreBasedMemoryBalanceWeight(memoryConfigs) {
-		memorySnapshot = newScoreBasedMemorySnapshot(nodeSnapshot, memoryConfigs)
+	if hasScoreBasedMemoryBalanceWeight(scoringConfigs) {
+		memorySnapshot = newScoreBasedMemorySnapshot(nodeSnapshot, scoringConfigs)
 		trace.SpanFromContext(memorySnapshotCtx).SetAttributes(memorySnapshot.spanAttributes(len(nodeSnapshot))...)
 	}
 	stopMemorySnapshot()
@@ -418,25 +411,8 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 		publishScoreBasedNoSavingsEvent(s.recorder, cmd, err)
 		return cmd, err
 	}
-	scoreMoveSet := func(cmd Command) moveSetScoring {
-		baseScore, costScore, utilisationContribution, sourceNodeScores := scoreMoveSetPriorityDetails(cmd, priceSnapshot)
-		concentration := concentrationSnapshot.score(cmd)
-		for i := range sourceNodeScores {
-			if i < len(concentration.SourceNodes) {
-				sourceNodeScores[i].InstanceTypeConcentration = concentration.SourceNodes[i]
-			}
-		}
-		memoryBalance := scoreBasedMemoryScoreForCommand(cmd, memorySnapshot, memoryConfigs)
-		return moveSetScoring{
-			Score:                     baseScore + memoryBalance.Correction + concentration.Correction,
-			BaseScore:                 baseScore,
-			Cost:                      costScore,
-			MemoryBalance:             memoryBalance,
-			InstanceTypeConcentration: concentration,
-			SourceNodeScores:          sourceNodeScores,
-			UtilisationContribution:   utilisationContribution,
-		}
-	}
+	scorer := newMoveSetScorer(priceSnapshot, scoringConfigs, memorySnapshot, concentrationSnapshot)
+	scoreMoveSet := scorer.Score
 
 	// Search every singleton before deciding whether to batch successes or explore pairs.
 	singles, evaluated, timedOut, stats, err := evaluateMoveSetsParWithStats(searchCtx, singleNodeMoveSets, deadline, compute, 0, nil, scoreMoveSet, result.stats)
@@ -448,7 +424,7 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 	}
 	for _, eval := range singles {
 		eval.searchPath = scoreBasedSearchPathSingleNode
-		eval.sourceNodeSingleMoveScores = []float64{eval.Score}
+		eval.sourceNodeSingleMoveScores = []float64{eval.Score.Total}
 	}
 	if timedOut {
 		result.evals = retainScoreBasedMoveSetResults(singles, nil, scoreBasedMoveSetResultLimit)
