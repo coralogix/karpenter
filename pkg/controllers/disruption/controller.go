@@ -457,7 +457,7 @@ func (c *Controller) refreshEmptyReclamationInventory(ctx context.Context, disru
 	if !ok {
 		return nil
 	}
-	if _, err := scoreBased.emptyReclamationNodeCounts(ctx); err != nil {
+	if _, err := scoreBased.refreshReclamationInventory(ctx); err != nil {
 		return fmt.Errorf("updating score-based reclamation inventory, %w", err)
 	}
 	return nil

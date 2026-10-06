@@ -54,6 +54,11 @@ type ScoreBasedReclamation struct {
 	validator Validator
 }
 
+type scoreBasedReclamationInventory struct {
+	dueEmptyNodeCounts map[string]int
+	emptyNodeCounts    map[string]scoreBasedEmptyNodeCounts
+}
+
 func NewScoreBasedReclamation(c consolidation, opts ...option.Function[MethodOptions]) *ScoreBasedReclamation {
 	o := option.Resolve(append([]option.Function[MethodOptions]{WithValidator(NewScoreBasedReclamationValidator(c))}, opts...)...)
 	return &ScoreBasedReclamation{
@@ -75,8 +80,7 @@ func NewScoreBasedReclamationValidator(c consolidation) *scoreBasedReclamationVa
 			queue:         c.queue,
 			reason:        v1.DisruptionReasonEmpty,
 		},
-		filter:         s.ShouldDisrupt,
-		validationType: ScoreBasedReclamationType,
+		reclamation: s,
 	}
 }
 
@@ -110,7 +114,7 @@ func (s *ScoreBasedReclamation) ConsolidationType() string {
 // computeReclamationCommand chooses empty candidates for removal without applying NodePool
 // disruption budgets. Reclamation runs as its own method before score-based compaction.
 func (s *ScoreBasedReclamation) computeReclamationCommand(ctx context.Context, candidates []*Candidate) (*Command, error) {
-	emptyCounts, err := s.emptyReclamationNodeCounts(ctx)
+	inventory, err := s.refreshReclamationInventory(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +124,7 @@ func (s *ScoreBasedReclamation) computeReclamationCommand(ctx context.Context, c
 		return nil, nil
 	}
 
-	selected := selectReclamationCandidates(byPool, emptyCounts)
+	selected := selectReclamationCandidates(byPool, inventory.dueEmptyNodeCounts)
 	if len(selected) == 0 {
 		return nil, nil
 	}
@@ -194,7 +198,8 @@ func selectReclamationCandidates(byPool map[string][]*Candidate, emptyCounts map
 	sort.Strings(poolNames)
 	var selected []*Candidate
 	for _, name := range poolNames {
-		emptyCandidates := byPool[name]
+		// Selection is pure: sorting a private slice leaves the candidate inventory intact.
+		emptyCandidates := append([]*Candidate(nil), byPool[name]...)
 		sortReclamationCandidates(emptyCandidates)
 		removalCount := reclamationRemovalCount(emptyCounts[name])
 		if removalCount > len(emptyCandidates) {
@@ -208,9 +213,14 @@ func selectReclamationCandidates(byPool map[string][]*Candidate, emptyCounts map
 func (s *ScoreBasedReclamation) validateReclamationCommand(ctx context.Context, cmd Command) (*Command, error) {
 	// Reclamation considers only nodes already marked and tainted as standby. Refresh candidates
 	// immediately before admission; the queue performs a final live check and conditional delete.
-	validated, _, err := selectFirstStillValidCommand(ctx, s.validator, s.recorder, []*moveSetEvaluation{{Command: cmd, Score: moveSetScore{Total: 1}}})
+	validated, err := s.validator.Validate(ctx, cmd, 0)
 	if err != nil {
-		return nil, err
+		if IsValidationError(err) {
+			reason := getValidationFailureReason(err)
+			cmd.EmitRejectedEvents(s.recorder, reason)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("validating score-based reclamation, %w", err)
 	}
 	if len(validated.Candidates) == 0 {
 		return nil, nil
@@ -218,16 +228,26 @@ func (s *ScoreBasedReclamation) validateReclamationCommand(ctx context.Context, 
 	return &validated, nil
 }
 
-// emptyReclamationNodeCounts counts managed, non-terminating empty nodes in configured score-based
-// pools. It returns due-pool counts for reclamation selection and publishes inventory counts for all
-// configured pools, regardless of reclamation cadence.
-func (s *ScoreBasedReclamation) emptyReclamationNodeCounts(ctx context.Context) (map[string]int, error) {
+func (s *ScoreBasedReclamation) refreshReclamationInventory(ctx context.Context) (*scoreBasedReclamationInventory, error) {
+	inventory, err := s.collectReclamationInventory(ctx)
+	if err != nil {
+		return nil, err
+	}
+	updateScoreBasedEmptyNodeMetrics(inventory.emptyNodeCounts)
+	return inventory, nil
+}
+
+// collectReclamationInventory counts managed, non-terminating empty nodes in configured score-based
+// pools. Selection consumes only dueEmptyNodeCounts; emptyNodeCounts is published independently.
+func (s *ScoreBasedReclamation) collectReclamationInventory(ctx context.Context) (*scoreBasedReclamationInventory, error) {
 	nodePools, inventoryCounts, err := s.scoreBasedReclamationPools(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	dueCounts := map[string]int{}
+	inventory := &scoreBasedReclamationInventory{
+		dueEmptyNodeCounts: map[string]int{},
+		emptyNodeCounts:    inventoryCounts,
+	}
 	now := s.clock.Now()
 	for _, node := range s.cluster.DeepCopyNodes() {
 		nodePool, poolName, isStandby, empty, err := s.emptyReclamationNodeInventory(ctx, node, nodePools)
@@ -237,13 +257,12 @@ func (s *ScoreBasedReclamation) emptyReclamationNodeCounts(ctx context.Context) 
 		if !empty {
 			continue
 		}
-		inventoryCounts[poolName] = inventoryCounts[poolName].add(isStandby)
+		inventory.emptyNodeCounts[poolName] = inventory.emptyNodeCounts[poolName].add(isStandby)
 		if isStandby && scoreBasedReclamationDue(nodePool, now) {
-			dueCounts[poolName]++
+			inventory.dueEmptyNodeCounts[poolName]++
 		}
 	}
-	updateScoreBasedEmptyNodeMetrics(inventoryCounts)
-	return dueCounts, nil
+	return inventory, nil
 }
 
 func (s *ScoreBasedReclamation) scoreBasedReclamationPools(ctx context.Context) (map[string]*v1.NodePool, map[string]scoreBasedEmptyNodeCounts, error) {

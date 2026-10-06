@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -34,6 +35,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	fakeprovider "sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
@@ -82,18 +84,18 @@ func TestScoreBasedReclamationEmptyNodeMetricsIncludeAllConfiguredPools(t *testi
 	consolidator := MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
 	reclamation := NewScoreBasedReclamation(consolidator)
 
-	dueCounts, err := reclamation.emptyReclamationNodeCounts(ctx)
+	inventory, err := reclamation.refreshReclamationInventory(ctx)
 	if err != nil {
-		t.Fatalf("emptyReclamationNodeCounts() error = %v", err)
+		t.Fatalf("refreshReclamationInventory() error = %v", err)
 	}
-	if dueCounts["due-pool"] != 1 {
-		t.Fatalf("due-pool standby count = %d, want 1", dueCounts["due-pool"])
+	if inventory.dueEmptyNodeCounts["due-pool"] != 1 {
+		t.Fatalf("due-pool standby count = %d, want 1", inventory.dueEmptyNodeCounts["due-pool"])
 	}
 	if ExperimentalReclamationRemoveAllEmptyImmediately {
-		if dueCounts["not-due-pool"] != 0 {
-			t.Fatalf("not-due-pool standby count = %d, want 0 for marker-only node", dueCounts["not-due-pool"])
+		if inventory.dueEmptyNodeCounts["not-due-pool"] != 0 {
+			t.Fatalf("not-due-pool standby count = %d, want 0 for marker-only node", inventory.dueEmptyNodeCounts["not-due-pool"])
 		}
-	} else if _, ok := dueCounts["not-due-pool"]; ok {
+	} else if _, ok := inventory.dueEmptyNodeCounts["not-due-pool"]; ok {
 		t.Fatal("non-due pool should not be included in reclamation selection counts")
 	}
 	assertScoreBasedEmptyNodeMetric(t, "due-pool", scoreBasedEmptyNodeStateStandby, 1, true)
@@ -130,8 +132,8 @@ func TestScoreBasedReclamationEmptyNodeMetricsKeepLastCompleteScanAndRemoveOutOf
 	}
 	consolidator := MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
 	reclamation := NewScoreBasedReclamation(consolidator)
-	if _, err := reclamation.emptyReclamationNodeCounts(ctx); err != nil {
-		t.Fatalf("initial emptyReclamationNodeCounts() error = %v", err)
+	if _, err := reclamation.refreshReclamationInventory(ctx); err != nil {
+		t.Fatalf("initial refreshReclamationInventory() error = %v", err)
 	}
 	assertScoreBasedEmptyNodeMetric(t, "old-pool", scoreBasedEmptyNodeStateOther, 1, true)
 
@@ -155,15 +157,15 @@ func TestScoreBasedReclamationEmptyNodeMetricsKeepLastCompleteScanAndRemoveOutOf
 	}
 
 	reclamation.kubeClient = errorOnPodListClient{Client: kubeClient, err: errors.New("pod list failed")}
-	if _, err := reclamation.emptyReclamationNodeCounts(ctx); err == nil {
-		t.Fatal("emptyReclamationNodeCounts() error = nil, want pod-list error")
+	if _, err := reclamation.refreshReclamationInventory(ctx); err == nil {
+		t.Fatal("refreshReclamationInventory() error = nil, want pod-list error")
 	}
 	assertScoreBasedEmptyNodeMetric(t, "old-pool", scoreBasedEmptyNodeStateOther, 1, true)
 	assertScoreBasedEmptyNodeMetric(t, "new-pool", scoreBasedEmptyNodeStateOther, 0, false)
 
 	reclamation.kubeClient = kubeClient
-	if _, err := reclamation.emptyReclamationNodeCounts(ctx); err != nil {
-		t.Fatalf("complete emptyReclamationNodeCounts() error = %v", err)
+	if _, err := reclamation.refreshReclamationInventory(ctx); err != nil {
+		t.Fatalf("complete refreshReclamationInventory() error = %v", err)
 	}
 	assertScoreBasedEmptyNodeMetric(t, "old-pool", scoreBasedEmptyNodeStateOther, 0, false)
 	assertScoreBasedEmptyNodeMetric(t, "new-pool", scoreBasedEmptyNodeStateOther, 1, true)
@@ -590,4 +592,167 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 	if err := reclamation.reclamationBeforeDelete(ctx, []*Candidate{candidate}); !IsUnrecoverableError(err) {
 		t.Fatalf("BeforeDelete() error for an activating node = %v, want unrecoverable", err)
 	}
+}
+
+func TestScoreBasedReclamationValidationRefreshesOnlySelectedPools(t *testing.T) {
+	fixture := newScoreBasedReclamationValidationFixture(t, "unrelated-pool")
+	fixture.provider.ErrorsForNodePool["unrelated-pool"] = errors.New("unrelated pool instance types unavailable")
+
+	validated, err := fixture.reclamation.validator.Validate(fixture.ctx, fixture.command(), 0)
+	if err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if len(validated.Candidates) != 1 {
+		t.Fatalf("validated candidate count = %d, want 1", len(validated.Candidates))
+	}
+	if got := fixture.provider.instanceTypePoolNames; len(got) != 2 || got[0] != fixture.pool.Name || got[1] != fixture.pool.Name {
+		t.Fatalf("GetInstanceTypes pools = %v, want only the selected pool on both selected-candidate refreshes", got)
+	}
+}
+
+func TestScoreBasedReclamationValidationRejectsSelectedCandidateSafetyChanges(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*testing.T, *scoreBasedReclamationValidationFixture)
+	}{
+		{
+			name: "cluster deletion mark",
+			change: func(_ *testing.T, fixture *scoreBasedReclamationValidationFixture) {
+				fixture.cluster.MarkForDeletion(fixture.candidate.ProviderID())
+			},
+		},
+		{
+			name: "same-name replacement",
+			change: func(t *testing.T, fixture *scoreBasedReclamationValidationFixture) {
+				claim := fixture.candidate.NodeClaim.DeepCopy()
+				node := fixture.candidate.Node.DeepCopy()
+				if err := fixture.kubeClient.Delete(fixture.ctx, claim); err != nil {
+					t.Fatal(err)
+				}
+				if err := fixture.kubeClient.Delete(fixture.ctx, node); err != nil {
+					t.Fatal(err)
+				}
+				claim.UID = types.UID("replacement-claim-uid")
+				claim.ResourceVersion = ""
+				node.UID = types.UID("replacement-node-uid")
+				node.ResourceVersion = ""
+				if err := fixture.kubeClient.Create(fixture.ctx, claim); err != nil {
+					t.Fatal(err)
+				}
+				if err := fixture.kubeClient.Create(fixture.ctx, node); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "daemonset pod do-not-disrupt",
+			change: func(t *testing.T, fixture *scoreBasedReclamationValidationFixture) {
+				pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+					Name:      "protected-daemon",
+					Namespace: "default",
+					Annotations: map[string]string{
+						v1.DoNotDisruptAnnotationKey: "true",
+					},
+					OwnerReferences: []metav1.OwnerReference{{Kind: "DaemonSet", Name: "system-daemon"}},
+				}, Spec: corev1.PodSpec{NodeName: fixture.candidate.Node.Name}}
+				pod.Status.Phase = corev1.PodRunning
+				if err := fixture.kubeClient.Create(fixture.ctx, pod); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newScoreBasedReclamationValidationFixture(t)
+			tt.change(t, fixture)
+			_, err := fixture.reclamation.validator.Validate(fixture.ctx, fixture.command(), 0)
+			var churnErr *ChurnValidationError
+			if !errors.As(err, &churnErr) {
+				t.Fatalf("Validate() error = %v, want churn rejection", err)
+			}
+		})
+	}
+}
+
+type scoreBasedReclamationValidationFixture struct {
+	ctx         context.Context
+	kubeClient  client.Client
+	cluster     *state.Cluster
+	provider    *reclamationValidationCloudProvider
+	pool        *v1.NodePool
+	candidate   *Candidate
+	reclamation *ScoreBasedReclamation
+}
+
+func newScoreBasedReclamationValidationFixture(t *testing.T, extraPoolNames ...string) *scoreBasedReclamationValidationFixture {
+	t.Helper()
+	ctx := context.Background()
+	clock := clocktesting.NewFakeClock(time.Date(2026, time.September, 25, 13, 0, 0, 0, time.UTC))
+	pool := scoreBasedReclamationTestManagedPool("selected-pool")
+	objects := []client.Object{pool}
+	for _, name := range extraPoolNames {
+		objects = append(objects, scoreBasedReclamationTestManagedPool(name))
+	}
+	nodeClaim, node := scoreBasedReclamationTestNode(pool.Name, "selected-node", true, true, false)
+	nodeClaim.UID = types.UID("selected-claim-uid")
+	node.UID = types.UID("selected-node-uid")
+	node.Labels[v1.NodeRegisteredLabelKey] = "true"
+	objects = append(objects, nodeClaim, node)
+	provider := &reclamationValidationCloudProvider{CloudProvider: fakeprovider.NewCloudProvider()}
+	provider.InstanceTypesForNodePool[pool.Name] = []*cloudprovider.InstanceType{fakeprovider.NewInstanceType("m6i.large")}
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(objects...).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
+			pod := obj.(*corev1.Pod)
+			if pod.Spec.NodeName == "" {
+				return nil
+			}
+			return []string{pod.Spec.NodeName}
+		}).Build()
+	cluster := state.NewCluster(clock, kubeClient, provider)
+	cluster.UpdateNodeClaim(nodeClaim)
+	if err := cluster.UpdateNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	recorder := events.NewRecorder(record.NewFakeRecorder(20))
+	queue := NewQueue(kubeClient, recorder, cluster, clock, nil)
+	reclamation := NewScoreBasedReclamation(MakeConsolidation(clock, cluster, kubeClient, nil, provider, recorder, queue, nil))
+	candidate := &Candidate{StateNode: cluster.DeepCopyNodes()[0], NodePool: pool}
+	return &scoreBasedReclamationValidationFixture{
+		ctx: ctx, kubeClient: kubeClient, cluster: cluster, provider: provider,
+		pool: pool, candidate: candidate, reclamation: reclamation,
+	}
+}
+
+func (f *scoreBasedReclamationValidationFixture) command() Command {
+	return Command{Method: f.reclamation, Candidates: []*Candidate{f.candidate}}
+}
+
+type reclamationValidationCloudProvider struct {
+	*fakeprovider.CloudProvider
+	instanceTypePoolNames []string
+}
+
+func (p *reclamationValidationCloudProvider) GetInstanceTypes(ctx context.Context, pool *v1.NodePool) ([]*cloudprovider.InstanceType, error) {
+	if pool != nil {
+		p.instanceTypePoolNames = append(p.instanceTypePoolNames, pool.Name)
+	}
+	return p.CloudProvider.GetInstanceTypes(ctx, pool)
+}
+
+func scoreBasedReclamationTestManagedPool(name string) *v1.NodePool {
+	return test.NodePool(v1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+			Annotations: map[string]string{
+				v1.ScoreBasedConsolidationAnnotationKey: "",
+			},
+		},
+		Spec: v1.NodePoolSpec{Disruption: v1.Disruption{
+			ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
+			ConsolidateAfter:    v1.MustParseNillableDuration("0s"),
+		}},
+	})
 }
