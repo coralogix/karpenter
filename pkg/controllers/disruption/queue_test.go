@@ -347,7 +347,16 @@ var _ = Describe("Queue", func() {
 			evictionQueue := terminator.NewQueue(env.Client, recorder)
 			queue.SetEvictionQueue(evictionQueue)
 			pod := test.Pod(test.PodOptions{NodeName: node1.Name})
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1, pod)
+			terminalPod := test.Pod(test.PodOptions{NodeName: node1.Name})
+			terminalPod.Finalizers = []string{"testing/terminal-finalizer"}
+			mirrorPod := test.Pod(test.PodOptions{NodeName: node1.Name})
+			mirrorPod.Annotations = map[string]string{corev1.MirrorPodAnnotationKey: "static-pod"}
+			mirrorPod.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: node1.Name, UID: types.UID("mirror-node")}}
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1, pod, terminalPod, mirrorPod)
+			storedTerminalPod := &corev1.Pod{}
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(terminalPod), storedTerminalPod)).To(Succeed())
+			storedTerminalPod.Status.Phase = corev1.PodSucceeded
+			Expect(env.Client.Status().Update(ctx, storedTerminalPod)).To(Succeed())
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
 			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
 			cmd := &disruption.Command{

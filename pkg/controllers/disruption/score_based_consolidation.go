@@ -26,15 +26,20 @@ import (
 	"time"
 
 	"github.com/awslabs/operatorpkg/option"
+	"github.com/samber/lo"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/events"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
+	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
@@ -143,11 +148,16 @@ func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candida
 
 // shouldCompact admits only eligible, non-empty active nodes into normal compaction.
 // It deliberately excludes empty nodes even when the combined method admits them for reclamation.
-func (s *ScoreBasedConsolidation) shouldCompact(ctx context.Context, cn *Candidate) bool {
+func (s *ScoreBasedConsolidation) shouldCompact(_ context.Context, cn *Candidate) bool {
 	if !s.compactionCandidateEligible(cn) {
 		return false
 	}
-	return s.compactionCandidateNonEmpty(ctx, cn)
+	// A terminating-only node is still occupied, but it has no movable workload for a
+	// compaction command. Leave it active until the pod leaves or becomes terminal; standby
+	// marking will then own it without leaving an evacuation waiting on a pod Karpenter cannot evict.
+	return lo.SomeBy(cn.reschedulablePods, func(pod *corev1.Pod) bool {
+		return podutils.IsActive(pod) && podutils.IsReschedulable(pod)
+	})
 }
 
 func (s *ScoreBasedConsolidation) compactionCandidateEligible(cn *Candidate) bool {
@@ -166,14 +176,11 @@ func (s *ScoreBasedConsolidation) compactionCandidateEligible(cn *Candidate) boo
 	return s.shouldDisruptIgnoringConsolidateAfter(cn)
 }
 
-func (s *ScoreBasedConsolidation) compactionCandidateNonEmpty(ctx context.Context, cn *Candidate) bool {
-	// A reschedulable non-daemon pod proves the node is non-empty. Check the API when the
-	// candidate has no reschedulable pods to include terminal and terminating bound pods.
-	if len(cn.reschedulablePods) > 0 {
-		return true
+func (s *ScoreBasedConsolidation) apiReader() client.Reader {
+	if s.queue != nil && s.queue.apiReader != nil {
+		return s.queue.apiReader
 	}
-	empty, err := reclamationEmpty(ctx, s.kubeClient, cn.Node)
-	return err == nil && !empty
+	return s.kubeClient
 }
 
 //nolint:gocyclo
@@ -240,7 +247,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 			}
 			continue
 		}
-		if len(candidate.reschedulablePods) > 0 && !s.underutilizedPace.candidateAllowed(candidate.NodePool, 0) {
+		if !s.underutilizedPace.candidateAllowed(candidate.NodePool, 0) {
 			paceBlockedCandidateCount++
 			if _, reported := paceBlockedNodePools[candidate.NodePool.Name]; !reported {
 				s.recorder.Publish(scoreBasedNodePoolBlockedByPace(candidate.NodePool))
@@ -325,7 +332,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	validateCtx, stopValidate := cxtracing.Measure(ctx, nil, scoreBasedConsolidationValidateSpan,
 		attribute.Int("move_set_eval_count", len(evals)),
 	)
-	cmd, selectedEvalIdx, err := selectFirstStillValidCommand(validateCtx, s.validator, s.recorder, evals)
+	cmd, selectedEvalIdx, err := selectFirstStillValidCommand(validateCtx, s.validator, s.recorder, evals, s.validateCommandPaceAndCap)
 	stopValidate()
 	if err != nil {
 		return []Command{}, err
@@ -492,13 +499,30 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 	return result, nil
 }
 
-func selectFirstStillValidCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation) (Command, int, error) {
+//nolint:gocyclo // Ranked fallback, validation reporting, and optional final checks form one command selection pass.
+func selectFirstStillValidCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation, checks ...func(context.Context, *Command) error) (Command, int, error) {
 	for _, eval := range evals {
 		eval.validationStatus = "not_attempted"
 		eval.validationReason = ""
 	}
 	for i, eval := range evals {
-		if _, err := validator.Validate(ctx, eval.Command, 0); err != nil {
+		validated, err := validator.Validate(ctx, eval.Command, 0)
+		if err == nil && len(checks) > 0 {
+			validated.Candidates = append([]*Candidate(nil), validated.Candidates...)
+			for candidateIdx, candidate := range validated.Candidates {
+				if candidate != nil {
+					candidateCopy := *candidate
+					validated.Candidates[candidateIdx] = &candidateCopy
+				}
+			}
+			for _, check := range checks {
+				if checkErr := check(ctx, &validated); checkErr != nil {
+					err = checkErr
+					break
+				}
+			}
+		}
+		if err != nil {
 			if IsValidationError(err) {
 				eval.validationStatus = "failed"
 				eval.validationReason = getValidationFailureReason(err)
@@ -508,9 +532,99 @@ func selectFirstStillValidCommand(ctx context.Context, validator Validator, reco
 			return Command{}, -1, fmt.Errorf("validating score-based consolidation, %w", err)
 		}
 		eval.validationStatus = "validated"
+		if len(checks) > 0 {
+			return validated, i, nil
+		}
 		return eval.Command, i, nil
 	}
 	return Command{}, -1, nil
+}
+
+//nolint:gocyclo // This final command gate checks current pool policy, cap, pace, and every selected source.
+func (s *ScoreBasedConsolidation) validateCommandPaceAndCap(ctx context.Context, cmd *Command) error {
+	counts := map[string]int{}
+	for _, candidate := range cmd.Candidates {
+		if candidate == nil || candidate.Node == nil || candidate.NodeClaim == nil || candidate.NodePool == nil {
+			return NewChurnValidationError(fmt.Errorf("score-based compaction candidate is missing its Node, NodeClaim, or NodePool"))
+		}
+		counts[candidate.NodePool.Name]++
+	}
+	reader := s.apiReader()
+	if reader == nil {
+		return fmt.Errorf("score-based compaction requires an API reader for final validation")
+	}
+	for name, count := range counts {
+		liveNodePool := &v1.NodePool{}
+		if err := reader.Get(ctx, types.NamespacedName{Name: name}, liveNodePool); err != nil {
+			if apierrors.IsNotFound(err) {
+				return NewChurnValidationError(fmt.Errorf("NodePool %q no longer exists", name))
+			}
+			return fmt.Errorf("getting live NodePool %q for compaction pace validation, %w", name, err)
+		}
+		nodePool := liveNodePool
+		if !NodePoolUsesScoreBasedConsolidation(nodePool) || nodePool.Spec.Disruption.ConsolidationPolicy != v1.ConsolidationPolicyWhenEmptyOrUnderutilized {
+			return NewChurnValidationError(fmt.Errorf("NodePool %q no longer permits score-based compaction", name))
+		}
+		config := underutilizedPaceConfigFor(nodePool)
+		if config.maxNodesPerCommand > 0 && count > config.maxNodesPerCommand {
+			return NewBudgetValidationError(fmt.Errorf("score-based compaction has %d candidates for NodePool %q, exceeding its limit of %d", count, name, config.maxNodesPerCommand))
+		}
+		for _, candidate := range cmd.Candidates {
+			if candidate.NodePool.Name != name {
+				continue
+			}
+			if err := s.validateLiveCompactionCandidate(ctx, reader, candidate, name); err != nil {
+				return err
+			}
+			candidate.NodePool = nodePool
+		}
+		if !s.underutilizedPace.candidateAllowed(nodePool, count-1) {
+			if s.recorder != nil {
+				s.recorder.Publish(scoreBasedNodePoolBlockedByPace(nodePool))
+			}
+			return NewBudgetValidationError(fmt.Errorf("score-based compaction is blocked by the pace limit for NodePool %q", name))
+		}
+	}
+	return nil
+}
+
+//nolint:gocyclo // Identity, deletion, standby, activation, and occupancy checks jointly protect one live source.
+func (s *ScoreBasedConsolidation) validateLiveCompactionCandidate(ctx context.Context, reader client.Reader, candidate *Candidate, nodePoolName string) error {
+	liveNode := &corev1.Node{}
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(candidate.Node), liveNode); err != nil {
+		if apierrors.IsNotFound(err) {
+			return NewChurnValidationError(fmt.Errorf("score-based compaction candidate Node %q no longer exists", candidate.Node.Name))
+		}
+		return fmt.Errorf("getting live Node %q for score-based compaction validation, %w", candidate.Node.Name, err)
+	}
+	if liveNode.UID != candidate.Node.UID || liveNode.Spec.ProviderID != candidate.ProviderID() || !liveNode.DeletionTimestamp.IsZero() ||
+		standby.HasNodeTaint(liveNode) || liveNode.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" ||
+		liveNode.Labels[v1.NodePoolLabelKey] != nodePoolName {
+		return NewChurnValidationError(fmt.Errorf("score-based compaction candidate Node %q changed identity or state", candidate.Node.Name))
+	}
+	liveNodeClaim := &v1.NodeClaim{}
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), liveNodeClaim); err != nil {
+		if apierrors.IsNotFound(err) {
+			return NewChurnValidationError(fmt.Errorf("score-based compaction candidate NodeClaim %q no longer exists", candidate.NodeClaim.Name))
+		}
+		return fmt.Errorf("getting live NodeClaim %q for score-based compaction validation, %w", candidate.NodeClaim.Name, err)
+	}
+	if liveNodeClaim.UID != candidate.NodeClaim.UID || !liveNodeClaim.DeletionTimestamp.IsZero() ||
+		liveNodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() ||
+		standby.IsNodeClaimStandby(liveNodeClaim) || standby.IsNodeClaimActivating(liveNodeClaim) ||
+		liveNodeClaim.Labels[v1.NodePoolLabelKey] != nodePoolName {
+		return NewChurnValidationError(fmt.Errorf("score-based compaction candidate NodeClaim %q changed state", candidate.NodeClaim.Name))
+	}
+	livePods, err := scoreBasedNodeOccupyingPods(ctx, reader, liveNode)
+	if err != nil {
+		return fmt.Errorf("checking live occupancy for score-based compaction Node %q, %w", liveNode.Name, err)
+	}
+	if lo.NoneBy(livePods, func(pod *corev1.Pod) bool {
+		return podutils.IsActive(pod) && podutils.IsReschedulable(pod)
+	}) {
+		return NewChurnValidationError(fmt.Errorf("score-based compaction candidate Node %q no longer has reschedulable workload", liveNode.Name))
+	}
+	return nil
 }
 
 func (s *ScoreBasedConsolidation) budgetExhaustedByInFlightDisruptions(nodePool *v1.NodePool) bool {

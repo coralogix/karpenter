@@ -31,9 +31,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
 	clocktesting "k8s.io/utils/clock/testing"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -200,6 +204,123 @@ func TestScoreBasedCompactionIgnoresConsolidateAfter(t *testing.T) {
 			t.Fatal("upstream consolidation must remain disabled for an unannotated Never pool")
 		}
 	})
+}
+
+func TestScoreBasedCompactionWaitsForStatefulSetTermination(t *testing.T) {
+	ctx := context.Background()
+	scoreBased := NewScoreBasedConsolidation(MakeConsolidation(nil, nil, nil, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil))
+	cases := []struct {
+		name  string
+		phase corev1.PodPhase
+	}{
+		{name: "terminating StatefulSet workload", phase: corev1.PodRunning},
+		{name: "terminal StatefulSet workload with finalizer", phase: corev1.PodSucceeded},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := scoreBasedTestCandidate(true)
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "stateful-workload",
+					Namespace:         "default",
+					DeletionTimestamp: &metav1.Time{Time: time.Now()},
+					Finalizers:        []string{"test.finalizer"},
+					OwnerReferences:   []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "workload"}},
+				},
+				Status: corev1.PodStatus{Phase: tc.phase},
+			}
+			candidate.reschedulablePods = []*corev1.Pod{pod}
+			if scoreBased.shouldCompact(ctx, candidate) {
+				t.Fatal("score-based compaction must wait for terminating or terminal StatefulSet pods to leave before admitting the node")
+			}
+		})
+	}
+}
+
+func TestScoreBasedFinalValidationUsesLiveOccupancyAndPaceConfig(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	testClock := clocktesting.NewFakeClock(now)
+	pace := NewUnderutilizedConsolidationPace(testClock)
+	nodePool := &v1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "default", Annotations: map[string]string{
+			v1.ScoreBasedConsolidationAnnotationKey:                  "",
+			v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey: "4",
+			v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey:    "2",
+		}},
+		Spec: v1.NodePoolSpec{Disruption: v1.Disruption{ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized}},
+	}
+	makeCandidate := func(name string) (*Candidate, *corev1.Pod) {
+		candidate := scoreBasedTestCandidate(true)
+		candidate.NodePool = nodePool.DeepCopy()
+		candidate.Node.Name = name
+		candidate.Node.UID = types.UID(name + "-uid")
+		candidate.Node.Spec.ProviderID = "provider-" + name
+		candidate.Node.Labels[v1.NodePoolLabelKey] = nodePool.Name
+		candidate.NodeClaim.Name = "claim-" + name
+		candidate.NodeClaim.UID = types.UID("claim-" + name + "-uid")
+		candidate.NodeClaim.Labels[v1.NodePoolLabelKey] = nodePool.Name
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "workload-" + name, Namespace: "default"}, Spec: corev1.PodSpec{NodeName: name}}
+		candidate.reschedulablePods = []*corev1.Pod{pod.DeepCopy()}
+		return candidate, pod
+	}
+	first, firstPod := makeCandidate("node-1")
+	second, secondPod := makeCandidate("node-2")
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(nodePool, first.Node, first.NodeClaim, firstPod, second.Node, second.NodeClaim, secondPod).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
+			pod := obj.(*corev1.Pod)
+			if pod.Spec.NodeName == "" {
+				return nil
+			}
+			return []string{pod.Spec.NodeName}
+		}).Build()
+	recorder := events.NewRecorder(record.NewFakeRecorder(10))
+	scoreBased := &ScoreBasedConsolidation{consolidation: MakeConsolidation(testClock, nil, kubeClient, nil, nil, recorder, nil, pace)}
+	cmd := Command{Method: scoreBased, Candidates: []*Candidate{first, second}}
+
+	// The live pool lowered the per-command cap after search planned this two-node batch.
+	liveNodePool := nodePool.DeepCopy()
+	liveNodePool.Annotations[v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey] = "1"
+	if err := kubeClient.Update(ctx, liveNodePool); err != nil {
+		t.Fatal(err)
+	}
+	if err := scoreBased.validateCommandPaceAndCap(ctx, &cmd); !IsValidationError(err) {
+		t.Fatalf("validation error = %v, want a validation failure after the live cap was lowered", err)
+	}
+
+	// With the live cap restored and rate lowered, validation refreshes the candidate pools so
+	// the ensuing charge uses the same live rate that admitted the command.
+	liveNodePool.Annotations[v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey] = "2"
+	liveNodePool.Annotations[v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey] = "2"
+	if err := kubeClient.Update(ctx, liveNodePool); err != nil {
+		t.Fatal(err)
+	}
+	cmd.Candidates = []*Candidate{{StateNode: first.StateNode, NodePool: first.NodePool, reschedulablePods: first.reschedulablePods}, {StateNode: second.StateNode, NodePool: second.NodePool, reschedulablePods: second.reschedulablePods}}
+	if err := scoreBased.validateCommandPaceAndCap(ctx, &cmd); err != nil {
+		t.Fatalf("validation with the current live pace config: %v", err)
+	}
+	cmd.Method = scoreBased
+	pace.Charge(&cmd)
+	testClock.Step(59 * time.Second)
+	if pace.candidateAllowed(liveNodePool, 0) {
+		t.Fatal("pace charge used the stale rate instead of the live rate refreshed during validation")
+	}
+
+	// A selected node that became empty according to the live API must fall back to standby.
+	terminalPod := &corev1.Pod{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(firstPod), terminalPod); err != nil {
+		t.Fatal(err)
+	}
+	terminalPod.Status.Phase = corev1.PodSucceeded
+	if err := kubeClient.Status().Update(ctx, terminalPod); err != nil {
+		t.Fatal(err)
+	}
+	cmd.Candidates = cmd.Candidates[:1]
+	if err := scoreBased.validateCommandPaceAndCap(ctx, &cmd); !IsValidationError(err) || getValidationFailureReason(err) != "churn" {
+		t.Fatalf("validation for a now-empty candidate = %v, want churn validation failure", err)
+	}
 }
 
 func TestScoreBasedConsolidationValidatorFilter(t *testing.T) {
@@ -415,6 +536,8 @@ func TestScoreBasedBatchPlanningEnforcesBudgetsPacingAndDeadline(t *testing.T) {
 		v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey: "5",
 		v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey:    "1",
 	}
+	first.reschedulablePods = nil
+	second.reschedulablePods = nil
 	second.NodePool = first.NodePool
 	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
 	batches, attempted, _, err = growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 2}, pace, compute, &moveSetSearchStats{})

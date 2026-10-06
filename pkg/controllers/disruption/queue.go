@@ -60,7 +60,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
-	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
@@ -429,20 +428,15 @@ func (q *Queue) queueEvacuationPods(ctx context.Context, cmd *Command) (int, err
 		if candidate.Node == nil || candidate.NodeClaim == nil {
 			return 0, NewUnrecoverableError(fmt.Errorf("evacuation requires a registered node and NodeClaim"))
 		}
-		pods, err := nodeutils.GetPods(ctx, q.kubeClient, candidate.Node)
+		occupyingPods, err := scoreBasedNodeOccupyingPods(ctx, q.apiReader, candidate.Node)
 		if err != nil {
 			return 0, fmt.Errorf("listing pods on evacuation node, %w", err)
 		}
-		nonDaemonPods := nonDaemonPods(pods)
-		waiting += len(nonDaemonPods)
-		evictable := lo.Filter(nonDaemonPods, func(p *corev1.Pod, _ int) bool { return podutils.IsEvictable(p, q.clock, q.recorder) })
+		waiting += len(occupyingPods)
+		evictable := lo.Filter(occupyingPods, func(p *corev1.Pod, _ int) bool { return podutils.IsEvictable(p, q.clock, q.recorder) })
 		q.addEvictablePods(cmd, queued, evictable)
 	}
 	return waiting, nil
-}
-
-func nonDaemonPods(pods []*corev1.Pod) []*corev1.Pod {
-	return lo.Filter(pods, func(p *corev1.Pod, _ int) bool { return !podutils.IsOwnedByDaemonSet(p) })
 }
 
 func (q *Queue) addEvictablePods(cmd *Command, queued map[terminator.QueueKey]struct{}, pods []*corev1.Pod) {

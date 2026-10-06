@@ -407,7 +407,7 @@ func TestSortReclamationCandidatesByCostPerVCPU(t *testing.T) {
 	}
 }
 
-func TestReclamationEmptyCountsBoundNonDaemonPodsUntilRemoved(t *testing.T) {
+func TestScoreBasedNodeEmptyIgnoresCompletedAndNodeOwnedPods(t *testing.T) {
 	ctx := context.Background()
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}
 	daemon := &corev1.Pod{
@@ -428,13 +428,21 @@ func TestReclamationEmptyCountsBoundNonDaemonPodsUntilRemoved(t *testing.T) {
 		Spec: corev1.PodSpec{NodeName: node.Name},
 	}
 	terminal := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "terminal", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "terminal", Namespace: "default", Finalizers: []string{"test.finalizer"}},
 		Spec:       corev1.PodSpec{NodeName: node.Name},
 		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
 	}
+	mirror := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "mirror",
+			Namespace:       "default",
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: node.Name}},
+		},
+		Spec: corev1.PodSpec{NodeName: node.Name},
+	}
 	kubeClient := fake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
-		WithObjects(node, daemon, terminating, terminal).
+		WithObjects(node, daemon, terminating, terminal, mirror).
 		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
 			pod := obj.(*corev1.Pod)
 			if pod.Spec.NodeName == "" {
@@ -443,8 +451,8 @@ func TestReclamationEmptyCountsBoundNonDaemonPodsUntilRemoved(t *testing.T) {
 			return []string{pod.Spec.NodeName}
 		}).Build()
 
-	if empty, err := reclamationEmpty(ctx, kubeClient, node); err != nil || empty {
-		t.Fatalf("reclamationEmpty() = (%v, %v), want (false, nil) while non-daemon pod is terminating", empty, err)
+	if empty, err := scoreBasedNodeEmpty(ctx, kubeClient, node); err != nil || empty {
+		t.Fatalf("scoreBasedNodeEmpty() = (%v, %v), want (false, nil) while a nonterminal workload pod is terminating", empty, err)
 	}
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(terminating), terminating); err != nil {
 		t.Fatal(err)
@@ -453,14 +461,8 @@ func TestReclamationEmptyCountsBoundNonDaemonPodsUntilRemoved(t *testing.T) {
 	if err := kubeClient.Update(ctx, terminating); err != nil {
 		t.Fatal(err)
 	}
-	if empty, err := reclamationEmpty(ctx, kubeClient, node); err != nil || empty {
-		t.Fatalf("reclamationEmpty() = (%v, %v), want (false, nil) while a terminal non-daemon pod remains bound", empty, err)
-	}
-	if err := kubeClient.Delete(ctx, terminal); err != nil {
-		t.Fatal(err)
-	}
-	if empty, err := reclamationEmpty(ctx, kubeClient, node); err != nil || !empty {
-		t.Fatalf("reclamationEmpty() = (%v, %v), want (true, nil) after non-daemon pod is gone", empty, err)
+	if empty, err := scoreBasedNodeEmpty(ctx, kubeClient, node); err != nil || !empty {
+		t.Fatalf("scoreBasedNodeEmpty() = (%v, %v), want (true, nil) with only DaemonSet, terminal, and mirror pods bound", empty, err)
 	}
 }
 
@@ -486,8 +488,8 @@ func TestReclamationEmptyDoesNotUseResourceRequests(t *testing.T) {
 			}
 			return []string{pod.Spec.NodeName}
 		}).Build()
-	if empty, err := reclamationEmpty(ctx, kubeClient, node); err != nil || empty {
-		t.Fatalf("reclamationEmpty() = (%v, %v), want (false, nil) for a bound zero-request workload pod", empty, err)
+	if empty, err := scoreBasedNodeEmpty(ctx, kubeClient, node); err != nil || empty {
+		t.Fatalf("scoreBasedNodeEmpty() = (%v, %v), want (false, nil) for a bound zero-request workload pod", empty, err)
 	}
 }
 

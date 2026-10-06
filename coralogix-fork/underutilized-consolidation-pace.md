@@ -23,7 +23,7 @@ spec:
 | Annotation | Meaning |
 |------------|---------|
 | `max-underutilized-node-disruptions-per-minute` | Maximum non-empty candidate nodes disrupted per minute for the NodePool (required to enable pacing) |
-| `max-underutilized-nodes-per-consolidation` | Optional maximum non-empty candidates selected from the NodePool in one consolidation command or static drift pass |
+| `max-underutilized-nodes-per-consolidation` | Optional maximum candidates selected from the NodePool in one multi-node or score-based consolidation command or static drift pass |
 
 | Configuration | Meaning |
 |---------------|---------|
@@ -44,13 +44,13 @@ Example values:
 
 ## Behavior
 
-- Applies to non-empty underutilized consolidation (single-node, multi-node, and score-based consolidation) and dynamic or static drift.
+- Applies to non-empty underutilized consolidation (single-node, multi-node, and score-based consolidation) and dynamic or static drift. Score-based batches count every admitted source node toward the per-command cap and pace charge.
 - Score-based consolidation ignores `consolidateAfter` entirely, including `Never`; this field continues to gate upstream single-node and multi-node consolidation for pools that are not opted into score-based mode.
-- Empty candidates are exempt. Empty-node deletion remains governed by its existing method, including when the node is drifted.
+- Empty candidates are exempt. Score-based standby marking and empty-node reclamation do not consume this pace. Empty-node deletion remains governed by its existing method, including when the node is drifted.
 - Does not affect expiration or disruption budgets.
 - Each successfully started consolidation or drift command charges one unit per disrupted non-empty candidate node per participating NodePool. Delete and replace commands both charge existing candidate nodes, not net node reduction.
 - A command with `N` non-empty candidates at rate `R` advances that NodePool's next eligible time by `N / R` minutes. Underutilized consolidation and drift share this per-NodePool cooldown, so starting either kind of command delays the other.
-- `max-underutilized-nodes-per-consolidation` caps how many non-empty candidate nodes from a NodePool may appear in one multi-node consolidation command or be selected during one static drift pass. Dynamic drift already selects one candidate per command. Excess candidates are considered on later passes. When omitted, there is no additional batch cap beyond disruption budgets.
+- `max-underutilized-nodes-per-consolidation` caps how many non-empty candidate nodes from a NodePool may appear in one multi-node or score-based consolidation command or be selected during one static drift pass. Dynamic drift already selects one candidate per command. Excess candidates are considered on later passes. When omitted, there is no additional batch cap beyond disruption budgets.
 - Pacing is enforced in memory and resets on controller restart or leader failover. After restart, a NodePool may immediately disrupt candidates in the first command, subject to the optional per-command cap.
 - When paced, consolidation is deferred without marking the cluster consolidated, similar to budget exhaustion.
 

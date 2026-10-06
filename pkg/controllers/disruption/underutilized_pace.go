@@ -135,8 +135,9 @@ func (p *UnderutilizedConsolidationPace) Charge(cmd *Command) {
 func candidateCountsAndPools(cmd *Command) (map[string]int, map[string]*v1.NodePool) {
 	counts := map[string]int{}
 	pools := map[string]*v1.NodePool{}
+	scoreBasedCompaction := cmd.Method != nil && cmd.ConsolidationType() == ScoreBasedConsolidationType
 	for _, candidate := range cmd.Candidates {
-		if candidate == nil || candidate.NodePool == nil || len(candidate.reschedulablePods) == 0 {
+		if candidate == nil || candidate.NodePool == nil || (!scoreBasedCompaction && len(candidate.reschedulablePods) == 0) {
 			continue
 		}
 		counts[candidate.NodePool.Name]++

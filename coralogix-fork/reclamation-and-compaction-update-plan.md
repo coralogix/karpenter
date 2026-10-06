@@ -48,7 +48,7 @@ Primary file: `pkg/controllers/disruption/score_based_reclamation.go`.
 Primary file: `pkg/controllers/disruption/score_based_consolidation.go` and its validator setup.
 
 - Score-based compaction excludes empty nodes before scoring or scheduling simulation. It also excludes standby and activating nodes as compaction sources.
-- Use the existing strict emptiness definition consistently: no bound non-DaemonSet pods means empty. Daemon-only nodes are empty; terminating and terminal non-daemon pods count while still bound. Do not equate emptiness with zero resource requests.
+- Use one emptiness definition consistently for score-based standby, reclamation, and evacuation: no bound non-DaemonSet, nonterminal, non-Node-owned workload pods means empty. DaemonSet pods, completed terminal pods, and Node-owned mirror pods are ignored. Nonterminal terminating workload pods remain occupancy until they leave or become terminal; a terminating-only node waits active and is then collected through standby or reclamation. Do not equate emptiness with zero resource requests.
 - Apply the compaction-only predicate during candidate revalidation too. A candidate that becomes empty during the validation delay is dropped from compaction; the reclamation method can consider it on a later pass.
 - Leave completion of already-started evacuation unchanged: becoming empty is its intended outcome and still leads to standby.
 - Preserve existing scoring, search limits, feasibility checks, budget enforcement, and pacing for eligible non-empty candidates.

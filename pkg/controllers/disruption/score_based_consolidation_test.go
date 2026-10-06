@@ -361,6 +361,11 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 		})
 
 		It("marks an empty active node as standby before reclaiming it on the next pass", func() {
+			scoreBasedNodePool.Annotations[v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey] = "1"
+			scoreBasedNodePool.Annotations[v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey] = "4"
+			scoreBasedNodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
+			ExpectApplied(ctx, env.Client, scoreBasedNodePool)
+
 			offering := leastExpensiveInstance.Offerings[0]
 			nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
@@ -375,6 +380,13 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			})
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+			terminalPod := test.Pod(test.PodOptions{NodeName: node.Name})
+			terminalPod.Finalizers = []string{"testing/finalizer"}
+			ExpectApplied(ctx, env.Client, terminalPod)
+			storedTerminalPod := &corev1.Pod{}
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(terminalPod), storedTerminalPod)).To(Succeed())
+			storedTerminalPod.Status.Phase = corev1.PodSucceeded
+			Expect(env.Client.Status().Update(ctx, storedTerminalPod)).To(Succeed())
 
 			disruption.EvacuationCommandsTotal.Reset()
 			disruption.NodeClaimsEvacuatedTotal.Reset()
@@ -389,8 +401,9 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 				output.WriteString(args)
 				output.WriteByte('\n')
 			}, funcr.Options{})
+			pace := disruption.NewUnderutilizedConsolidationPace(env.Clock)
 			controller := disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
-				disruption.WithMethods(NewMethodsWithRealValidator()...))
+				disruption.WithMethods(NewMethodsWithRealValidator(pace)...), disruption.WithUnderutilizedPace(pace))
 			start := env.Clock.Now()
 
 			result, err := controller.Reconcile(log.IntoContext(ctx, logger))

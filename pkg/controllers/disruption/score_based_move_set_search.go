@@ -435,20 +435,17 @@ func scoreBasedMoveSetCanAddWithReason(current []*Candidate, next *Candidate, bu
 	if next == nil || next.NodePool == nil {
 		return false, false
 	}
-	poolCount, workCount := 0, 0
+	poolCount := 0
 	for _, candidate := range current {
 		if candidate == nil || candidate.NodePool == nil || candidate.NodePool.Name != next.NodePool.Name {
 			continue
 		}
 		poolCount++
-		if len(candidate.reschedulablePods) > 0 {
-			workCount++
-		}
 	}
 	if poolCount+1 > budgets[next.NodePool.Name] {
 		return false, true
 	}
-	if len(next.reschedulablePods) > 0 && !pace.candidateAllowed(next.NodePool, workCount) {
+	if !pace.candidateAllowed(next.NodePool, poolCount) {
 		return false, true
 	}
 	return true, false

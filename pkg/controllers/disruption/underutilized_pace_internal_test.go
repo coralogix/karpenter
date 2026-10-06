@@ -182,4 +182,26 @@ func TestChargeSkipsEmptyCandidates(t *testing.T) {
 	if !pace.candidateAllowed(np, 0) {
 		t.Fatal("expected admission after cooldown from mixed charge")
 	}
+
+	pace.Charge(&Command{Method: &ScoreBasedConsolidation{}, Candidates: []*Candidate{{NodePool: np}}})
+	if pace.candidateAllowed(np, 0) {
+		t.Fatal("expected score-based compaction to charge every admitted source candidate")
+	}
+}
+
+func TestStandbyAndReclamationDoNotConsumeCompactionPace(t *testing.T) {
+	testClock := clocktesting.NewFakeClock(time.Now())
+	pace := NewUnderutilizedConsolidationPace(testClock)
+	nodePool := paceTestNodePool("1", "4")
+	emptyCandidate := &Candidate{NodePool: nodePool}
+	pace.Charge(&Command{Method: &ScoreBasedStandby{}, Candidates: []*Candidate{emptyCandidate}})
+	pace.Charge(&Command{Method: &ScoreBasedReclamation{}, Candidates: []*Candidate{emptyCandidate}})
+	if !pace.candidateAllowed(nodePool, 0) {
+		t.Fatal("standby marking or reclamation charged the score-based compaction pace")
+	}
+
+	pace.Charge(&Command{Method: &ScoreBasedConsolidation{}, Candidates: []*Candidate{{NodePool: nodePool}}})
+	if pace.candidateAllowed(nodePool, 0) {
+		t.Fatal("expected subsequent compaction to charge the source node and start cooldown")
+	}
 }

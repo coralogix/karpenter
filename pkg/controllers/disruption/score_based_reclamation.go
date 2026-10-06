@@ -34,7 +34,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
-	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
@@ -274,7 +273,7 @@ func (s *ScoreBasedReclamation) emptyReclamationNodeInventory(ctx context.Contex
 	if nodePool == nil {
 		return nil, "", false, false, nil
 	}
-	empty, err := reclamationEmpty(ctx, s.kubeClient, node.Node)
+	empty, err := scoreBasedNodeEmpty(ctx, s.apiReader(), node.Node)
 	if err != nil {
 		return nil, "", false, false, fmt.Errorf("checking emptiness of node %q for reclamation, %w", node.Name(), err)
 	}
@@ -387,7 +386,7 @@ func (s *ScoreBasedReclamation) reclamationNodeStillEmpty(ctx context.Context, c
 	if node.Annotations[v1.DoNotDisruptAnnotationKey] == "true" || node.Labels[v1.NodeInitializedLabelKey] != "true" {
 		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q is no longer eligible", candidate.Name()))
 	}
-	empty, err := reclamationEmpty(ctx, s.apiReader(), node)
+	empty, err := scoreBasedNodeEmpty(ctx, s.apiReader(), node)
 	if err != nil {
 		return fmt.Errorf("checking reclamation candidate emptiness, %w", err)
 	}
@@ -481,23 +480,6 @@ func scoreBasedReclamationInterval(nodePool *v1.NodePool) time.Duration {
 	return interval
 }
 
-// reclamationEmpty reports whether a node has no non-DaemonSet pods. Terminating and terminal
-// non-daemon pods still count while they remain bound to the node.
-
-func reclamationEmpty(ctx context.Context, kubeClient client.Reader, node *corev1.Node) (bool, error) {
-	var podList corev1.PodList
-	if err := kubeClient.List(ctx, &podList, client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
-		return false, fmt.Errorf("listing pods, %w", err)
-	}
-	for i := range podList.Items {
-		pod := &podList.Items[i]
-		if !podutils.IsOwnedByDaemonSet(pod) {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
 func (s *ScoreBasedReclamation) apiReader() client.Reader {
 	if s.queue != nil && s.queue.apiReader != nil {
 		return s.queue.apiReader
@@ -569,7 +551,7 @@ func (s *ScoreBasedReclamation) isReclamationCandidateAvailable(ctx context.Cont
 	if !currentNode.DeletionTimestamp.IsZero() || currentNode.Annotations[v1.DoNotDisruptAnnotationKey] == "true" || currentNodeClaim.Annotations[v1.DoNotDisruptAnnotationKey] == "true" {
 		return false
 	}
-	empty, err := reclamationEmpty(ctx, s.apiReader(), currentNode)
+	empty, err := scoreBasedNodeEmpty(ctx, s.apiReader(), currentNode)
 	return err == nil && empty
 }
 

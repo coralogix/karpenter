@@ -64,13 +64,16 @@ func (s *ScoreBasedStandby) ShouldDisrupt(ctx context.Context, candidate *Candid
 	if standby.IsNodeClaimStandby(candidate.NodeClaim) || standby.IsNodeClaimActivating(candidate.NodeClaim) || standby.HasNodeTaint(candidate.Node) {
 		return false
 	}
+	// Keep candidate discovery on the informer snapshot. Empty candidates still get a live API
+	// check below before they are marked; a stale occupied snapshot only delays this transition
+	// until the next watch-driven reconciliation.
 	if len(candidate.reschedulablePods) > 0 {
 		return false
 	}
 	if s.cluster != nil && s.cluster.IsNodeNominated(candidate.ProviderID()) {
 		return false
 	}
-	empty, err := reclamationEmpty(ctx, s.apiReader(), candidate.Node)
+	empty, err := scoreBasedNodeEmpty(ctx, s.apiReader(), candidate.Node)
 	return err == nil && empty
 }
 
@@ -146,7 +149,7 @@ func (s *ScoreBasedStandby) standbyCandidateMatchesLiveObjects(ctx context.Conte
 		node.Labels[v1.NodeInitializedLabelKey] != "true" {
 		return nil, nil, false, nil
 	}
-	empty, err := reclamationEmpty(ctx, s.apiReader(), node)
+	empty, err := scoreBasedNodeEmpty(ctx, s.apiReader(), node)
 	if err != nil || !empty {
 		return nil, nil, false, err
 	}
@@ -343,7 +346,7 @@ func (q *Queue) removeDisruptionTaint(ctx context.Context, nodeName string) erro
 
 //nolint:gocyclo // Recovery applies activation, removes the temporary taint, and refreshes both live objects.
 func (q *Queue) recoverOccupiedStandbyNode(ctx context.Context, method *ScoreBasedStandby, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
-	empty, err := reclamationEmpty(ctx, method.apiReader(), node)
+	empty, err := scoreBasedNodeEmpty(ctx, method.apiReader(), node)
 	if err != nil || empty {
 		return false, err
 	}

@@ -290,11 +290,33 @@ func (c *Controller) recoverOccupiedStandbyNodes(ctx context.Context) error {
 			return fmt.Errorf("getting standby NodeClaim %q, %w", stateNode.NodeClaim.Name, err)
 		}
 		if node.UID != stateNode.Node.UID || nodeClaim.UID != stateNode.NodeClaim.UID || node.Spec.ProviderID != stateNode.ProviderID() ||
-			(!standby.IsNodeClaimStandby(nodeClaim) && !standby.IsNodeClaimActivating(nodeClaim) && node.Annotations[standby.NodeClaimActivatingAnnotationKey] != "true") ||
-			!node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() {
+			!node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() ||
+			nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
 			continue
 		}
-		empty, err := reclamationEmpty(ctx, c.apiReader, node)
+		claimStandby := standby.IsNodeClaimStandby(nodeClaim)
+		claimActivating := standby.IsNodeClaimActivating(nodeClaim)
+		nodeActivating := node.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true"
+		if !claimStandby && !claimActivating && !nodeActivating {
+			if standby.HasNodeTaint(node) {
+				// A crash between tainting a node and persisting its standby marker can leave a
+				// node permanently unschedulable. Remove only the orphan taint, using the live
+				// Node resourceVersion so a concurrent activation marker wins.
+				stored := node.DeepCopy()
+				standby.SetNodeTaint(node, false)
+				if err := c.kubeClient.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
+					if errors.IsConflict(err) || errors.IsNotFound(err) {
+						continue
+					}
+					return fmt.Errorf("removing orphan standby taint from Node %q, %w", node.Name, err)
+				}
+				if err := updateStandbyState(ctx, c.cluster, c.apiReader, node, nodeClaim); err != nil {
+					return fmt.Errorf("refreshing Node %q after removing orphan standby taint, %w", node.Name, err)
+				}
+			}
+			continue
+		}
+		empty, err := scoreBasedNodeEmpty(ctx, c.apiReader, node)
 		if err != nil {
 			return fmt.Errorf("checking standby Node %q for bound workloads, %w", node.Name, err)
 		}

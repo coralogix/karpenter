@@ -14,7 +14,7 @@ The intended benefits are clearer compaction objectives, reuse of already runnin
 
 ## Responsibilities
 
-**Compaction** considers only non-empty active nodes and decides whether evacuating them is worth the workload disruption, aiming to pack workloads onto cheaper or otherwise preferable capacity. A node is empty when it has no bound non-DaemonSet pods; terminating and terminal pods still count while bound. Karpenter controls disruption and simulates placement; the Kubernetes scheduler determines actual pod placement. Compaction can activate suitable standby nodes as destinations instead of creating new nodes, including when cheap standby capacity can replace expensive active capacity. It may arrange replacement capacity before eviction when needed. Compaction honors NodePool disruption budgets and pacing.
+**Compaction** considers only active nodes with movable workload and decides whether evacuating them is worth the disruption, aiming to pack workloads onto cheaper or otherwise preferable capacity. Bound DaemonSet pods, terminal pods, and Node-owned mirror pods do not make a node occupied. A nonterminal terminating workload pod remains occupancy until it leaves or becomes terminal; a node with only such pods waits for that transition before standby marking. Karpenter controls disruption and simulates placement; the Kubernetes scheduler determines actual pod placement. Compaction can activate suitable standby nodes as destinations instead of creating new nodes, including when cheap standby capacity can replace expensive active capacity. It may arrange replacement capacity before eviction when needed. Compaction honors NodePool disruption budgets and pacing.
 
 Compaction completes by handing over an empty, tainted node. It does not decide whether that node should subsequently be removed, reactivated, or retained.
 
@@ -54,7 +54,7 @@ Evacuating and standby nodes remain tainted against ordinary scheduling. Standby
 
 Naturally empty active nodes become standby before reclamation can consider them. Standby nodes reserved for activation are excluded. A late pod binding is possible because the scheduler can act on a stale Node cache after the taint is written. Disruption controller cleanup periodically checks live occupancy and restores any occupied standby node to active by clearing its marker and taint. Reclamation also checks live occupancy immediately before its conditional delete. A pod that binds after that final check can enter the normal drain path after NodeClaim deletion; Kubernetes does not provide an atomic barrier between scheduler binding and deleting the NodeClaim.
 
-“Empty” means no non-daemon pods remain, including terminating non-daemon pods. Evacuation completes only once those pods are gone; accepting eviction requests is insufficient. Daemon pods may remain, so evacuation should not blindly reuse full termination drain behavior.
+For score-based standby and reclamation, “empty” means no bound non-DaemonSet, nonterminal, non-Node-owned workload pods remain. Terminal and mirror pods may remain bound without blocking completion. Evacuation uses the same occupancy rule, while a live terminating workload pod still blocks completion until it leaves or becomes terminal; accepting an eviction request alone is insufficient. Daemon pods may remain, so evacuation should not blindly reuse full termination drain behavior.
 
 ## Restart and cancellation behavior
 

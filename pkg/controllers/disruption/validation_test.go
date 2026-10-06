@@ -32,8 +32,8 @@ import (
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
 
-func NewMethodsWithRealValidator() []disruption.Method {
-	return disruption.NewMethods(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue)
+func NewMethodsWithRealValidator(paces ...*disruption.UnderutilizedConsolidationPace) []disruption.Method {
+	return disruption.NewMethods(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, paces...)
 }
 
 type NopValidator struct{}

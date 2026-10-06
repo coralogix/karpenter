@@ -19,10 +19,12 @@ package disruption
 import (
 	"context"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
+	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -56,5 +58,66 @@ func TestEnsureStandbyTaintsDoesNotRetaintActivatedNodeFromStaleState(t *testing
 	}
 	if standby.HasNodeTaint(storedNode) {
 		t.Fatal("ensureStandbyTaints() restored the taint using stale standby state after activation")
+	}
+}
+
+func TestRecoverOccupiedStandbyNodesRepairsOrphanTaintAndPreservesActivation(t *testing.T) {
+	cases := []struct {
+		name             string
+		nodeActivating   bool
+		claimActivating  bool
+		wantStandbyTaint bool
+	}{
+		{name: "orphan taint is cleared"},
+		{name: "node activation marker preserves taint", nodeActivating: true, wantStandbyTaint: true},
+		{name: "claim activation marker preserves taint", claimActivating: true, wantStandbyTaint: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1", Annotations: map[string]string{}}, Spec: corev1.NodeSpec{ProviderID: "provider-id"}}
+			nodeClaim := &v1.NodeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: "nodeclaim-1"},
+				Status:     v1.NodeClaimStatus{ProviderID: "provider-id"},
+			}
+			standby.SetNodeTaint(node, true)
+			if tc.nodeActivating {
+				node.Annotations[standby.NodeClaimActivatingAnnotationKey] = "true"
+			}
+			if tc.claimActivating {
+				standby.SetNodeClaimActivating(nodeClaim, true)
+			}
+			kubeClient := fake.NewClientBuilder().
+				WithScheme(scheme.Scheme).
+				WithObjects(node, nodeClaim).
+				WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
+					pod := obj.(*corev1.Pod)
+					if pod.Spec.NodeName == "" {
+						return nil
+					}
+					return []string{pod.Spec.NodeName}
+				}).Build()
+			cluster := state.NewCluster(clocktesting.NewFakeClock(time.Now()), kubeClient, nil)
+			cluster.UpdateNodeClaim(nodeClaim)
+			if err := cluster.UpdateNode(ctx, node); err != nil {
+				t.Fatalf("updating cluster Node state: %v", err)
+			}
+			controller := &Controller{
+				kubeClient: kubeClient,
+				apiReader:  kubeClient,
+				cluster:    cluster,
+				queue:      &Queue{ProviderIDToCommand: map[string]*Command{}},
+			}
+			if err := controller.recoverOccupiedStandbyNodes(ctx); err != nil {
+				t.Fatalf("recoverOccupiedStandbyNodes() error = %v", err)
+			}
+			stored := &corev1.Node{}
+			if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(node), stored); err != nil {
+				t.Fatalf("getting live Node: %v", err)
+			}
+			if got := standby.HasNodeTaint(stored); got != tc.wantStandbyTaint {
+				t.Fatalf("standby taint = %v, want %v", got, tc.wantStandbyTaint)
+			}
+		})
 	}
 }
