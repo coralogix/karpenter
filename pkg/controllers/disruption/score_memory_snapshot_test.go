@@ -18,6 +18,7 @@ package disruption
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -115,6 +116,35 @@ func TestScoreBasedConsolidationMemoryConfigInvalidatesConsolidatedCache(t *test
 	}
 	if strings.Contains(output.String(), `"reason"="cluster_already_marked_consolidated"`) {
 		t.Fatalf("a memory annotation change should invalidate the consolidated cache, got logs %q", output.String())
+	}
+}
+
+func TestScoreBasedConsolidationUtilisationConfigInvalidatesConsolidatedCache(t *testing.T) {
+	clk := clocktesting.NewFakeClock(time.Now())
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).Build()
+	cluster := state.NewCluster(clk, kubeClient, nil)
+	method := NewScoreBasedConsolidation(MakeConsolidation(clk, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil))
+	candidate := scoreBasedTestCandidate(true)
+	assertScoreBasedConsolidationComputeReason(t, method, candidate, nil, "cluster_already_marked_consolidated")
+	candidate.NodePool.Annotations[v1.ScoreBasedUtilisationWeightAnnotationKey] = "2"
+	assertScoreBasedConsolidationComputeReason(t, method, candidate, map[string]int{candidate.NodePool.Name: 0}, "budget_or_pace_filtered")
+	assertScoreBasedConsolidationComputeReason(t, method, candidate, nil, "cluster_already_marked_consolidated")
+	candidate.NodePool.Annotations[v1.ScoreBasedUtilisationWeightAnnotationKey] = "3"
+	assertScoreBasedConsolidationComputeReason(t, method, candidate, map[string]int{candidate.NodePool.Name: 0}, "budget_or_pace_filtered")
+	delete(candidate.NodePool.Annotations, v1.ScoreBasedUtilisationWeightAnnotationKey)
+	assertScoreBasedConsolidationComputeReason(t, method, candidate, map[string]int{candidate.NodePool.Name: 0}, "budget_or_pace_filtered")
+}
+
+func assertScoreBasedConsolidationComputeReason(t *testing.T, method *ScoreBasedConsolidation, candidate *Candidate, budgets map[string]int, reason string) {
+	t.Helper()
+	method.markConsolidated()
+	var output strings.Builder
+	ctx := log.IntoContext(context.Background(), funcr.New(func(_, args string) { output.WriteString(args) }, funcr.Options{}))
+	if _, err := method.ComputeCommands(ctx, budgets, candidate); err != nil {
+		t.Fatalf("ComputeCommands() = %v, want no error", err)
+	}
+	if !strings.Contains(output.String(), fmt.Sprintf(`"reason"=%q`, reason)) {
+		t.Fatalf("ComputeCommands() log reason missing %q: %s", reason, output.String())
 	}
 }
 

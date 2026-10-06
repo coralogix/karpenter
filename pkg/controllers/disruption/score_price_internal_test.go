@@ -143,6 +143,100 @@ func TestScoreBasedPriceContributionRetainsAveragePricedOnDemandToSpotSavings(t 
 	}
 }
 
+func TestScoreBasedReplacementPriceUsesAvailableCompatibleOfferings(t *testing.T) {
+	const pool = "pool"
+	sourceType := scorePriceInstanceType("source", 2, map[string]float64{v1.CapacityTypeOnDemand: 0.50})
+	sourceNode := scorePriceStateNode("source", pool, v1.CapacityTypeOnDemand, "source", 2, true)
+	source := scorePriceCandidate(sourceNode, map[string]*cloudprovider.InstanceType{"source": sourceType})
+	snapshot := newScoreBasedPriceSnapshot(state.StateNodes{sourceNode}, []*Candidate{source})
+	offering := func(price float64, available bool, capacityType, zone string) *cloudprovider.Offering {
+		return &cloudprovider.Offering{
+			Available: available,
+			Price:     price,
+			Requirements: scheduling.NewLabelRequirements(map[string]string{
+				v1.CapacityTypeLabelKey:  capacityType,
+				corev1.LabelTopologyZone: zone,
+			}),
+		}
+	}
+	requirements := func(key string, values ...string) scheduling.Requirements {
+		return scheduling.NewRequirements(scheduling.NewRequirement(key, corev1.NodeSelectorOpIn, values...))
+	}
+	tests := []struct {
+		name            string
+		offerings       cloudprovider.Offerings
+		requirements    scheduling.Requirements
+		wantReplacement float64
+		wantSavings     float64
+	}{
+		{
+			name: "unavailable cheaper offering",
+			offerings: cloudprovider.Offerings{
+				offering(0.01, false, v1.CapacityTypeOnDemand, "zone-a"),
+				offering(0.40, true, v1.CapacityTypeOnDemand, "zone-a"),
+			},
+			requirements:    requirements(v1.CapacityTypeLabelKey, v1.CapacityTypeOnDemand),
+			wantReplacement: 0.40,
+			wantSavings:     0.10,
+		},
+		{
+			name: "incompatible capacity type",
+			offerings: cloudprovider.Offerings{
+				offering(0.10, true, v1.CapacityTypeSpot, "zone-a"),
+				offering(0.40, true, v1.CapacityTypeOnDemand, "zone-a"),
+			},
+			requirements:    requirements(v1.CapacityTypeLabelKey, v1.CapacityTypeOnDemand),
+			wantReplacement: 0.40,
+			wantSavings:     0.10,
+		},
+		{
+			name: "incompatible zone",
+			offerings: cloudprovider.Offerings{
+				offering(0.05, true, v1.CapacityTypeOnDemand, "zone-b"),
+				offering(0.45, true, v1.CapacityTypeOnDemand, "zone-a"),
+			},
+			requirements:    requirements(corev1.LabelTopologyZone, "zone-a"),
+			wantReplacement: 0.45,
+			wantSavings:     0.05,
+		},
+		{
+			name: "unconstrained offerings",
+			offerings: cloudprovider.Offerings{
+				offering(0.10, true, v1.CapacityTypeSpot, "zone-a"),
+				offering(0.40, true, v1.CapacityTypeOnDemand, "zone-a"),
+			},
+			requirements:    scheduling.NewRequirements(),
+			wantReplacement: 0.10,
+			wantSavings:     0.40,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			replacementType := &cloudprovider.InstanceType{Name: "replacement", Offerings: test.offerings}
+			command := scorePriceReplacementCommand([]*Candidate{source}, replacementType)
+			command.Results.NewNodeClaims[0].Requirements = test.requirements
+
+			if got := consolidationSavingsUSDPerHour(command); math.Abs(got-test.wantSavings) > 1e-12 {
+				t.Errorf("consolidationSavingsUSDPerHour() = %v, want %v", got, test.wantSavings)
+			}
+			if got := command.EstimatedSavings(); math.Abs(got-test.wantSavings) > 1e-12 {
+				t.Errorf("Command.EstimatedSavings() = %v, want %v", got, test.wantSavings)
+			}
+			cost := snapshot.score(command)
+			if !cost.Valid || cost.Status != scoreFactorApplied {
+				t.Fatalf("cost score = %+v, want an applied valid score", cost)
+			}
+			if math.Abs(cost.SavingsUSDPerHour-test.wantSavings) > 1e-12 || math.Abs(cost.ReplacementUSDPerHour-test.wantReplacement) > 1e-12 {
+				t.Errorf("cost score savings/replacement = %v/%v, want %v/%v", cost.SavingsUSDPerHour, cost.ReplacementUSDPerHour, test.wantSavings, test.wantReplacement)
+			}
+			wantContribution := test.wantSavings / source.Price
+			if math.Abs(cost.Contribution-wantContribution) > 1e-12 {
+				t.Errorf("normalized cost contribution = %v, want %v", cost.Contribution, wantContribution)
+			}
+		})
+	}
+}
+
 func TestScoreBasedPriceContributionIsInvariantToCommonPriceScalingWithReplacement(t *testing.T) {
 	const pool = "pool"
 	types := map[string]*cloudprovider.InstanceType{

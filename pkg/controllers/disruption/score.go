@@ -75,6 +75,66 @@ type scoreBasedNodePoolScoringConfig struct {
 
 type scoreBasedScoringConfig map[string]scoreBasedNodePoolScoringConfig
 
+type scoreBasedScoringAnnotationSignature struct {
+	present bool
+	value   string
+}
+
+type scoreBasedNodePoolScoringConfigSignature struct {
+	utilisationWeight      scoreBasedScoringAnnotationSignature
+	memorySurplus          scoreBasedScoringAnnotationSignature
+	memoryBalanceWeight    scoreBasedScoringAnnotationSignature
+	concentrationThreshold scoreBasedScoringAnnotationSignature
+	concentrationWeight    scoreBasedScoringAnnotationSignature
+}
+
+type scoreBasedScoringConfigSignature map[string]scoreBasedNodePoolScoringConfigSignature
+
+func scoreBasedScoringConfigChanged(previous scoreBasedScoringConfigSignature, candidates []*Candidate) (scoreBasedScoringConfigSignature, bool) {
+	current := scoreBasedScoringConfigSignature{}
+	for _, candidate := range candidates {
+		if candidate == nil || candidate.NodePool == nil {
+			continue
+		}
+		name := candidate.NodePool.Name
+		if _, found := current[name]; found {
+			continue
+		}
+		signature := scoreBasedNodePoolScoringConfigSignatureFor(candidate.NodePool)
+		if signature.hasScoringAnnotations() {
+			current[name] = signature
+		}
+	}
+	if len(current) != len(previous) {
+		return current, true
+	}
+	for name, signature := range current {
+		if previous[name] != signature {
+			return current, true
+		}
+	}
+	return current, false
+}
+
+func scoreBasedNodePoolScoringConfigSignatureFor(nodePool *v1.NodePool) scoreBasedNodePoolScoringConfigSignature {
+	annotation := func(key string) scoreBasedScoringAnnotationSignature {
+		value, present := nodePool.Annotations[key]
+		return scoreBasedScoringAnnotationSignature{present: present, value: value}
+	}
+	return scoreBasedNodePoolScoringConfigSignature{
+		utilisationWeight:      annotation(v1.ScoreBasedUtilisationWeightAnnotationKey),
+		memorySurplus:          annotation(v1.ScoreBasedMemorySurplusAnnotationKey),
+		memoryBalanceWeight:    annotation(v1.ScoreBasedMemoryBalanceWeightAnnotationKey),
+		concentrationThreshold: annotation(v1.ScoreBasedInstanceTypeConcentrationThresholdAnnotationKey),
+		concentrationWeight:    annotation(v1.ScoreBasedInstanceTypeConcentrationWeightAnnotationKey),
+	}
+}
+
+func (signature scoreBasedNodePoolScoringConfigSignature) hasScoringAnnotations() bool {
+	return signature.utilisationWeight.present || signature.memorySurplus.present || signature.memoryBalanceWeight.present ||
+		signature.concentrationThreshold.present || signature.concentrationWeight.present
+}
+
 func scoreBasedScoringConfigForCandidates(candidates []*Candidate) scoreBasedScoringConfig {
 	configs := scoreBasedScoringConfig{}
 	for _, candidate := range candidates {
@@ -292,23 +352,31 @@ func scoreMoveSetUtilisation(command Command, configs scoreBasedScoringConfig) s
 	return score
 }
 
-// consolidationSavingsUSDPerHour mirrors EstimatedSavings for commands produced by scheduling simulation,
-// without treating evacuation as zero savings.
+// consolidationSavingsUSDPerHour mirrors the pricing inputs used by EstimatedSavings,
+// without treating evacuation as zero potential savings.
 func consolidationSavingsUSDPerHour(cmd Command) float64 {
 	sourcePrice := sumCandidatePrices(cmd.Candidates)
 	if len(cmd.Replacements) == 0 {
 		return sourcePrice
 	}
+	return sourcePrice - replacementCostUSDPerHour(cmd)
+}
+
+// replacementCostUSDPerHour returns the estimated replacement cost for both score-driven and realized savings.
+// It preserves the scheduler's existing first-instance-type estimate while filtering out unavailable and
+// requirement-incompatible offerings.
+func replacementCostUSDPerHour(cmd Command) float64 {
 	destPrice := 0.0
 	for _, nodeClaim := range cmd.Results.NewNodeClaims {
-		if len(nodeClaim.InstanceTypeOptions) > 0 {
-			offerings := nodeClaim.InstanceTypeOptions[0].Offerings
-			if len(offerings) > 0 {
-				destPrice += offerings.Cheapest().Price
-			}
+		if len(nodeClaim.InstanceTypeOptions) == 0 {
+			continue
+		}
+		offerings := nodeClaim.InstanceTypeOptions[0].Offerings.Available().Compatible(nodeClaim.Requirements)
+		if len(offerings) > 0 {
+			destPrice += offerings.Cheapest().Price
 		}
 	}
-	return sourcePrice - destPrice
+	return destPrice
 }
 
 func candidateAllocatableCPU(candidate *Candidate) float64 {

@@ -45,6 +45,47 @@ func TestScoreBasedUtilisationWeight(t *testing.T) {
 	}
 }
 
+func TestScoreBasedScoringConfigSignatureTracksRawAnnotationPresenceAndValues(t *testing.T) {
+	candidate := &Candidate{NodePool: &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "pool", Annotations: map[string]string{}}}}
+	keys := []string{
+		v1.ScoreBasedUtilisationWeightAnnotationKey,
+		v1.ScoreBasedMemorySurplusAnnotationKey,
+		v1.ScoreBasedMemoryBalanceWeightAnnotationKey,
+		v1.ScoreBasedInstanceTypeConcentrationThresholdAnnotationKey,
+		v1.ScoreBasedInstanceTypeConcentrationWeightAnnotationKey,
+	}
+
+	empty, changed := scoreBasedScoringConfigChanged(nil, []*Candidate{candidate})
+	if changed || len(empty) != 0 {
+		t.Fatalf("initial absent configuration = changed %v, signature %v; want unchanged and empty", changed, empty)
+	}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			candidate.NodePool.Annotations[key] = ""
+			presentEmpty, changed := scoreBasedScoringConfigChanged(empty, []*Candidate{candidate})
+			if !changed {
+				t.Fatal("adding a present empty annotation should change the signature")
+			}
+			if same, unchangedChanged := scoreBasedScoringConfigChanged(presentEmpty, []*Candidate{candidate}); unchangedChanged || len(same) != 1 {
+				t.Fatalf("unchanged present annotation = changed %v, signature %v; want unchanged", unchangedChanged, same)
+			}
+
+			candidate.NodePool.Annotations[key] = "1"
+			presentValue, changed := scoreBasedScoringConfigChanged(presentEmpty, []*Candidate{candidate})
+			if !changed {
+				t.Fatal("changing the raw annotation value should change the signature")
+			}
+
+			delete(candidate.NodePool.Annotations, key)
+			absentAgain, changed := scoreBasedScoringConfigChanged(presentValue, []*Candidate{candidate})
+			if !changed || len(absentAgain) != 0 {
+				t.Fatalf("removing the annotation = changed %v, signature %v; want changed and empty", changed, absentAgain)
+			}
+		})
+		delete(candidate.NodePool.Annotations, key)
+	}
+}
+
 func TestMoveSetScorerCombinesNormalizedCostAndDimensionlessUtilisation(t *testing.T) {
 	offering := &cloudprovider.Offering{
 		Price: 0.12,

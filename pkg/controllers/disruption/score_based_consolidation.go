@@ -105,9 +105,8 @@ func NodePoolUsesScoreBasedConsolidation(np *v1.NodePool) bool {
 
 type ScoreBasedConsolidation struct {
 	consolidation
-	validator                    Validator
-	memoryConfigSignature        map[string]string
-	concentrationConfigSignature map[string]string
+	validator              Validator
+	scoringConfigSignature scoreBasedScoringConfigSignature
 }
 
 func NewScoreBasedConsolidation(c consolidation, opts ...option.Function[MethodOptions]) *ScoreBasedConsolidation {
@@ -179,14 +178,12 @@ func (s *ScoreBasedConsolidation) apiReader() client.Reader {
 
 //nolint:gocyclo
 func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
-	currentMemoryConfigSignature, memoryConfigChanged := scoreBasedMemoryConfigChanged(s.memoryConfigSignature, candidates)
-	s.memoryConfigSignature = currentMemoryConfigSignature
-	currentConcentrationConfigSignature, concentrationConfigChanged := scoreBasedInstanceTypeConcentrationConfigChanged(s.concentrationConfigSignature, candidates)
-	s.concentrationConfigSignature = currentConcentrationConfigSignature
-	if memoryConfigChanged || concentrationConfigChanged {
+	currentScoringConfigSignature, scoringConfigChanged := scoreBasedScoringConfigChanged(s.scoringConfigSignature, candidates)
+	s.scoringConfigSignature = currentScoringConfigSignature
+	if scoringConfigChanged {
 		s.lastConsolidationState = time.Time{}
 	}
-	if s.IsConsolidated() && !memoryConfigChanged && !concentrationConfigChanged {
+	if s.IsConsolidated() && !scoringConfigChanged {
 		logScoreBasedCompactionNoMove(ctx, scoreBasedNoMoveAlreadyConsolidated, scoreBasedNoMoveDetails{
 			candidateCount:           len(candidates),
 			compactionCandidateCount: -1,

@@ -157,35 +157,6 @@ func hasScoreBasedMemoryBalanceWeight(configs scoreBasedScoringConfig) bool {
 	return false
 }
 
-func scoreBasedMemoryConfigChanged(previous map[string]string, candidates []*Candidate) (map[string]string, bool) {
-	current := make(map[string]string)
-	for _, candidate := range candidates {
-		if candidate == nil || candidate.NodePool == nil {
-			continue
-		}
-		name := candidate.NodePool.Name
-		if _, found := current[name]; found {
-			continue
-		}
-		annotations := candidate.NodePool.Annotations
-		surplus, hasSurplus := annotations[v1.ScoreBasedMemorySurplusAnnotationKey]
-		weight, hasWeight := annotations[v1.ScoreBasedMemoryBalanceWeightAnnotationKey]
-		if !hasSurplus && !hasWeight {
-			continue
-		}
-		current[name] = surplus + "\x00" + weight
-	}
-	if len(current) != len(previous) {
-		return current, true
-	}
-	for name, value := range current {
-		if previous[name] != value {
-			return current, true
-		}
-	}
-	return current, false
-}
-
 // newScoreBasedMemorySnapshot aggregates pool ratios once from the node snapshot owned by the scheduler search.
 //
 //nolint:gocyclo // Keep the per-pool aggregation and invalid-profile handling in one snapshot pass.

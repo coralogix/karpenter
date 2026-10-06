@@ -122,35 +122,6 @@ func parseScoreBasedInstanceTypeConcentrationAnnotation(nodePool *v1.NodePool, k
 	return value
 }
 
-func scoreBasedInstanceTypeConcentrationConfigChanged(previous map[string]string, candidates []*Candidate) (map[string]string, bool) {
-	current := make(map[string]string)
-	for _, candidate := range candidates {
-		if candidate == nil || candidate.NodePool == nil {
-			continue
-		}
-		name := candidate.NodePool.Name
-		if _, found := current[name]; found {
-			continue
-		}
-		annotations := candidate.NodePool.Annotations
-		threshold, hasThreshold := annotations[v1.ScoreBasedInstanceTypeConcentrationThresholdAnnotationKey]
-		weight, hasWeight := annotations[v1.ScoreBasedInstanceTypeConcentrationWeightAnnotationKey]
-		if !hasThreshold && !hasWeight {
-			continue
-		}
-		current[name] = threshold + "\x00" + weight
-	}
-	if len(current) != len(previous) {
-		return current, true
-	}
-	for name, value := range current {
-		if previous[name] != value {
-			return current, true
-		}
-	}
-	return current, false
-}
-
 // newScoreBasedInstanceTypeConcentrationSnapshot counts the full immutable node inventory for
 // each configured pool. Standby, activating, and otherwise ineligible initialized nodes remain
 // part of the inventory; nodes without an instance-type label remain in the denominator.

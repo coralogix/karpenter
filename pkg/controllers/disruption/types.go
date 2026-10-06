@@ -410,19 +410,7 @@ func (c Command) EstimatedSavings() float64 {
 	}
 
 	// For replace consolidation, sum destination costs from all replacement NodeClaims.
-	destPrice := 0.0
-	for _, nodeClaim := range c.Results.NewNodeClaims {
-		if len(nodeClaim.InstanceTypeOptions) > 0 {
-			available := nodeClaim.InstanceTypeOptions[0].Offerings.
-				Available().                       // Filter to available offerings so ICE'd zones don't produce an optimistic estimate.
-				Compatible(nodeClaim.Requirements) // Filter to only consider allowed offerings
-			if len(available) > 0 {
-				destPrice += available.Cheapest().Price
-			}
-		}
-	}
-
-	return sourcePrice - destPrice
+	return sourcePrice - replacementCostUSDPerHour(c)
 }
 
 // EmitCandidateEvents emits ConsolidationCandidate events for all candidates in this command
