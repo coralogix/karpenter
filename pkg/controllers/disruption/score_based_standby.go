@@ -117,16 +117,10 @@ func (s *ScoreBasedStandby) standbyCandidateMatchesLiveObjects(ctx context.Conte
 	if candidate == nil || candidate.Node == nil || candidate.NodeClaim == nil || candidate.NodePool == nil {
 		return nil, nil, false, fmt.Errorf("standby candidate is missing its Node, NodeClaim, or NodePool")
 	}
-	node := &corev1.Node{}
-	if err := s.apiReader().Get(ctx, client.ObjectKeyFromObject(candidate.Node), node); err != nil {
-		return nil, nil, false, client.IgnoreNotFound(err)
-	}
-	nodeClaim := &v1.NodeClaim{}
-	if err := s.apiReader().Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
-		return nil, nil, false, client.IgnoreNotFound(err)
-	}
-	if node.UID != candidate.Node.UID || nodeClaim.UID != candidate.NodeClaim.UID || node.Spec.ProviderID != candidate.ProviderID() {
-		return nil, nil, false, nil
+	lifecycle := standby.NewLifecycle(s.apiReader(), s.kubeClient)
+	node, nodeClaim, matches, err := lifecycle.ReadLivePair(ctx, candidate.Node, candidate.NodeClaim, candidate.ProviderID())
+	if err != nil || !matches {
+		return nil, nil, false, err
 	}
 	if !node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() || nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() ||
 		standby.IsNodeClaimStandby(nodeClaim) || standby.IsNodeClaimActivating(nodeClaim) || standby.HasNodeTaint(node) ||
@@ -246,9 +240,7 @@ func (q *Queue) markEmptyNodeStandby(ctx context.Context, method *ScoreBasedStan
 		rollbackErr := q.removeDisruptionTaint(ctx, candidate.Node.Name)
 		return false, multierr.Combine(err, rollbackErr)
 	}
-	storedNodeClaim := nodeClaim.DeepCopy()
-	standby.SetNodeClaimStandby(nodeClaim, true)
-	if err := q.kubeClient.Patch(ctx, nodeClaim, client.MergeFromWithOptions(storedNodeClaim, client.MergeFromWithOptimisticLock{})); err != nil {
+	if err := standby.NewLifecycle(method.apiReader(), q.kubeClient).PatchNodeClaimStandby(ctx, nodeClaim, true); err != nil {
 		rollbackErr := q.removeDisruptionTaint(ctx, candidate.Node.Name)
 		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
 			return false, rollbackErr
@@ -276,9 +268,7 @@ func (q *Queue) markEmptyNodeStandby(ctx context.Context, method *ScoreBasedStan
 		}
 		return false, nil
 	}
-	storedNode := node.DeepCopy()
-	standby.SetNodeTaint(node, true)
-	if err := q.kubeClient.Patch(ctx, node, client.MergeFromWithOptions(storedNode, client.MergeFromWithOptimisticLock{})); err != nil {
+	if err := standby.NewLifecycle(method.apiReader(), q.kubeClient).PatchNodeStandbyTaint(ctx, node, true); err != nil {
 		return false, err
 	}
 	if err := q.removeDisruptionTaint(ctx, node.Name); err != nil {

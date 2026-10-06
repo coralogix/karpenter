@@ -30,7 +30,6 @@ import (
 	"go.uber.org/multierr"
 	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -477,12 +476,10 @@ func (q *Queue) persistStandby(ctx context.Context, candidate *Candidate) error 
 		if err := q.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
 			return err
 		}
-		stored := nodeClaim.DeepCopy()
-		standby.SetNodeClaimStandby(nodeClaim, true)
-		if equality.Semantic.DeepEqual(stored, nodeClaim) {
+		if standby.IsNodeClaimStandby(nodeClaim) {
 			return nil
 		}
-		return q.kubeClient.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
+		return standby.NewLifecycle(q.kubeClient, q.kubeClient).PatchNodeClaimStandby(ctx, nodeClaim, true)
 	}); err != nil {
 		return err
 	}
@@ -494,16 +491,7 @@ func (q *Queue) ensureStandbyTaint(ctx context.Context, sourceNode *corev1.Node)
 		return fmt.Errorf("cannot restore standby taint without a Node")
 	}
 	return retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
-		node := &corev1.Node{}
-		if err := q.kubeClient.Get(ctx, client.ObjectKeyFromObject(sourceNode), node); err != nil {
-			return err
-		}
-		stored := node.DeepCopy()
-		standby.SetNodeTaint(node, true)
-		if equality.Semantic.DeepEqual(stored, node) {
-			return nil
-		}
-		return q.kubeClient.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
+		return standby.NewLifecycle(q.kubeClient, q.kubeClient).EnsureNodeStandbyTaint(ctx, sourceNode)
 	})
 }
 

@@ -37,7 +37,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
@@ -275,21 +274,11 @@ func (c *Controller) recoverOccupiedStandbyNodes(ctx context.Context) error {
 			!standby.HasNodeTaint(stateNode.Node) && stateNode.Node.Annotations[standby.NodeClaimActivatingAnnotationKey] != "true" {
 			continue
 		}
-		node := &corev1.Node{}
-		if err := c.apiReader.Get(ctx, client.ObjectKeyFromObject(stateNode.Node), node); err != nil {
-			if errors.IsNotFound(err) {
-				continue
-			}
-			return fmt.Errorf("getting standby Node %q, %w", stateNode.Name(), err)
+		node, nodeClaim, matches, err := standby.NewLifecycle(c.apiReader, c.kubeClient).ReadLivePair(ctx, stateNode.Node, stateNode.NodeClaim, stateNode.ProviderID())
+		if err != nil {
+			return fmt.Errorf("getting live standby objects for Node %q, %w", stateNode.Name(), err)
 		}
-		nodeClaim := &v1.NodeClaim{}
-		if err := c.apiReader.Get(ctx, client.ObjectKeyFromObject(stateNode.NodeClaim), nodeClaim); err != nil {
-			if errors.IsNotFound(err) {
-				continue
-			}
-			return fmt.Errorf("getting standby NodeClaim %q, %w", stateNode.NodeClaim.Name, err)
-		}
-		if node.UID != stateNode.Node.UID || nodeClaim.UID != stateNode.NodeClaim.UID || node.Spec.ProviderID != stateNode.ProviderID() ||
+		if !matches ||
 			!node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() ||
 			nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
 			continue
@@ -302,9 +291,7 @@ func (c *Controller) recoverOccupiedStandbyNodes(ctx context.Context) error {
 				// A crash between tainting a node and persisting its standby marker can leave a
 				// node permanently unschedulable. Remove only the orphan taint, using the live
 				// Node resourceVersion so a concurrent activation marker wins.
-				stored := node.DeepCopy()
-				standby.SetNodeTaint(node, false)
-				if err := c.kubeClient.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
+				if err := standby.NewLifecycle(c.apiReader, c.kubeClient).PatchNodeStandbyTaint(ctx, node, false); err != nil {
 					if errors.IsConflict(err) || errors.IsNotFound(err) {
 						continue
 					}
@@ -362,36 +349,7 @@ func (c *Controller) ensureStandbyTaints(ctx context.Context, nodes ...*state.St
 }
 
 func (c *Controller) ensureStandbyTaint(ctx context.Context, stateNode *state.StateNode) error {
-	if stateNode.Node == nil || stateNode.NodeClaim == nil {
-		return nil
-	}
-	// Cluster state is informer-backed and may still report a standby marker
-	// after provisioning has activated this node. Read the live Node first so
-	// its optimistic-lock version protects against activation starting after
-	// this snapshot, then check the live NodeClaim marker.
-	node := &corev1.Node{}
-	if err := c.apiReader.Get(ctx, client.ObjectKeyFromObject(stateNode.Node), node); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	// Activation marks the live Node before removing the standby taint. The
-	// optimistic-lock patch below makes a concurrent marker update conflict,
-	// so the next reconciliation can observe activation.
-	if node.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" {
-		return nil
-	}
-	nodeClaim := &v1.NodeClaim{}
-	if err := c.apiReader.Get(ctx, client.ObjectKeyFromObject(stateNode.NodeClaim), nodeClaim); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	if !standby.IsNodeClaimStandby(nodeClaim) || standby.IsNodeClaimActivating(nodeClaim) {
-		return nil
-	}
-	stored := node.DeepCopy()
-	standby.SetNodeTaint(node, true)
-	if equality.Semantic.DeepEqual(stored, node) {
-		return nil
-	}
-	return c.kubeClient.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
+	return standby.NewLifecycle(c.apiReader, c.kubeClient).EnsureStandbyTaintForClaim(ctx, stateNode.Node, stateNode.NodeClaim)
 }
 
 func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, error) {

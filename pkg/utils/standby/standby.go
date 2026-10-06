@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package standby contains shared representation helpers for retained nodes.
+// Package standby contains shared representation helpers and lifecycle operations for retained nodes.
 package standby
 
 import (
@@ -47,6 +47,11 @@ func NodeTaint() corev1.Taint {
 // IsNodeClaimActivating reports whether activation of this NodeClaim was interrupted and needs resuming.
 func IsNodeClaimActivating(nodeClaim *v1.NodeClaim) bool {
 	return nodeClaim != nil && nodeClaim.Annotations[NodeClaimActivatingAnnotationKey] == "true"
+}
+
+// HasNodeActivationMarker reports whether activation reserved a Node.
+func HasNodeActivationMarker(node *corev1.Node) bool {
+	return node != nil && node.Annotations[NodeClaimActivatingAnnotationKey] == "true"
 }
 
 // SetNodeClaimActivating updates the persistent activation-in-progress marker on a NodeClaim in memory.
