@@ -170,7 +170,7 @@ func TestScoreBasedMoveSetScoreMustBePositiveWithOrWithoutMemoryScoring(t *testi
 	if got := evaluateMoveSetWith(context.Background(), moveSet{Nodes: []*Candidate{candidate}}, compute, enabledStats, nil, scoring(true)); got != nil {
 		t.Fatal("expected a non-positive memory-adjusted score to veto an otherwise profitable move")
 	}
-	if got := enabledStats.nonPositiveScoreMoveSetCount(); got != 1 {
+	if got := enabledStats.snapshot().nonPositiveScoreMoveSetCount; got != 1 {
 		t.Fatalf("enabled non-positive score count = %d, want 1", got)
 	}
 
@@ -178,7 +178,7 @@ func TestScoreBasedMoveSetScoreMustBePositiveWithOrWithoutMemoryScoring(t *testi
 	if got := evaluateMoveSetWith(context.Background(), moveSet{Nodes: []*Candidate{candidate}}, compute, disabledStats, nil, scoring(false)); got != nil {
 		t.Fatal("non-positive score should veto a move when memory scoring is disabled too")
 	}
-	if got := disabledStats.nonPositiveScoreMoveSetCount(); got != 1 {
+	if got := disabledStats.snapshot().nonPositiveScoreMoveSetCount; got != 1 {
 		t.Fatalf("disabled non-positive score count = %d, want 1", got)
 	}
 }
@@ -202,7 +202,7 @@ func TestScoreBasedMoveSetRejectsUnknownPriceDespitePositiveUtilisationAndMemory
 	if got := evaluateMoveSetWith(context.Background(), moveSet{Nodes: []*Candidate{candidate}}, compute, stats, nil, scoring); got != nil {
 		t.Fatal("unknown source pricing must reject the move even with positive utilization and memory scoring disabled")
 	}
-	if got := stats.nonPositiveScoreMoveSetCount(); got != 1 {
+	if got := stats.snapshot().nonPositiveScoreMoveSetCount; got != 1 {
 		t.Fatalf("invalid-price score count = %d, want 1", got)
 	}
 }

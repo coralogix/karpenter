@@ -18,6 +18,7 @@ package disruption
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -28,6 +29,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr/funcr"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -73,18 +75,24 @@ func TestLogScoreBasedCompactionNoMoveSummarizesBlockedPools(t *testing.T) {
 	ctx := log.IntoContext(context.Background(), funcr.New(func(_, args string) {
 		output = args
 	}, funcr.Options{}))
-	logScoreBasedCompactionNoMove(ctx, scoreBasedNoMoveBudgetOrPaceFiltered, scoreBasedNoMoveDetails{
-		candidateCount:                 6,
-		compactionCandidateCount:       6,
-		budgetBlockedCandidateCount:    3,
-		budgetBlockedNodePools:         map[string]struct{}{"zeta": {}, "alpha": {}},
-		paceBlockedCandidateCount:      2,
-		paceBlockedNodePools:           map[string]struct{}{"gamma": {}, "beta": {}},
-		validCandidateCount:            1,
-		moveSetsEvaluated:              1,
-		noOpMoveSetCount:               2,
-		nonPositiveSavingsMoveSetCount: 3,
-	})
+	searchStats := &moveSetSearchStats{}
+	searchStats.record(time.Millisecond, fmt.Errorf("compute failed"))
+	searchStats.recordNoOpMoveSet()
+	searchStats.recordNonPositiveSavingsMoveSet()
+	searchStats.recordNonPositiveScoreMoveSet()
+	details := scoreBasedNoMoveDetails{
+		candidateCount:              6,
+		compactionCandidateCount:    6,
+		budgetBlockedCandidateCount: 3,
+		budgetBlockedNodePools:      map[string]struct{}{"zeta": {}, "alpha": {}},
+		paceBlockedCandidateCount:   2,
+		paceBlockedNodePools:        map[string]struct{}{"gamma": {}, "beta": {}},
+		validCandidateCount:         1,
+	}
+	details.recordSearch(moveSetSearchResult{evaluated: 5, timedOut: true, stats: searchStats})
+	details.validMoveSetCount = 2
+	details.validationAttemptCount = 2
+	logScoreBasedCompactionNoMove(ctx, scoreBasedNoMoveBudgetOrPaceFiltered, details)
 
 	for _, field := range []string{
 		`"reason"="budget_or_pace_filtered"`,
@@ -92,8 +100,15 @@ func TestLogScoreBasedCompactionNoMoveSummarizesBlockedPools(t *testing.T) {
 		`"budgetBlockedCandidateCount"=3`,
 		`"paceBlockedCandidateCount"=2`,
 		`"validCandidateCount"=1`,
-		`"noOpMoveSetCount"=2`,
-		`"nonPositiveSavingsMoveSetCount"=3`,
+		`"moveSetsEvaluated"=5`,
+		`"validMoveSetCount"=2`,
+		`"noOpMoveSetCount"=1`,
+		`"nonPositiveSavingsMoveSetCount"=1`,
+		`"nonPositiveScoreMoveSetCount"=1`,
+		`"searchTimedOut"=true`,
+		`"moveSetEvaluationErrorCount"=1`,
+		`"firstMoveSetEvaluationError"="compute failed"`,
+		`"validationAttemptCount"=2`,
 	} {
 		if !strings.Contains(output, field) {
 			t.Errorf("log output %q does not contain %q", output, field)
@@ -360,16 +375,17 @@ func TestMoveSetSearchStats(t *testing.T) {
 	stats.record(300*time.Millisecond, fmt.Errorf("compute failed"))
 	stats.record(200*time.Millisecond, nil)
 
-	if got := stats.avg(); got != 200*time.Millisecond {
+	snapshot := stats.snapshot()
+	if got := snapshot.averageDuration; got != 200*time.Millisecond {
 		t.Fatalf("avg = %v, want %v", got, 200*time.Millisecond)
 	}
-	if got := stats.maxDuration(); got != 300*time.Millisecond {
+	if got := snapshot.maxDuration; got != 300*time.Millisecond {
 		t.Fatalf("max = %v, want %v", got, 300*time.Millisecond)
 	}
-	if got := stats.errorCount(); got != 1 {
+	if got := snapshot.errorCount; got != 1 {
 		t.Fatalf("errors = %d, want 1", got)
 	}
-	if got := stats.firstErrorMessage(); got != "compute failed" {
+	if got := snapshot.firstError; got != "compute failed" {
 		t.Fatalf("first error = %q, want %q", got, "compute failed")
 	}
 
@@ -383,10 +399,11 @@ func TestMoveSetSearchStats(t *testing.T) {
 	}
 	wg.Wait()
 
-	if got := stats.maxDuration(); got != 300*time.Millisecond {
+	snapshot = stats.snapshot()
+	if got := snapshot.maxDuration; got != 300*time.Millisecond {
 		t.Fatalf("max after concurrent records = %v, want %v", got, 300*time.Millisecond)
 	}
-	if got := stats.errorCount(); got != 1 {
+	if got := snapshot.errorCount; got != 1 {
 		t.Fatalf("errors after concurrent records = %d, want 1", got)
 	}
 }
@@ -479,11 +496,11 @@ func TestGrowScoreBasedBatchesUsesAdditiveSingleScoresAndRequiresZeroReplacement
 		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "result-marker", Namespace: "default"}}
 		return Command{Candidates: candidates, Results: pscheduling.Results{PodErrors: map[*corev1.Pod]error{pod: fmt.Errorf("retained simulation result")}}}, nil
 	}
-	batches, _, timedOut, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 3}, nil, compute, &moveSetSearchStats{}, scoreAdditiveFixture)
-	if err != nil || timedOut {
-		t.Fatalf("growScoreBasedBatches() error/timedOut = %v/%v, want nil/false", err, timedOut)
+	batchOutcome, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 3}, nil, compute, &moveSetSearchStats{}, scoreAdditiveFixture)
+	if err != nil || batchOutcome.timedOut || !batchOutcome.complete {
+		t.Fatalf("growScoreBasedBatches() error/timedOut/complete = %v/%v/%v, want nil/false/true", err, batchOutcome.timedOut, batchOutcome.complete)
 	}
-	assertAdditiveBatchResults(t, batches, map[string]float64{
+	assertAdditiveBatchResults(t, batchOutcome.evals, map[string]float64{
 		candidateMoveSetKey([]*Candidate{first}):  4,
 		candidateMoveSetKey([]*Candidate{second}): 3,
 		candidateMoveSetKey([]*Candidate{third}):  2,
@@ -495,12 +512,12 @@ func TestGrowScoreBasedBatchesUsesAdditiveSingleScoresAndRequiresZeroReplacement
 		}
 		return Command{Candidates: candidates}, nil
 	}
-	withoutZeroReplacement, _, _, err := growScoreBasedBatches(context.Background(), singletons[:2], map[string]int{"pool": 2}, nil, replacementCompute, &moveSetSearchStats{}, scoreAdditiveFixture)
+	withoutZeroReplacement, err := growScoreBasedBatches(context.Background(), singletons[:2], map[string]int{"pool": 2}, nil, replacementCompute, &moveSetSearchStats{}, scoreAdditiveFixture)
 	if err != nil {
 		t.Fatalf("growScoreBasedBatches() with replacement error = %v", err)
 	}
-	if len(withoutZeroReplacement) != 0 {
-		t.Fatalf("replacement batches retained = %d, want none", len(withoutZeroReplacement))
+	if len(withoutZeroReplacement.evals) != 0 {
+		t.Fatalf("replacement batches retained = %d, want none", len(withoutZeroReplacement.evals))
 	}
 }
 
@@ -543,13 +560,12 @@ func TestScoreBasedBatchPlanningEnforcesBudgetsPacingAndDeadline(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	batches, attempted, _, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 1}, nil, compute, &moveSetSearchStats{}, sourcePriceSearchTestScore)
-	if err != nil {
-		t.Fatalf("budget-limited batch search error = %v", err)
-	}
-	if len(batches) != 0 || attempted != 0 || computeCalls != 0 {
-		t.Fatalf("budget-limited search returned %d batches after %d simulations (%d compute calls), want all zero", len(batches), attempted, computeCalls)
-	}
+	batchOutcome, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 1}, nil, compute, &moveSetSearchStats{}, sourcePriceSearchTestScore)
+	require.NoError(t, err)
+	require.Empty(t, batchOutcome.evals)
+	require.Zero(t, batchOutcome.evaluated)
+	require.Zero(t, computeCalls)
+	require.True(t, batchOutcome.complete)
 
 	first.NodePool.Annotations = map[string]string{
 		v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey: "5",
@@ -559,20 +575,19 @@ func TestScoreBasedBatchPlanningEnforcesBudgetsPacingAndDeadline(t *testing.T) {
 	second.reschedulablePods = nil
 	second.NodePool = first.NodePool
 	pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
-	batches, attempted, _, err = growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 2}, pace, compute, &moveSetSearchStats{}, sourcePriceSearchTestScore)
-	if err != nil {
-		t.Fatalf("pace-limited batch search error = %v", err)
-	}
-	if len(batches) != 0 || attempted != 0 || computeCalls != 0 {
-		t.Fatalf("pace-limited search returned %d batches after %d simulations (%d compute calls), want all zero", len(batches), attempted, computeCalls)
-	}
+	batchOutcome, err = growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool": 2}, pace, compute, &moveSetSearchStats{}, sourcePriceSearchTestScore)
+	require.NoError(t, err)
+	require.Empty(t, batchOutcome.evals)
+	require.Zero(t, batchOutcome.evaluated)
+	require.Zero(t, computeCalls)
+	require.True(t, batchOutcome.complete)
 
 	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
-	_, _, timedOut, err := growScoreBasedBatches(expired, singletons, map[string]int{"pool": 2}, nil, compute, &moveSetSearchStats{}, sourcePriceSearchTestScore)
-	if err != nil || !timedOut {
-		t.Fatalf("expired batch search error/timedOut = %v/%v, want nil/true", err, timedOut)
-	}
+	batchOutcome, err = growScoreBasedBatches(expired, singletons, map[string]int{"pool": 2}, nil, compute, &moveSetSearchStats{}, sourcePriceSearchTestScore)
+	require.NoError(t, err)
+	require.True(t, batchOutcome.timedOut)
+	require.False(t, batchOutcome.complete)
 }
 
 func TestScoreBasedPairSearchSamplesUniqueBoundedPairs(t *testing.T) {
@@ -681,7 +696,6 @@ func batchSizes(evals []*moveSetEvaluation) []int {
 func TestEvaluateMoveSetsPar_respectsOrder(t *testing.T) {
 	ctx := context.Background()
 	moveSets := make([]moveSet, 2)
-	delays := []time.Duration{50 * time.Millisecond, 5 * time.Millisecond}
 	for i := range moveSets {
 		candidate := candidateWithPrice(t, 0.10)
 		candidate.NodePool = &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: strconv.Itoa(i)}}
@@ -689,34 +703,28 @@ func TestEvaluateMoveSetsPar_respectsOrder(t *testing.T) {
 	}
 
 	compute := func(ctx context.Context, candidates ...*Candidate) (Command, error) {
-		idx, err := strconv.Atoi(candidates[0].NodePool.Name)
-		if err != nil {
-			t.Fatalf("unexpected move set index: %v", err)
+		delay := 5 * time.Millisecond
+		if candidates[0].NodePool.Name == "0" {
+			delay = 50 * time.Millisecond
 		}
 		select {
-		case <-time.After(delays[idx]):
+		case <-time.After(delay):
 		case <-ctx.Done():
 			return Command{}, ctx.Err()
 		}
 		return Command{Candidates: candidates}, nil
 	}
 
-	winner, evaluated, _, _, err := evaluateMoveSetsParWithStats(ctx, moveSets, time.Now().Add(time.Second), compute, scoreBasedMoveSetResultLimit, nil, sourcePriceSearchTestScore, nil)
-	if err != nil {
-		t.Fatalf("evaluateMoveSetsParWithStats() error = %v", err)
-	}
-	if len(winner) != 2 {
-		t.Fatalf("evaluations = %d, want 2", len(winner))
-	}
-	if winner[0].Command.Candidates[0].NodePool.Name != "0" {
-		t.Fatalf("first evaluation index = %q, want %q", winner[0].Command.Candidates[0].NodePool.Name, "0")
-	}
-	if winner[1].Command.Candidates[0].NodePool.Name != "1" {
-		t.Fatalf("second evaluation index = %q, want %q", winner[1].Command.Candidates[0].NodePool.Name, "1")
-	}
-	if evaluated != 2 {
-		t.Fatalf("evaluated = %d, want 2", evaluated)
-	}
+	outcome, err := evaluateMoveSetsParWithStats(ctx, moveSets, time.Now().Add(time.Second), compute, scoreBasedMoveSetResultLimit, nil, sourcePriceSearchTestScore, nil)
+	require.NoError(t, err)
+	require.Len(t, outcome.evals, 2)
+	require.Equal(t, []string{"0", "1"}, []string{
+		outcome.evals[0].Command.Candidates[0].NodePool.Name,
+		outcome.evals[1].Command.Candidates[0].NodePool.Name,
+	})
+	require.Equal(t, 2, outcome.evaluated)
+	require.True(t, outcome.complete)
+	require.False(t, outcome.timedOut)
 }
 
 func TestEvaluateMoveSetsPar_stopsOnDeadline(t *testing.T) {
@@ -733,18 +741,18 @@ func TestEvaluateMoveSetsPar_stopsOnDeadline(t *testing.T) {
 		}
 	}
 
-	winner, evaluated, timedOut, _, err := evaluateMoveSetsParWithStats(ctx, moveSets, time.Now().Add(-time.Millisecond), compute, scoreBasedMoveSetResultLimit, nil, sourcePriceSearchTestScore, nil)
+	outcome, err := evaluateMoveSetsParWithStats(ctx, moveSets, time.Now().Add(-time.Millisecond), compute, scoreBasedMoveSetResultLimit, nil, sourcePriceSearchTestScore, nil)
 	if err != nil {
 		t.Fatalf("evaluateMoveSetsParWithStats() error = %v", err)
 	}
-	if len(winner) != 0 {
-		t.Fatalf("evaluations = %d, want 0", len(winner))
+	if len(outcome.evals) != 0 {
+		t.Fatalf("evaluations = %d, want 0", len(outcome.evals))
 	}
-	if evaluated != 0 {
-		t.Fatalf("evaluated = %d, want 0", evaluated)
+	if outcome.evaluated != 0 {
+		t.Fatalf("evaluated = %d, want 0", outcome.evaluated)
 	}
-	if !timedOut {
-		t.Fatal("timedOut = false, want true")
+	if !outcome.timedOut || outcome.complete {
+		t.Fatalf("timedOut/complete = %v/%v, want true/false", outcome.timedOut, outcome.complete)
 	}
 }
 
@@ -762,17 +770,20 @@ func TestEvaluateMoveSetsPar_returnsTopResultsAfterSearch(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	evals, evaluated, _, _, err := evaluateMoveSetsParWithStats(ctx, moveSets, time.Now().Add(time.Second), compute, scoreBasedMoveSetResultLimit, nil, sourcePriceSearchTestScore, nil)
+	outcome, err := evaluateMoveSetsParWithStats(ctx, moveSets, time.Now().Add(time.Second), compute, scoreBasedMoveSetResultLimit, nil, sourcePriceSearchTestScore, nil)
 	if err != nil {
 		t.Fatalf("evaluateMoveSetsParWithStats() error = %v", err)
 	}
-	if len(evals) != scoreBasedMoveSetResultLimit {
-		t.Fatalf("evaluations = %d, want %d", len(evals), scoreBasedMoveSetResultLimit)
+	if len(outcome.evals) != scoreBasedMoveSetResultLimit {
+		t.Fatalf("evaluations = %d, want %d", len(outcome.evals), scoreBasedMoveSetResultLimit)
 	}
-	if evaluated != len(moveSets) {
-		t.Fatalf("evaluated = %d, want %d", evaluated, len(moveSets))
+	if outcome.evaluated != len(moveSets) {
+		t.Fatalf("evaluated = %d, want %d", outcome.evaluated, len(moveSets))
 	}
-	for i, eval := range evals {
+	if !outcome.complete || outcome.timedOut {
+		t.Fatalf("complete/timedOut = %v/%v, want true/false", outcome.complete, outcome.timedOut)
+	}
+	for i, eval := range outcome.evals {
 		want := strconv.Itoa(len(moveSets) - 1 - i)
 		if eval.Command.Candidates[0].NodePool.Name != want {
 			t.Fatalf("evaluation[%d] index = %q, want %q", i, eval.Command.Candidates[0].NodePool.Name, want)
@@ -790,12 +801,8 @@ func TestEvaluateMoveSetsPar_returnsPartialOnTimeout(t *testing.T) {
 	}
 
 	compute := func(ctx context.Context, candidates ...*Candidate) (Command, error) {
-		idx, err := strconv.Atoi(candidates[0].NodePool.Name)
-		if err != nil {
-			t.Fatalf("unexpected move set index: %v", err)
-		}
 		delay := time.Millisecond
-		if idx > 0 {
+		if candidates[0].NodePool.Name != "0" {
 			delay = time.Second
 		}
 		select {
@@ -806,21 +813,29 @@ func TestEvaluateMoveSetsPar_returnsPartialOnTimeout(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	evals, evaluated, timedOut, _, err := evaluateMoveSetsParWithStats(ctx, moveSets, time.Now().Add(100*time.Millisecond), compute, scoreBasedMoveSetResultLimit, nil, sourcePriceSearchTestScore, nil)
-	if err != nil {
-		t.Fatalf("evaluateMoveSetsParWithStats() error = %v", err)
+	outcome, err := evaluateMoveSetsParWithStats(ctx, moveSets, time.Now().Add(100*time.Millisecond), compute, scoreBasedMoveSetResultLimit, nil, sourcePriceSearchTestScore, nil)
+	require.NoError(t, err)
+	require.Len(t, outcome.evals, 1)
+	require.Equal(t, "0", outcome.evals[0].Command.Candidates[0].NodePool.Name)
+	require.Equal(t, 1, outcome.evaluated)
+	require.True(t, outcome.timedOut)
+	require.False(t, outcome.complete)
+}
+
+func TestEvaluateMoveSetsPar_returnsCanceledErrorWithoutCompleting(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	candidate := candidateWithPrice(t, 0.10)
+	compute := func(ctx context.Context, candidates ...*Candidate) (Command, error) {
+		return Command{Candidates: candidates}, nil
 	}
-	if len(evals) != 1 {
-		t.Fatalf("evaluations = %d, want 1", len(evals))
+
+	outcome, err := evaluateMoveSetsParWithStats(ctx, []moveSet{{Nodes: []*Candidate{candidate}}}, time.Now().Add(time.Second), compute, scoreBasedMoveSetResultLimit, nil, sourcePriceSearchTestScore, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("evaluateMoveSetsParWithStats() error = %v, want %v", err, context.Canceled)
 	}
-	if evals[0].Command.Candidates[0].NodePool.Name != "0" {
-		t.Fatalf("evaluation index = %q, want %q", evals[0].Command.Candidates[0].NodePool.Name, "0")
-	}
-	if evaluated != 1 {
-		t.Fatalf("evaluated = %d, want 1", evaluated)
-	}
-	if !timedOut {
-		t.Fatal("timedOut = false, want true")
+	if outcome.complete || outcome.timedOut || len(outcome.evals) != 0 {
+		t.Fatalf("canceled outcome = complete %v, timedOut %v, evaluations %d; want false/false/0", outcome.complete, outcome.timedOut, len(outcome.evals))
 	}
 }
 

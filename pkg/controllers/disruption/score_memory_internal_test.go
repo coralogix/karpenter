@@ -305,14 +305,14 @@ func TestScoreBasedMemoryInternalAnnotationParsing(t *testing.T) {
 
 func scoreMemoryGrowBatchesForTest(t *testing.T, singletons []*moveSetEvaluation, compute consolidationComputer, score func(Command) moveSetScore) []*moveSetEvaluation {
 	t.Helper()
-	batches, _, timedOut, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"memory-pool": 2}, nil, compute, &moveSetSearchStats{}, score)
+	batchOutcome, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"memory-pool": 2}, nil, compute, &moveSetSearchStats{}, score)
 	if err != nil {
 		t.Fatalf("growScoreBasedBatches() error = %v", err)
 	}
-	if timedOut {
-		t.Fatal("growScoreBasedBatches() timed out")
+	if batchOutcome.timedOut || !batchOutcome.complete {
+		t.Fatalf("growScoreBasedBatches() timedOut/complete = %v/%v, want false/true", batchOutcome.timedOut, batchOutcome.complete)
 	}
-	return batches
+	return batchOutcome.evals
 }
 
 func scoreMemoryTwoCandidateBatchForTest(t *testing.T, batches []*moveSetEvaluation) *moveSetEvaluation {

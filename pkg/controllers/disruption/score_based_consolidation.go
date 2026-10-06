@@ -93,6 +93,13 @@ type moveSetSearchResult struct {
 	constrained bool
 }
 
+type moveSetSearchPhaseOutcome struct {
+	evals     []*moveSetEvaluation
+	evaluated int
+	timedOut  bool
+	complete  bool
+}
+
 type consolidationComputer func(ctx context.Context, candidates ...*Candidate) (Command, error)
 
 func NodePoolUsesScoreBasedConsolidation(np *v1.NodePool) bool {
@@ -178,21 +185,21 @@ func (s *ScoreBasedConsolidation) apiReader() client.Reader {
 
 //nolint:gocyclo
 func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
+	noMoveDetails := scoreBasedNoMoveDetails{
+		candidateCount:           len(candidates),
+		compactionCandidateCount: -1,
+	}
 	currentScoringConfigSignature, scoringConfigChanged := scoreBasedScoringConfigChanged(s.scoringConfigSignature, candidates)
 	s.scoringConfigSignature = currentScoringConfigSignature
 	if scoringConfigChanged {
 		s.lastConsolidationState = time.Time{}
 	}
 	if s.IsConsolidated() && !scoringConfigChanged {
-		logScoreBasedCompactionNoMove(ctx, scoreBasedNoMoveAlreadyConsolidated, scoreBasedNoMoveDetails{
-			candidateCount:           len(candidates),
-			compactionCandidateCount: -1,
-		})
+		logScoreBasedCompactionNoMove(ctx, scoreBasedNoMoveAlreadyConsolidated, noMoveDetails)
 		return []Command{}, nil
 	}
 
 	prepareCtx, stopPrepare := cxtracing.Measure(ctx, nil, scoreBasedConsolidationPrepareSpan)
-	inputCandidateCount := len(candidates)
 	normalCandidates := make([]*Candidate, 0, len(candidates))
 	for _, candidate := range candidates {
 		if candidate == nil || candidate.NodePool == nil || standby.IsNodeClaimActivating(candidate.NodeClaim) || standby.IsNodeClaimStandby(candidate.NodeClaim) || standby.HasNodeTaint(candidate.Node) {
@@ -204,24 +211,20 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	}
 	stopPrepare()
 	candidates = normalCandidates
+	noMoveDetails.compactionCandidateCount = len(candidates)
 	if len(candidates) == 0 {
 		reason := scoreBasedNoMoveAllCandidatesFiltered
-		if inputCandidateCount == 0 {
+		if noMoveDetails.candidateCount == 0 {
 			reason = scoreBasedNoMoveNoEligibleCandidates
 		}
-		logScoreBasedCompactionNoMove(ctx, reason, scoreBasedNoMoveDetails{
-			candidateCount:           inputCandidateCount,
-			compactionCandidateCount: 0,
-		})
+		logScoreBasedCompactionNoMove(ctx, reason, noMoveDetails)
 		return []Command{}, nil
 	}
 
 	start := s.clock.Now()
 	deadline := start.Add(ScoreBasedConsolidationTimeoutDuration)
-	budgetBlockedCandidateCount := 0
-	paceBlockedCandidateCount := 0
-	budgetBlockedNodePools := map[string]struct{}{}
-	paceBlockedNodePools := map[string]struct{}{}
+	noMoveDetails.budgetBlockedNodePools = map[string]struct{}{}
+	noMoveDetails.paceBlockedNodePools = map[string]struct{}{}
 
 	_, stopFilter := cxtracing.Measure(ctx, nil, scoreBasedConsolidationFilterSpan,
 		attribute.Int("compaction_candidate_count", len(candidates)),
@@ -229,9 +232,9 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	var validCandidates []*Candidate
 	for _, candidate := range candidates {
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
-			budgetBlockedCandidateCount++
-			if _, checked := budgetBlockedNodePools[candidate.NodePool.Name]; !checked {
-				budgetBlockedNodePools[candidate.NodePool.Name] = struct{}{}
+			noMoveDetails.budgetBlockedCandidateCount++
+			if _, checked := noMoveDetails.budgetBlockedNodePools[candidate.NodePool.Name]; !checked {
+				noMoveDetails.budgetBlockedNodePools[candidate.NodePool.Name] = struct{}{}
 				if s.budgetExhaustedByInFlightDisruptions(candidate.NodePool) {
 					s.recorder.Publish(scoreBasedNodePoolBlockedByInFlightDisruptions(candidate.NodePool))
 				}
@@ -239,25 +242,19 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 			continue
 		}
 		if !s.underutilizedPace.candidateAllowed(candidate.NodePool, 0) {
-			paceBlockedCandidateCount++
-			if _, reported := paceBlockedNodePools[candidate.NodePool.Name]; !reported {
+			noMoveDetails.paceBlockedCandidateCount++
+			if _, reported := noMoveDetails.paceBlockedNodePools[candidate.NodePool.Name]; !reported {
 				s.recorder.Publish(scoreBasedNodePoolBlockedByPace(candidate.NodePool))
-				paceBlockedNodePools[candidate.NodePool.Name] = struct{}{}
+				noMoveDetails.paceBlockedNodePools[candidate.NodePool.Name] = struct{}{}
 			}
 			continue
 		}
 		validCandidates = append(validCandidates, candidate)
 	}
 	stopFilter()
+	noMoveDetails.validCandidateCount = len(validCandidates)
 	if len(validCandidates) == 0 {
-		logScoreBasedCompactionNoMove(ctx, scoreBasedNoMoveBudgetOrPaceFiltered, scoreBasedNoMoveDetails{
-			candidateCount:              inputCandidateCount,
-			compactionCandidateCount:    len(candidates),
-			budgetBlockedCandidateCount: budgetBlockedCandidateCount,
-			paceBlockedCandidateCount:   paceBlockedCandidateCount,
-			budgetBlockedNodePools:      budgetBlockedNodePools,
-			paceBlockedNodePools:        paceBlockedNodePools,
-		})
+		logScoreBasedCompactionNoMove(ctx, scoreBasedNoMoveBudgetOrPaceFiltered, noMoveDetails)
 		return []Command{}, nil
 	}
 
@@ -272,34 +269,19 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	evals := searchResult.evals
 	evaluated := searchResult.evaluated
 	timedOut := searchResult.timedOut
-	searchStats := searchResult.stats
+	noMoveDetails.recordSearch(searchResult)
 	if len(evals) == 0 {
 		if timedOut {
 			log.FromContext(ctx).V(1).Info(fmt.Sprintf("abandoning score-based consolidation due to timeout after evaluating %d candidates", evaluated))
 		}
-		if searchResult.complete && !searchResult.constrained && !timedOut && budgetBlockedCandidateCount == 0 && paceBlockedCandidateCount == 0 {
+		if searchResult.complete && !searchResult.constrained && !timedOut && noMoveDetails.budgetBlockedCandidateCount == 0 && noMoveDetails.paceBlockedCandidateCount == 0 {
 			s.markConsolidated()
 		}
 		reason := scoreBasedNoMoveNoPositiveFeasibleMove
 		if timedOut {
 			reason = scoreBasedNoMoveSearchTimedOut
 		}
-		logScoreBasedCompactionNoMove(ctx, reason, scoreBasedNoMoveDetails{
-			candidateCount:                 inputCandidateCount,
-			compactionCandidateCount:       len(candidates),
-			budgetBlockedCandidateCount:    budgetBlockedCandidateCount,
-			paceBlockedCandidateCount:      paceBlockedCandidateCount,
-			budgetBlockedNodePools:         budgetBlockedNodePools,
-			paceBlockedNodePools:           paceBlockedNodePools,
-			validCandidateCount:            len(validCandidates),
-			moveSetsEvaluated:              evaluated,
-			noOpMoveSetCount:               searchStats.noOpMoveSetCount(),
-			nonPositiveSavingsMoveSetCount: searchStats.nonPositiveSavingsMoveSetCount(),
-			nonPositiveScoreMoveSetCount:   searchStats.nonPositiveScoreMoveSetCount(),
-			searchTimedOut:                 timedOut,
-			moveSetEvaluationErrorCount:    searchStats.errorCount(),
-			firstMoveSetEvaluationError:    searchStats.firstErrorMessage(),
-		})
+		logScoreBasedCompactionNoMove(ctx, reason, noMoveDetails)
 		return []Command{}, nil
 	}
 
@@ -328,29 +310,14 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	if err != nil {
 		return []Command{}, err
 	}
+	noMoveDetails.validMoveSetCount = len(evals)
+	noMoveDetails.validationAttemptCount = len(evals)
 	if len(cmd.Candidates) == 0 {
 		reason := scoreBasedNoMoveValidationReturnedNoMove
 		if selectedEvalIdx < 0 {
 			reason = scoreBasedNoMoveAllValidationFailed
 		}
-		logScoreBasedCompactionNoMove(ctx, reason, scoreBasedNoMoveDetails{
-			candidateCount:                 inputCandidateCount,
-			compactionCandidateCount:       len(candidates),
-			budgetBlockedCandidateCount:    budgetBlockedCandidateCount,
-			paceBlockedCandidateCount:      paceBlockedCandidateCount,
-			budgetBlockedNodePools:         budgetBlockedNodePools,
-			paceBlockedNodePools:           paceBlockedNodePools,
-			validCandidateCount:            len(validCandidates),
-			moveSetsEvaluated:              evaluated,
-			validMoveSetCount:              len(evals),
-			noOpMoveSetCount:               searchStats.noOpMoveSetCount(),
-			nonPositiveSavingsMoveSetCount: searchStats.nonPositiveSavingsMoveSetCount(),
-			nonPositiveScoreMoveSetCount:   searchStats.nonPositiveScoreMoveSetCount(),
-			searchTimedOut:                 timedOut,
-			moveSetEvaluationErrorCount:    searchStats.errorCount(),
-			firstMoveSetEvaluationError:    searchStats.firstErrorMessage(),
-			validationAttemptCount:         len(evals),
-		})
+		logScoreBasedCompactionNoMove(ctx, reason, noMoveDetails)
 		return []Command{}, nil
 	}
 	logScoreBasedCompactionMoveSelected(ctx, evals, selectedEvalIdx, evaluated, len(validCandidates), timedOut)
@@ -412,37 +379,37 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 	scoreMoveSet := scorer.Score
 
 	// Search every singleton before deciding whether to batch successes or explore pairs.
-	singles, evaluated, timedOut, stats, err := evaluateMoveSetsParWithStats(searchCtx, singleNodeMoveSets, deadline, compute, 0, nil, scoreMoveSet, result.stats)
-	result.evals = singles
-	result.evaluated += evaluated
-	result.timedOut = timedOut
+	singletonOutcome, err := evaluateMoveSetsParWithStats(searchCtx, singleNodeMoveSets, deadline, compute, 0, nil, scoreMoveSet, result.stats)
+	result.evals = singletonOutcome.evals
+	result.evaluated += singletonOutcome.evaluated
+	result.timedOut = singletonOutcome.timedOut
 	if err != nil {
 		return result, err
 	}
-	for _, eval := range singles {
+	for _, eval := range singletonOutcome.evals {
 		eval.searchPath = scoreBasedSearchPathSingleNode
 		eval.sourceNodeSingleMoveScores = []float64{eval.Score.Total}
 	}
-	if timedOut {
-		result.evals = retainScoreBasedMoveSetResults(singles, nil, scoreBasedMoveSetResultLimit)
+	if singletonOutcome.timedOut {
+		result.evals = retainScoreBasedMoveSetResults(singletonOutcome.evals, nil, scoreBasedMoveSetResultLimit)
 		return result, nil
 	}
 
-	if len(singles) > 0 {
-		zeroReplacementSingles := make([]*moveSetEvaluation, 0, len(singles))
-		for _, single := range singles {
+	if len(singletonOutcome.evals) > 0 {
+		zeroReplacementSingles := make([]*moveSetEvaluation, 0, len(singletonOutcome.evals))
+		for _, single := range singletonOutcome.evals {
 			if len(single.Command.Candidates) == 1 && len(single.Command.Replacements) == 0 {
 				zeroReplacementSingles = append(zeroReplacementSingles, single)
 			}
 		}
-		batches, attempted, batchTimedOut, batchErr := growScoreBasedBatches(searchCtx, zeroReplacementSingles, budgets, s.underutilizedPace, compute, result.stats, scoreMoveSet)
+		batchOutcome, batchErr := growScoreBasedBatches(searchCtx, zeroReplacementSingles, budgets, s.underutilizedPace, compute, result.stats, scoreMoveSet)
 		if batchErr != nil {
 			return result, batchErr
 		}
-		result.evals = retainScoreBasedMoveSetResults(singles, batches, scoreBasedMoveSetResultLimit)
-		result.evaluated += attempted
-		result.timedOut = batchTimedOut
-		result.complete = !batchTimedOut
+		result.evals = retainScoreBasedMoveSetResults(singletonOutcome.evals, batchOutcome.evals, scoreBasedMoveSetResultLimit)
+		result.evaluated += batchOutcome.evaluated
+		result.timedOut = batchOutcome.timedOut
+		result.complete = batchOutcome.complete
 		return result, nil
 	}
 
@@ -457,18 +424,18 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCa
 		result.timedOut = true
 		return result, nil
 	}
-	pairEvals, pairEvaluated, pairTimedOut, _, err := evaluateMoveSetsParWithStats(searchCtx, pairs, deadline, compute, scoreBasedMoveSetResultLimit,
-		func(cmd Command) bool { return len(cmd.Candidates) == 2 && len(cmd.Replacements) == 1 }, scoreMoveSet, stats)
+	pairOutcome, err := evaluateMoveSetsParWithStats(searchCtx, pairs, deadline, compute, scoreBasedMoveSetResultLimit,
+		func(cmd Command) bool { return len(cmd.Candidates) == 2 && len(cmd.Replacements) == 1 }, scoreMoveSet, result.stats)
 	if err != nil {
 		return result, err
 	}
-	for _, eval := range pairEvals {
+	for _, eval := range pairOutcome.evals {
 		eval.searchPath = scoreBasedSearchPathPair2To1
 	}
-	result.evals = pairEvals
-	result.evaluated += pairEvaluated
-	result.timedOut = pairTimedOut
-	result.complete = exhaustive && !pairTimedOut
+	result.evals = pairOutcome.evals
+	result.evaluated += pairOutcome.evaluated
+	result.timedOut = pairOutcome.timedOut
+	result.complete = exhaustive && pairOutcome.complete
 	return result, nil
 }
 

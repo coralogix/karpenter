@@ -215,14 +215,14 @@ func TestGrowScoreBasedBatchesRetainsOriginalSingletonScoresInCommandOrder(t *te
 		return Command{Candidates: []*Candidate{second, first}}, nil
 	}
 	score := func(Command) moveSetScore { return scoreBasedLogTestScore(10) }
-	batches, _, timedOut, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool-a": 2}, nil, compute, &moveSetSearchStats{}, score)
-	if err != nil || timedOut {
-		t.Fatalf("growScoreBasedBatches() error/timedOut = %v/%v, want nil/false", err, timedOut)
+	batchOutcome, err := growScoreBasedBatches(context.Background(), singletons, map[string]int{"pool-a": 2}, nil, compute, &moveSetSearchStats{}, score)
+	if err != nil || batchOutcome.timedOut || !batchOutcome.complete {
+		t.Fatalf("growScoreBasedBatches() error/timedOut/complete = %v/%v/%v, want nil/false/true", err, batchOutcome.timedOut, batchOutcome.complete)
 	}
-	if len(batches) != 1 {
-		t.Fatalf("retained batches = %d, want exactly one", len(batches))
+	if len(batchOutcome.evals) != 1 {
+		t.Fatalf("retained batches = %d, want exactly one", len(batchOutcome.evals))
 	}
-	batch := batches[0]
+	batch := batchOutcome.evals[0]
 	if batch.searchPath != scoreBasedSearchPathBatch {
 		t.Errorf("batch searchPath = %q, want %q", batch.searchPath, scoreBasedSearchPathBatch)
 	}

@@ -97,6 +97,16 @@ type scoreBasedNoMoveDetails struct {
 	validationAttemptCount         int
 }
 
+type moveSetSearchStatsSnapshot struct {
+	averageDuration                time.Duration
+	maxDuration                    time.Duration
+	errorCount                     int
+	firstError                     string
+	noOpMoveSetCount               int
+	nonPositiveSavingsMoveSetCount int
+	nonPositiveScoreMoveSetCount   int
+}
+
 func (s *moveSetSearchStats) record(d time.Duration, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -112,33 +122,6 @@ func (s *moveSetSearchStats) record(d time.Duration, err error) {
 		}
 		ScoreBasedMoveSetEvaluationErrorsTotal.Inc(nil)
 	}
-}
-
-func (s *moveSetSearchStats) avg() time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.count == 0 {
-		return 0
-	}
-	return s.sum / time.Duration(s.count)
-}
-
-func (s *moveSetSearchStats) maxDuration() time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.max
-}
-
-func (s *moveSetSearchStats) errorCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.errors
-}
-
-func (s *moveSetSearchStats) firstErrorMessage() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.firstError
 }
 
 func (s *moveSetSearchStats) recordNoOpMoveSet() {
@@ -159,22 +142,18 @@ func (s *moveSetSearchStats) recordNonPositiveScoreMoveSet() {
 	s.nonPositiveScores++
 }
 
-func (s *moveSetSearchStats) noOpMoveSetCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.noOpMoves
-}
-
-func (s *moveSetSearchStats) nonPositiveSavingsMoveSetCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.noSavings
-}
-
-func (s *moveSetSearchStats) nonPositiveScoreMoveSetCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.nonPositiveScores
+func (details *scoreBasedNoMoveDetails) recordSearch(result moveSetSearchResult) {
+	details.moveSetsEvaluated = result.evaluated
+	details.searchTimedOut = result.timedOut
+	if result.stats == nil {
+		return
+	}
+	stats := result.stats.snapshot()
+	details.noOpMoveSetCount = stats.noOpMoveSetCount
+	details.nonPositiveSavingsMoveSetCount = stats.nonPositiveSavingsMoveSetCount
+	details.nonPositiveScoreMoveSetCount = stats.nonPositiveScoreMoveSetCount
+	details.moveSetEvaluationErrorCount = stats.errorCount
+	details.firstMoveSetEvaluationError = stats.firstError
 }
 
 func logMoveSetSearchComplete(
@@ -186,17 +165,36 @@ func logMoveSetSearchComplete(
 	searchDuration time.Duration,
 	stats *moveSetSearchStats,
 ) {
+	statsSnapshot := stats.snapshot()
 	log.FromContext(ctx).V(1).Info("score-based consolidation move set search complete",
 		"moveSets", moveSets,
 		"evaluated", evaluated,
 		"valid", valid,
 		"timedOut", timedOut,
 		"searchDuration", searchDuration,
-		"avgMoveSetEvalDuration", stats.avg(),
-		"maxMoveSetEvalDuration", stats.maxDuration(),
-		"computeErrors", stats.errorCount(),
-		"firstComputeError", stats.firstErrorMessage(),
+		"avgMoveSetEvalDuration", statsSnapshot.averageDuration,
+		"maxMoveSetEvalDuration", statsSnapshot.maxDuration,
+		"computeErrors", statsSnapshot.errorCount,
+		"firstComputeError", statsSnapshot.firstError,
 	)
+}
+
+func (s *moveSetSearchStats) snapshot() moveSetSearchStatsSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	averageDuration := time.Duration(0)
+	if s.count > 0 {
+		averageDuration = s.sum / time.Duration(s.count)
+	}
+	return moveSetSearchStatsSnapshot{
+		averageDuration:                averageDuration,
+		maxDuration:                    s.max,
+		errorCount:                     s.errors,
+		firstError:                     s.firstError,
+		noOpMoveSetCount:               s.noOpMoves,
+		nonPositiveSavingsMoveSetCount: s.noSavings,
+		nonPositiveScoreMoveSetCount:   s.nonPositiveScores,
+	}
 }
 
 func logScoreBasedCompactionMoveSelected(

@@ -51,9 +51,9 @@ func growScoreBasedBatches(
 	compute consolidationComputer,
 	stats *moveSetSearchStats,
 	score func(Command) moveSetScore,
-) ([]*moveSetEvaluation, int, bool, error) {
+) (moveSetSearchPhaseOutcome, error) {
 	if len(singletons) < 2 {
-		return nil, 0, false, nil
+		return moveSetSearchPhaseOutcome{complete: true}, nil
 	}
 	sort.Slice(singletons, func(i, j int) bool { return singletons[i].Score.Total > singletons[j].Score.Total })
 	seeds := make([]*moveSetEvaluation, 0, scoreBasedBatchSeedLimit)
@@ -70,7 +70,7 @@ func growScoreBasedBatches(
 		seeds = append(seeds, singleton)
 	}
 	if len(seeds) == 0 {
-		return nil, 0, false, nil
+		return moveSetSearchPhaseOutcome{complete: true}, nil
 	}
 
 	scoreByCandidate := make(map[string]float64, len(singletons))
@@ -185,10 +185,15 @@ func growScoreBasedBatches(
 	}
 	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
 	if ctx.Err() != nil && !timedOut {
-		return nil, attempted, false, ctx.Err()
+		return moveSetSearchPhaseOutcome{evaluated: attempted}, ctx.Err()
 	}
 	logMoveSetSearchComplete(ctx, attempted, attempted, len(bestBatches), timedOut, time.Since(searchStart), stats)
-	return bestBatches, attempted, timedOut, nil
+	return moveSetSearchPhaseOutcome{
+		evals:     bestBatches,
+		evaluated: attempted,
+		timedOut:  timedOut,
+		complete:  !timedOut,
+	}, nil
 }
 
 //nolint:gocyclo // Result selection reserves independent fallbacks before filling the bounded score-ranked result set.
@@ -494,7 +499,7 @@ func evaluateMoveSetsParWithStats(
 	accept func(Command) bool,
 	score func(Command) moveSetScore,
 	stats *moveSetSearchStats,
-) ([]*moveSetEvaluation, int, bool, *moveSetSearchStats, error) {
+) (moveSetSearchPhaseOutcome, error) {
 	searchStart := time.Now()
 	if stats == nil {
 		stats = &moveSetSearchStats{}
@@ -528,15 +533,20 @@ func evaluateMoveSetsParWithStats(
 	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
 	logMoveSetSearchComplete(ctx, len(moveSets), int(evaluated.Load()), len(evals), timedOut, time.Since(searchStart), stats)
 	if err != nil {
-		return nil, int(evaluated.Load()), timedOut, stats, err
+		return moveSetSearchPhaseOutcome{evaluated: int(evaluated.Load()), timedOut: timedOut}, err
 	}
 	if ctx.Err() != nil && !timedOut {
-		return nil, int(evaluated.Load()), false, stats, ctx.Err()
+		return moveSetSearchPhaseOutcome{evaluated: int(evaluated.Load())}, ctx.Err()
 	}
 	if timedOut && len(evals) == 0 {
 		ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
 	}
-	return evals, int(evaluated.Load()), timedOut, stats, nil
+	return moveSetSearchPhaseOutcome{
+		evals:     evals,
+		evaluated: int(evaluated.Load()),
+		timedOut:  timedOut,
+		complete:  !timedOut,
+	}, nil
 }
 
 func evaluateMoveSetWith(
