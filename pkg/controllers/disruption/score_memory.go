@@ -67,7 +67,7 @@ type scoreBasedMemoryPool struct {
 
 type scoreBasedMemoryPoolScore struct {
 	MemorySurplus             float64                     `json:"memorySurplus"`
-	Status                    string                      `json:"status"`
+	Status                    scoreFactorStatus           `json:"status"`
 	Reason                    string                      `json:"reason,omitempty"`
 	CapacityMemoryBytesPerCPU float64                     `json:"capacityMemoryBytesPerCPU"`
 	TargetMemoryBytesPerCPU   float64                     `json:"targetMemoryBytesPerCPU"`
@@ -82,16 +82,40 @@ type scoreBasedMemoryPoolScore struct {
 }
 
 type scoreBasedMemoryScore struct {
-	Enabled               bool                                 `json:"enabled"`
-	Status                scoreFactorStatus                    `json:"status"`
-	Reason                string                               `json:"reason,omitempty"`
-	Contribution          float64                              `json:"contribution"`
-	RemovedCPU            float64                              `json:"removedCPU"`
-	SourceNodeCount       int                                  `json:"sourceNodeCount"`
-	Pools                 map[string]scoreBasedMemoryPoolScore `json:"pools,omitempty"`
-	addedShapes           map[string]scoreBasedMemoryShape
-	addedShapeAssessments map[string]string
-	unavailableReason     string
+	Enabled         bool                                 `json:"enabled"`
+	Status          scoreFactorStatus                    `json:"status"`
+	Reason          string                               `json:"reason,omitempty"`
+	Contribution    float64                              `json:"contribution"`
+	RemovedCPU      float64                              `json:"removedCPU"`
+	SourceNodeCount int                                  `json:"sourceNodeCount"`
+	Pools           map[string]scoreBasedMemoryPoolScore `json:"pools,omitempty"`
+}
+
+type scoreBasedMemoryCommandSummary struct {
+	score               scoreBasedMemoryScore
+	sources             []scoreBasedMemorySourceCapacity
+	replacements        []scoreBasedMemoryReplacementCapacity
+	standbyDestinations []scoreBasedMemoryStandbyCapacity
+}
+
+type scoreBasedMemorySourceCapacity struct {
+	poolName string
+	hasPool  bool
+	shape    scoreBasedMemoryShape
+	hasShape bool
+}
+
+type scoreBasedMemoryReplacementCapacity struct {
+	poolName       string
+	nodeClaimValid bool
+	configured     bool
+	options        []corev1.ResourceList
+}
+
+type scoreBasedMemoryStandbyCapacity struct {
+	poolName string
+	shape    scoreBasedMemoryShape
+	hasShape bool
 }
 
 type scoreBasedMemorySnapshot struct {
@@ -222,292 +246,257 @@ func newScoreBasedMemorySnapshot(nodes state.StateNodes, configs scoreBasedScori
 }
 
 func scoreBasedMemoryScoreForCommand(command Command, snapshot *scoreBasedMemorySnapshot, configs scoreBasedScoringConfig) scoreBasedMemoryScore {
-	details := initialScoreBasedMemoryScore(command, configs)
-	details = captureRemovedScoreBasedMemoryShapes(details, command, snapshot)
-	if !details.Enabled {
-		return details
+	summary := newScoreBasedMemoryCommandSummary(command, snapshot, configs)
+	if !summary.score.Enabled {
+		return summary.score
 	}
 	if snapshot == nil {
-		return unavailableScoreBasedMemory(details, "memory_baseline_snapshot_missing")
+		return unavailableScoreBasedMemory(summary.score, "memory_baseline_snapshot_missing")
 	}
-	raw := snapshot.scoreCorrection(command, configs)
-	if !raw.Enabled || len(raw.Pools) == 0 {
-		reason := raw.unavailableReason
-		if reason == "" {
-			reason = "memory_balance_inputs_unavailable"
-		}
-		return unavailableScoreBasedMemory(details, reason)
-	}
-	return applyScoreBasedMemoryCorrection(details, raw)
+	return snapshot.scoreCorrection(summary, configs)
 }
 
-func captureRemovedScoreBasedMemoryShapes(details scoreBasedMemoryScore, command Command, snapshot *scoreBasedMemorySnapshot) scoreBasedMemoryScore {
-	for _, candidate := range command.Candidates {
-		if candidate == nil || candidate.NodePool == nil || snapshot == nil {
+//nolint:gocyclo // Sources and destinations share one summary so scoring and diagnostics cannot diverge.
+func (snapshot *scoreBasedMemorySnapshot) scoreCorrection(summary *scoreBasedMemoryCommandSummary, configs scoreBasedScoringConfig) scoreBasedMemoryScore {
+	localDelta := map[string]float64{}
+	poolNames := map[string]struct{}{}
+	removedCPU := 0.0
+
+	for _, source := range summary.sources {
+		if !source.hasPool {
+			return unavailableScoreBasedMemory(summary.score, "source_node_pool_missing")
+		}
+		pool := snapshot.pools[source.poolName]
+		if pool == nil {
+			return unavailableScoreBasedMemory(summary.score, "source_pool_snapshot_missing")
+		}
+		if !source.hasShape || source.shape.cpu <= 0 || source.shape.memory <= 0 {
+			return unavailableScoreBasedMemory(summary.score, "source_node_shape_unavailable")
+		}
+		removedCPU += source.shape.cpu
+		if configs[source.poolName].memory.weight > 0 {
+			if !pool.valid {
+				return unavailableScoreBasedMemory(summary.score, "source_pool_baseline_unavailable")
+			}
+			localDelta[source.poolName] += memoryShapeDelta(source.shape, pool.capacityRatio)
+			poolNames[source.poolName] = struct{}{}
+		}
+	}
+	if removedCPU <= 0 || !finiteScoreValue(removedCPU) {
+		return unavailableScoreBasedMemory(summary.score, "removed_cpu_unavailable")
+	}
+
+	for _, replacement := range summary.replacements {
+		if !replacement.nodeClaimValid {
+			return unavailableScoreBasedMemory(summary.score, "replacement_node_claim_missing")
+		}
+		if !replacement.configured {
+			return unavailableScoreBasedMemory(summary.score, "replacement_pool_configuration_missing")
+		}
+		pool := snapshot.pools[replacement.poolName]
+		if pool == nil {
+			return unavailableScoreBasedMemory(summary.score, "replacement_pool_snapshot_missing")
+		}
+		config := configs[replacement.poolName].memory
+		if config.weight <= 0 {
 			continue
 		}
-		if pool := snapshot.pools[candidate.NodePool.Name]; pool != nil {
-			if shape, found := pool.shapes[candidate.Name()]; found {
-				poolScore := details.Pools[candidate.NodePool.Name]
-				poolScore.RemovedShape = addScoreBasedMemoryShape(poolScore.RemovedShape, shape)
-				details.Pools[candidate.NodePool.Name] = poolScore
-			}
+		if !pool.valid {
+			return unavailableScoreBasedMemory(summary.score, "replacement_pool_baseline_unavailable")
 		}
-	}
-	return details
-}
-
-func applyScoreBasedMemoryCorrection(details, raw scoreBasedMemoryScore) scoreBasedMemoryScore {
-	details.Status = "applied"
-	details.Reason = ""
-	details.Contribution = raw.Contribution
-	details.RemovedCPU = raw.RemovedCPU
-	details.SourceNodeCount = raw.SourceNodeCount
-	for poolName, scored := range raw.Pools {
-		poolScore := details.Pools[poolName]
-		poolScore.Status = "applied"
-		poolScore.Reason = ""
-		poolScore.CapacityMemoryBytesPerCPU = scored.CapacityMemoryBytesPerCPU
-		poolScore.TargetMemoryBytesPerCPU = scored.TargetMemoryBytesPerCPU
-		poolScore.Pressure = scored.Pressure
-		poolScore.NormalizedDelta = scored.NormalizedDelta
-		poolScore.Weight = scored.Weight
-		poolScore.SourceNodeCount = scored.SourceNodeCount
-		poolScore.Contribution = scored.Contribution
-		if shape, found := raw.addedShapes[poolName]; found {
-			poolScore.AddedShape = addScoreBasedMemoryShape(poolScore.AddedShape, shape)
-			poolScore.AddedShapeAssessment = raw.addedShapeAssessments[poolName]
+		if len(replacement.options) == 0 {
+			return unavailableScoreBasedMemory(summary.score, "replacement_shape_unavailable")
 		}
-		details.Pools[poolName] = poolScore
-	}
-	return details
-}
-
-func initialScoreBasedMemoryScore(command Command, configs scoreBasedScoringConfig) scoreBasedMemoryScore {
-	details := scoreBasedMemoryScore{Status: "disabled", Reason: "memory_balance_weight_zero", Pools: map[string]scoreBasedMemoryPoolScore{}}
-	for poolName := range scoreBasedMemoryPoolNames(command) {
-		poolConfig, found := configs[poolName]
+		shape, contribution, found := conservativeAddedMemoryShape(replacement.options, pool.capacityRatio, pool.pressure)
 		if !found {
-			poolConfig.memory = scoreBasedMemoryConfig{surplus: defaultScoreBasedMemorySurplus, weight: defaultScoreBasedMemoryBalanceWeight}
+			return unavailableScoreBasedMemory(summary.score, "replacement_shape_unavailable")
 		}
-		config := poolConfig.memory
+		localDelta[replacement.poolName] += contribution
+		poolScore := summary.score.Pools[replacement.poolName]
+		poolScore.AddedShape = addScoreBasedMemoryShape(poolScore.AddedShape, shape)
+		poolScore.AddedShapeAssessment = "conservatively_assessed_worst_case_compatible_offering"
+		summary.score.Pools[replacement.poolName] = poolScore
+		poolNames[replacement.poolName] = struct{}{}
+	}
+
+	for _, destination := range summary.standbyDestinations {
+		if _, configured := configs[destination.poolName]; !configured {
+			return unavailableScoreBasedMemory(summary.score, "standby_pool_configuration_missing")
+		}
+		pool := snapshot.pools[destination.poolName]
+		if pool == nil {
+			return unavailableScoreBasedMemory(summary.score, "standby_pool_snapshot_missing")
+		}
+		if configs[destination.poolName].memory.weight <= 0 {
+			continue
+		}
+		if !destination.hasShape || !pool.valid {
+			return unavailableScoreBasedMemory(summary.score, "standby_shape_or_pool_baseline_unavailable")
+		}
+		localDelta[destination.poolName] -= memoryShapeDelta(destination.shape, pool.capacityRatio)
+		poolScore := summary.score.Pools[destination.poolName]
+		poolScore.AddedShape = addScoreBasedMemoryShape(poolScore.AddedShape, destination.shape)
+		if poolScore.AddedShapeAssessment == "conservatively_assessed_worst_case_compatible_offering" || poolScore.AddedShapeAssessment == "conservative_replacement_and_measured_standby_shapes" {
+			poolScore.AddedShapeAssessment = "conservative_replacement_and_measured_standby_shapes"
+		} else {
+			poolScore.AddedShapeAssessment = "measured_standby_allocatable_shape"
+		}
+		summary.score.Pools[destination.poolName] = poolScore
+		poolNames[destination.poolName] = struct{}{}
+	}
+	if len(poolNames) == 0 {
+		return unavailableScoreBasedMemory(summary.score, "memory_balance_inputs_unavailable")
+	}
+
+	summary.score.Status = scoreFactorApplied
+	summary.score.Reason = ""
+	summary.score.RemovedCPU = removedCPU
+	summary.score.SourceNodeCount = len(summary.sources)
+	for poolName := range poolNames {
+		pool := snapshot.pools[poolName]
+		config := configs[poolName].memory
+		normalizedDelta := clampUnit(localDelta[poolName] / removedCPU)
+		contribution := config.weight * pool.pressure * normalizedDelta * float64(summary.score.SourceNodeCount)
+		poolScore := summary.score.Pools[poolName]
+		poolScore.Status = scoreFactorApplied
+		poolScore.Reason = ""
+		poolScore.CapacityMemoryBytesPerCPU = pool.capacityRatio
+		poolScore.TargetMemoryBytesPerCPU = pool.targetRatio
+		poolScore.Pressure = pool.pressure
+		poolScore.NormalizedDelta = normalizedDelta
+		poolScore.Weight = config.weight
+		poolScore.SourceNodeCount = summary.score.SourceNodeCount
+		poolScore.Contribution = contribution
+		summary.score.Pools[poolName] = poolScore
+		summary.score.Contribution += contribution
+	}
+	if !finiteScoreValue(summary.score.Contribution) {
+		return unavailableScoreBasedMemory(summary.score, "non_finite_memory_correction")
+	}
+	return summary.score
+}
+
+//nolint:gocyclo // Gather each command capacity input once and retain its diagnostics.
+func newScoreBasedMemoryCommandSummary(command Command, snapshot *scoreBasedMemorySnapshot, configs scoreBasedScoringConfig) *scoreBasedMemoryCommandSummary {
+	summary := &scoreBasedMemoryCommandSummary{
+		score: scoreBasedMemoryScore{
+			Status: scoreFactorDisabled,
+			Reason: "memory_balance_weight_zero",
+			Pools:  map[string]scoreBasedMemoryPoolScore{},
+		},
+		sources:             make([]scoreBasedMemorySourceCapacity, 0, len(command.Candidates)),
+		replacements:        make([]scoreBasedMemoryReplacementCapacity, 0, len(command.Replacements)),
+		standbyDestinations: make([]scoreBasedMemoryStandbyCapacity, 0, len(command.Results.ExistingNodes)),
+	}
+	addPool := func(poolName string) {
+		if _, found := summary.score.Pools[poolName]; found {
+			return
+		}
+		config := scoreBasedMemoryConfigForPool(poolName, configs)
 		poolScore := scoreBasedMemoryPoolScore{MemorySurplus: config.surplus, Weight: config.weight}
 		if config.weight > 0 {
-			details.Enabled = true
-			details.Status = "unavailable"
-			details.Reason = "memory_balance_inputs_unavailable"
-			poolScore.Status = "unavailable"
+			summary.score.Enabled = true
+			summary.score.Status = scoreFactorUnavailable
+			summary.score.Reason = "memory_balance_inputs_unavailable"
+			poolScore.Status = scoreFactorUnavailable
 			poolScore.Reason = "memory_balance_inputs_unavailable"
 		} else {
-			poolScore.Status = "disabled"
+			poolScore.Status = scoreFactorDisabled
 			poolScore.Reason = "memory_balance_weight_zero"
 		}
-		details.Pools[poolName] = poolScore
+		summary.score.Pools[poolName] = poolScore
 	}
-	return details
-}
-
-func scoreBasedMemoryPoolNames(command Command) map[string]struct{} {
-	involved := map[string]struct{}{}
 	for _, candidate := range command.Candidates {
+		source := scoreBasedMemorySourceCapacity{}
 		if candidate != nil && candidate.NodePool != nil {
-			involved[candidate.NodePool.Name] = struct{}{}
+			source.hasPool = true
+			source.poolName = candidate.NodePool.Name
+			addPool(source.poolName)
+			if snapshot != nil {
+				if pool := snapshot.pools[source.poolName]; pool != nil {
+					if shape, found := pool.shapes[candidate.Name()]; found {
+						source.shape = shape
+						source.hasShape = true
+						poolScore := summary.score.Pools[source.poolName]
+						poolScore.RemovedShape = addScoreBasedMemoryShape(poolScore.RemovedShape, shape)
+						summary.score.Pools[source.poolName] = poolScore
+					}
+				}
+			}
 		}
+		summary.sources = append(summary.sources, source)
 	}
 	for _, replacement := range command.Replacements {
+		replacementCapacity := scoreBasedMemoryReplacementCapacity{}
 		if replacement != nil && replacement.NodeClaim != nil {
-			involved[replacement.Labels[v1.NodePoolLabelKey]] = struct{}{}
+			replacementCapacity.nodeClaimValid = true
+			replacementCapacity.poolName = replacement.Labels[v1.NodePoolLabelKey]
+			_, replacementCapacity.configured = configs[replacementCapacity.poolName]
+			addPool(replacementCapacity.poolName)
+			if snapshot != nil && configs[replacementCapacity.poolName].memory.weight > 0 {
+				replacementCapacity.options = replacement.ScoreBasedMemoryAllocatableOptions()
+			}
 		}
+		summary.replacements = append(summary.replacements, replacementCapacity)
 	}
 	for _, existing := range command.Results.ExistingNodes {
-		if existing != nil && scoreBasedMemoryPoolHasStandbyAddition(existing.NodeClaim, len(existing.Pods)) {
-			involved[existing.Labels()[v1.NodePoolLabelKey]] = struct{}{}
+		if existing == nil || !scoreBasedMemoryPoolHasStandbyAddition(existing.NodeClaim, len(existing.Pods)) {
+			continue
 		}
+		destination := scoreBasedMemoryStandbyCapacity{poolName: existing.Labels()[v1.NodePoolLabelKey]}
+		addPool(destination.poolName)
+		if snapshot != nil {
+			if pool := snapshot.pools[destination.poolName]; pool != nil {
+				if shape, found := pool.shapes[existing.Name()]; found {
+					destination.shape = shape
+					destination.hasShape = true
+				}
+			}
+		}
+		summary.standbyDestinations = append(summary.standbyDestinations, destination)
 	}
-	return involved
+	return summary
+}
+
+func scoreBasedMemoryConfigForPool(poolName string, configs scoreBasedScoringConfig) scoreBasedMemoryConfig {
+	if config, found := configs[poolName]; found {
+		return config.memory
+	}
+	return scoreBasedMemoryConfig{surplus: defaultScoreBasedMemorySurplus, weight: defaultScoreBasedMemoryBalanceWeight}
 }
 
 func scoreBasedMemoryPoolHasStandbyAddition(nodeClaim *v1.NodeClaim, podCount int) bool {
 	return nodeClaim != nil && standby.IsNodeClaimStandby(nodeClaim) && podCount > 0
 }
 
-func unavailableScoreBasedMemory(details scoreBasedMemoryScore, reason string) scoreBasedMemoryScore {
-	details.Status = "unavailable"
-	details.Reason = reason
-	details.Contribution = 0
-	for poolName, poolScore := range details.Pools {
+func unavailableScoreBasedMemory(score scoreBasedMemoryScore, reason string) scoreBasedMemoryScore {
+	score.Status = scoreFactorUnavailable
+	score.Reason = reason
+	score.Contribution = 0
+	score.RemovedCPU = 0
+	score.SourceNodeCount = 0
+	for poolName, poolScore := range score.Pools {
+		poolScore.CapacityMemoryBytesPerCPU = 0
+		poolScore.TargetMemoryBytesPerCPU = 0
+		poolScore.Pressure = 0
+		poolScore.NormalizedDelta = 0
+		poolScore.SourceNodeCount = 0
+		poolScore.Contribution = 0
+		poolScore.AddedShape = scoreBasedMemoryLoggedShape{}
+		poolScore.AddedShapeAssessment = ""
 		if poolScore.Weight > 0 {
-			poolScore.Status = "unavailable"
+			poolScore.Status = scoreFactorUnavailable
 			poolScore.Reason = reason
-			poolScore.NormalizedDelta = 0
-			poolScore.Contribution = 0
 		}
-		details.Pools[poolName] = poolScore
+		score.Pools[poolName] = poolScore
 	}
-	return details
-}
-
-func unavailableScoreBasedMemoryCorrection(reason string) scoreBasedMemoryScore {
-	return scoreBasedMemoryScore{Enabled: true, unavailableReason: reason}
+	return score
 }
 
 func addScoreBasedMemoryShape(total scoreBasedMemoryLoggedShape, shape scoreBasedMemoryShape) scoreBasedMemoryLoggedShape {
 	total.CPUCores += shape.cpu
 	total.MemoryBytes += shape.memory
 	return total
-}
-
-//nolint:gocyclo // Keep source, replacement, and standby deltas in one joint command correction.
-func (snapshot *scoreBasedMemorySnapshot) scoreCorrection(command Command, configs scoreBasedScoringConfig) scoreBasedMemoryScore {
-	details := scoreBasedMemoryScore{
-		addedShapes:           map[string]scoreBasedMemoryShape{},
-		addedShapeAssessments: map[string]string{},
-	}
-	if snapshot == nil {
-		return details
-	}
-	memoryActive := false
-	for _, candidate := range command.Candidates {
-		if candidate == nil || candidate.NodePool == nil {
-			continue
-		}
-		if configs[candidate.NodePool.Name].memory.weight > 0 {
-			memoryActive = true
-		}
-	}
-	for _, replacement := range command.Replacements {
-		if replacement == nil || replacement.NodeClaim == nil {
-			continue
-		}
-		if configs[replacement.NodeClaim.Labels[v1.NodePoolLabelKey]].memory.weight > 0 {
-			memoryActive = true
-		}
-	}
-	for _, existing := range command.Results.ExistingNodes {
-		if existing == nil || existing.NodeClaim == nil || !standby.IsNodeClaimStandby(existing.NodeClaim) || len(existing.Pods) == 0 {
-			continue
-		}
-		if configs[existing.Labels()[v1.NodePoolLabelKey]].memory.weight > 0 {
-			memoryActive = true
-		}
-	}
-	if !memoryActive {
-		return details
-	}
-	details.Enabled = true
-	details.SourceNodeCount = len(command.Candidates)
-	details.Pools = map[string]scoreBasedMemoryPoolScore{}
-	localDelta := map[string]float64{}
-	poolNames := map[string]struct{}{}
-	for _, candidate := range command.Candidates {
-		if candidate == nil || candidate.NodePool == nil {
-			return unavailableScoreBasedMemoryCorrection("source_node_pool_missing")
-		}
-		poolName := candidate.NodePool.Name
-		pool := snapshot.pools[poolName]
-		if pool == nil {
-			return unavailableScoreBasedMemoryCorrection("source_pool_snapshot_missing")
-		}
-		shape, found := pool.shapes[candidate.Name()]
-		if !found || shape.cpu <= 0 || shape.memory <= 0 {
-			return unavailableScoreBasedMemoryCorrection("source_node_shape_unavailable")
-		}
-		details.RemovedCPU += shape.cpu
-		if configs[poolName].memory.weight > 0 {
-			if !pool.valid {
-				return unavailableScoreBasedMemoryCorrection("source_pool_baseline_unavailable")
-			}
-			localDelta[poolName] += memoryShapeDelta(shape, pool.capacityRatio)
-			poolNames[poolName] = struct{}{}
-		}
-	}
-	if details.RemovedCPU <= 0 || !finiteScoreValue(details.RemovedCPU) {
-		return unavailableScoreBasedMemoryCorrection("removed_cpu_unavailable")
-	}
-	for _, replacement := range command.Replacements {
-		if replacement == nil || replacement.NodeClaim == nil {
-			return unavailableScoreBasedMemoryCorrection("replacement_node_claim_missing")
-		}
-		poolName := replacement.Labels[v1.NodePoolLabelKey]
-		if _, configured := configs[poolName]; !configured {
-			return unavailableScoreBasedMemoryCorrection("replacement_pool_configuration_missing")
-		}
-		pool := snapshot.pools[poolName]
-		if pool == nil {
-			return unavailableScoreBasedMemoryCorrection("replacement_pool_snapshot_missing")
-		}
-		config := configs[poolName].memory
-		if config.weight <= 0 {
-			continue
-		}
-		if !pool.valid {
-			return unavailableScoreBasedMemoryCorrection("replacement_pool_baseline_unavailable")
-		}
-		shapeOptions := replacement.ScoreBasedMemoryAllocatableOptions()
-		if len(shapeOptions) == 0 {
-			return unavailableScoreBasedMemoryCorrection("replacement_shape_unavailable")
-		}
-		shape, contribution, found := conservativeAddedMemoryShape(shapeOptions, pool.capacityRatio, pool.pressure)
-		if !found {
-			return unavailableScoreBasedMemoryCorrection("replacement_shape_unavailable")
-		}
-		localDelta[poolName] += contribution
-		details.addedShapes[poolName] = addRawScoreBasedMemoryShape(details.addedShapes[poolName], shape)
-		details.addedShapeAssessments[poolName] = "conservatively_assessed_worst_case_compatible_offering"
-		poolNames[poolName] = struct{}{}
-	}
-	for _, existing := range command.Results.ExistingNodes {
-		if existing == nil || existing.NodeClaim == nil || !standby.IsNodeClaimStandby(existing.NodeClaim) || len(existing.Pods) == 0 {
-			continue
-		}
-		poolName := existing.Labels()[v1.NodePoolLabelKey]
-		if _, configured := configs[poolName]; !configured {
-			return unavailableScoreBasedMemoryCorrection("standby_pool_configuration_missing")
-		}
-		pool := snapshot.pools[poolName]
-		if pool == nil {
-			return unavailableScoreBasedMemoryCorrection("standby_pool_snapshot_missing")
-		}
-		if configs[poolName].memory.weight <= 0 {
-			continue
-		}
-		shape, found := pool.shapes[existing.Name()]
-		if !found || !pool.valid {
-			return unavailableScoreBasedMemoryCorrection("standby_shape_or_pool_baseline_unavailable")
-		}
-		localDelta[poolName] -= memoryShapeDelta(shape, pool.capacityRatio)
-		details.addedShapes[poolName] = addRawScoreBasedMemoryShape(details.addedShapes[poolName], shape)
-		if details.addedShapeAssessments[poolName] == "conservatively_assessed_worst_case_compatible_offering" || details.addedShapeAssessments[poolName] == "conservative_replacement_and_measured_standby_shapes" {
-			details.addedShapeAssessments[poolName] = "conservative_replacement_and_measured_standby_shapes"
-		} else {
-			details.addedShapeAssessments[poolName] = "measured_standby_allocatable_shape"
-		}
-		poolNames[poolName] = struct{}{}
-	}
-	if len(poolNames) == 0 {
-		return details
-	}
-	denominator := details.RemovedCPU
-	for poolName := range poolNames {
-		pool := snapshot.pools[poolName]
-		config := configs[poolName].memory
-		normalizedDelta := clampUnit(localDelta[poolName] / denominator)
-		contribution := config.weight * pool.pressure * normalizedDelta * float64(details.SourceNodeCount)
-		details.Pools[poolName] = scoreBasedMemoryPoolScore{
-			CapacityMemoryBytesPerCPU: pool.capacityRatio,
-			TargetMemoryBytesPerCPU:   pool.targetRatio,
-			Pressure:                  pool.pressure,
-			NormalizedDelta:           normalizedDelta,
-			Weight:                    config.weight,
-			SourceNodeCount:           details.SourceNodeCount,
-			Contribution:              contribution,
-		}
-		details.Contribution += contribution
-	}
-	if !finiteScoreValue(details.Contribution) {
-		return unavailableScoreBasedMemoryCorrection("non_finite_memory_correction")
-	}
-	return details
 }
 
 func scoreBasedMemoryNodeShape(node *state.StateNode) scoreBasedMemoryShape {
@@ -580,12 +569,6 @@ func conservativeAddedMemoryShape(options []corev1.ResourceList, capacityRatio, 
 		return scoreBasedMemoryShape{}, 0, false
 	}
 	return bestShape, -bestDelta, true
-}
-
-func addRawScoreBasedMemoryShape(total, shape scoreBasedMemoryShape) scoreBasedMemoryShape {
-	total.cpu += shape.cpu
-	total.memory += shape.memory
-	return total
 }
 
 func memoryShapeDelta(shape scoreBasedMemoryShape, capacityRatio float64) float64 {

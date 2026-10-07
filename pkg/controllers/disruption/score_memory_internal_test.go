@@ -181,6 +181,69 @@ func TestScoreBasedMemoryInternalReplacementUsesConservativeOptions(t *testing.T
 	}
 }
 
+//nolint:gocyclo // Keep cross-pool normalization and late-failure diagnostics in one behavior regression.
+func TestScoreBasedMemoryCrossPoolCorrectionAndUnavailableDestination(t *testing.T) {
+	const (
+		weightedSourcePool = "weighted-source"
+		disabledSourcePool = "disabled-source"
+		destinationPool    = "destination"
+		missingPool        = "missing-destination"
+	)
+	snapshot := &scoreBasedMemorySnapshot{pools: map[string]*scoreBasedMemoryPool{}}
+	for poolName, shapes := range map[string]map[string]scoreBasedMemoryShape{
+		weightedSourcePool: {"source-a": {cpu: 1, memory: 8}},
+		disabledSourcePool: {"source-b": {cpu: 3, memory: 12}},
+		destinationPool:    {},
+	} {
+		poolSnapshot := scoreMemorySnapshotForTest(poolName, 10, 40, 5, 10, shapes)
+		snapshot.pools[poolName] = poolSnapshot.pools[poolName]
+	}
+	configs := scoreBasedScoringConfig{
+		weightedSourcePool: {memory: scoreBasedMemoryConfig{surplus: defaultScoreBasedMemorySurplus, weight: 1}},
+		disabledSourcePool: {memory: scoreBasedMemoryConfig{surplus: defaultScoreBasedMemorySurplus, weight: 0}},
+		destinationPool:    {memory: scoreBasedMemoryConfig{surplus: defaultScoreBasedMemorySurplus, weight: 1}},
+		missingPool:        {memory: scoreBasedMemoryConfig{surplus: defaultScoreBasedMemorySurplus, weight: 1}},
+	}
+	command := Command{
+		Candidates: []*Candidate{
+			scoreMemoryCandidateForTest(weightedSourcePool, "source-a"),
+			scoreMemoryCandidateForTest(disabledSourcePool, "source-b"),
+		},
+		Replacements: []*Replacement{{NodeClaim: scoreMemoryReplacementForTest(destinationPool, scoreBasedMemoryShape{cpu: 1, memory: 8})}},
+	}
+
+	got := scoreBasedMemoryScoreForCommand(command, snapshot, configs)
+	if got.Status != scoreFactorApplied || got.RemovedCPU != 4 || got.SourceNodeCount != 2 || got.Contribution != 0 {
+		t.Fatalf("cross-pool correction = %+v, want opposing 0.5 contributions normalized by all 4 removed CPU and two sources", got)
+	}
+	if got.Pools[weightedSourcePool].NormalizedDelta != 0.25 || got.Pools[weightedSourcePool].Contribution != 0.5 {
+		t.Fatalf("weighted source score = %+v, want delta 0.25 and contribution 0.5", got.Pools[weightedSourcePool])
+	}
+	if got.Pools[destinationPool].NormalizedDelta != -0.25 || got.Pools[destinationPool].Contribution != -0.5 {
+		t.Fatalf("cross-pool destination score = %+v, want delta -0.25 and contribution -0.5", got.Pools[destinationPool])
+	}
+	if disabled := got.Pools[disabledSourcePool]; disabled.Status != scoreFactorDisabled || disabled.RemovedShape.CPUCores != 3 || disabled.RemovedShape.MemoryBytes != 12 {
+		t.Fatalf("disabled source diagnostics = %+v, want disabled status with its removed shape", disabled)
+	}
+
+	command.Replacements = append(command.Replacements, &Replacement{
+		NodeClaim: scoreMemoryReplacementForTest(missingPool, scoreBasedMemoryShape{cpu: 1, memory: 4}),
+	})
+	unavailable := scoreBasedMemoryScoreForCommand(command, snapshot, configs)
+	if unavailable.Status != scoreFactorUnavailable || unavailable.Reason != "replacement_pool_snapshot_missing" || unavailable.Contribution != 0 || unavailable.RemovedCPU != 0 || unavailable.SourceNodeCount != 0 {
+		t.Fatalf("late unavailable destination result = %+v, want a zero correction with destination snapshot reason", unavailable)
+	}
+	if source := unavailable.Pools[weightedSourcePool]; source.Status != scoreFactorUnavailable || source.Contribution != 0 || source.NormalizedDelta != 0 || source.RemovedShape.CPUCores != 1 || source.RemovedShape.MemoryBytes != 8 {
+		t.Fatalf("unavailable weighted source diagnostics = %+v, want zero correction and known removed shape", source)
+	}
+	if disabled := unavailable.Pools[disabledSourcePool]; disabled.Status != scoreFactorDisabled || disabled.RemovedShape.CPUCores != 3 || disabled.RemovedShape.MemoryBytes != 12 {
+		t.Fatalf("unavailable disabled source diagnostics = %+v, want disabled status and known removed shape", disabled)
+	}
+	if destination := unavailable.Pools[destinationPool]; destination.Status != scoreFactorUnavailable || destination.AddedShape != (scoreBasedMemoryLoggedShape{}) || destination.AddedShapeAssessment != "" {
+		t.Fatalf("partial destination diagnostics = %+v, want no added shape after late failure", destination)
+	}
+}
+
 func TestScoreBasedMemoryDetailsReportDisabledState(t *testing.T) {
 	const poolName = "memory-pool"
 	candidate := scoreMemoryCandidateForTest(poolName, "source")
