@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -160,5 +161,45 @@ func BenchmarkSimulateScheduling_ClusterFixture(b *testing.B) {
 		if _, err := bench.simulator.Simulate(bench.ctx, candidate); err != nil {
 			b.Fatalf("simulating scheduling for candidate %q: %v", candidate.Name(), err)
 		}
+	}
+}
+
+func BenchmarkNewConsolidationSchedulingSimulator_ClusterFixture(b *testing.B) {
+	dir := clusterfixture.ResolveDir(clusterFixtureDir())
+	if !clusterfixture.Exists(dir) {
+		b.Skipf("cluster fixture not found at %q", dir)
+	}
+
+	bench := getClusterFixtureBench(b)
+	catalog := bench.env.Fixture().Catalog
+	if !catalog.HasFullInstanceCatalog() && bench.env.NodeCount > 10 {
+		b.Fatalf("fixture %q has no full instance-types.json (only node-derived catalog). "+
+			"Run the cluster-fixture-scraper command once; the benchmark itself does not call AWS.", dir)
+	}
+	totalITs := 0
+	for _, names := range catalog.NodePoolInstanceTypes {
+		totalITs += len(names)
+	}
+	b.Logf("instance catalog: %d specs, %d pool assignments (offline from fixture files)", len(catalog.InstanceTypeSpecs), totalITs)
+	b.ReportAllocs()
+
+	b.ResetTimer()
+	b.ReportMetric(float64(bench.env.NodeCount), "nodes")
+	b.ReportMetric(float64(bench.env.PodCount), "pods")
+	b.ReportMetric(float64(len(bench.candidates)), "candidates")
+	for i := 0; i < b.N; i++ {
+		simulator, err := NewConsolidationSchedulingSimulator(
+			bench.ctx,
+			bench.env.Client,
+			bench.env.Cluster,
+			bench.env.Provisioner,
+			bench.env.Clock,
+			bench.env.Recorder,
+			bench.candidates...,
+		)
+		if err != nil {
+			b.Fatalf("constructing consolidation scheduling simulator: %v", err)
+		}
+		runtime.KeepAlive(simulator)
 	}
 }

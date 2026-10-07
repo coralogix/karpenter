@@ -29,6 +29,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	pscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
 )
@@ -72,6 +73,52 @@ func TestPreparedTopologyMatchesLiveTopologyForSpread(t *testing.T) {
 	}
 	if got, want := materialized.topologyGroups[group.Hash()].emptyDomains, live.topologyGroups[group.Hash()].emptyDomains; !reflect.DeepEqual(got, want) {
 		t.Fatalf("prepared spread domains differ from live domains: got %v, want %v", got, want)
+	}
+}
+
+func TestPreparedTopologyUsesCapturedNodeLabelsForNewGroups(t *testing.T) {
+	ctx := context.Background()
+	node := preparedTopologyTestNode("node-a", "zone-c")
+	node.Node.Labels["example.com/pool"] = "blue"
+	node.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "node-a", Labels: map[string]string{"example.com/pool": "red"}}}
+	prepared, err := NewPreparedTopology(ctx, preparedTopologyTestInputs(), []*state.StateNode{node}, nil, nil)
+	if err != nil {
+		t.Fatalf("building prepared topology: %v", err)
+	}
+
+	// A new group is prepared during materialization, after the caller's node
+	// object has changed. It must still use the captured label snapshot.
+	node.Node.Labels["example.com/pool"] = "green"
+	newIncoming := func(name, pool string) *corev1.Pod {
+		incoming := preparedTopologyTestPod(name, "")
+		incoming.Spec.NodeSelector = map[string]string{"example.com/pool": pool}
+		incoming.Spec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{{
+			TopologyKey:       corev1.LabelTopologyZone,
+			MaxSkew:           1,
+			WhenUnsatisfiable: corev1.DoNotSchedule,
+			LabelSelector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+		}}
+		return incoming
+	}
+
+	blueIncoming := newIncoming("incoming-blue", "blue")
+	blueTopology, err := prepared.Materialize(ctx, []*corev1.Pod{blueIncoming})
+	if err != nil {
+		t.Fatalf("materializing blue topology: %v", err)
+	}
+	blueGroup := blueTopology.topologyGroups[incomingTopologyGroup(t, blueIncoming).Hash()]
+	if _, ok := blueGroup.domains["zone-c"]; !ok {
+		t.Fatalf("expected captured Node labels to register zone-c for blue selector, got domains %v", blueGroup.domains)
+	}
+
+	redIncoming := newIncoming("incoming-red", "red")
+	redTopology, err := prepared.Materialize(ctx, []*corev1.Pod{redIncoming})
+	if err != nil {
+		t.Fatalf("materializing red topology: %v", err)
+	}
+	redGroup := redTopology.topologyGroups[incomingTopologyGroup(t, redIncoming).Hash()]
+	if _, ok := redGroup.domains["zone-c"]; ok {
+		t.Fatalf("expected captured Node labels to exclude zone-c for red selector, got domains %v", redGroup.domains)
 	}
 }
 
