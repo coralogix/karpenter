@@ -29,9 +29,7 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
 	"golang.org/x/time/rate"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
@@ -59,7 +57,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
-	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
@@ -188,80 +185,29 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 			metrics.ReasonLabel:    pretty.ToSnakeCase(string(cmd.Reason())),
 			ConsolidationTypeLabel: string(cmd.Decision()),
 		})
-		if cmd.Action == EvacuateAction && q.evictionQueue != nil {
-			q.evictionQueue.Cancel(cmd.evictionPods...)
-		}
-		stateNodes := lo.Map(cmd.Candidates, func(c *Candidate, _ int) *state.StateNode { return c.StateNode })
-		var cleanupErr error
-		if cmd.Action == EvacuateAction {
-			cleanupErr = q.rollbackEvacuation(ctx, cmd.Candidates)
-		} else {
-			cleanupErr = state.RequireNoScheduleTaint(ctx, q.kubeClient, false, stateNodes...)
-			cleanupErr = multierr.Combine(cleanupErr, state.ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, stateNodes...))
-		}
-		multiErr := multierr.Combine(err, cleanupErr)
-		if cmd.Action == EvacuateAction {
-			q.recordEvacuationOutcome(baseLogContext, cmd, evacuationOutcomeFailed, multiErr)
-		} else {
-			log.FromContext(ctx).Error(multiErr, "failed terminating nodes while executing a disruption command")
-		}
+		q.handleCommandFailure(ctx, baseLogContext, cmd, err)
 	} else {
 		cmd.Succeeded = true
-		if cmd.Action == EvacuateAction {
-			q.recordEvacuationOutcome(baseLogContext, cmd, evacuationOutcomeCompleted, nil)
-		} else {
-			log.FromContext(ctx).V(1).Info("command succeeded")
-		}
+		q.handleCommandSuccess(ctx, baseLogContext, cmd)
 	}
 	q.CompleteCommand(cmd)
 	return reconcile.Result{}, nil
 }
 
-func (q *Queue) recordEvacuationOutcome(ctx context.Context, cmd *Command, outcome string, err error) {
-	duration := q.clock.Since(cmd.CreationTimestamp)
-	reason := pretty.ToSnakeCase(string(cmd.Reason()))
-	if outcome == evacuationOutcomeCompleted {
-		seenNodeClaims := map[string]struct{}{}
-		for _, candidate := range cmd.Candidates {
-			if candidate == nil || candidate.NodeClaim == nil {
-				continue
-			}
-			nodeClaim := candidate.NodeClaim
-			nodeClaimID := nodeClaim.Name
-			if nodeClaimID == "" {
-				nodeClaimID = nodeClaim.Status.ProviderID
-			}
-			if _, seen := seenNodeClaims[nodeClaimID]; seen {
-				continue
-			}
-			seenNodeClaims[nodeClaimID] = struct{}{}
-			NodeClaimsEvacuatedTotal.Inc(map[string]string{
-				metrics.ReasonLabel:       reason,
-				metrics.NodePoolLabel:     nodeClaim.Labels[v1.NodePoolLabelKey],
-				metrics.CapacityTypeLabel: nodeClaim.Labels[v1.CapacityTypeLabelKey],
-			})
-		}
-	}
-	EvacuationCommandsTotal.Inc(map[string]string{
-		evacuationOutcomeLabel: outcome,
-		metrics.ReasonLabel:    reason,
-	})
-	EvacuationDurationSeconds.Observe(duration.Seconds(), map[string]string{
-		metrics.ReasonLabel: reason,
-	})
-
-	logger := log.FromContext(ctx).WithValues(
-		"command-id", cmd.ID.String(),
-		"outcome", outcome,
-		metrics.ReasonLabel, reason,
-		"disrupted-node-count", len(cmd.Candidates),
-		"duration", duration,
-	)
-	if err != nil {
-		logger.Error(err, "evacuation failed")
+func (q *Queue) handleCommandFailure(ctx, callbackCtx context.Context, cmd *Command, err error) {
+	if cmd.Action == EvacuateAction {
+		q.handleEvacuationFailure(ctx, callbackCtx, cmd, err)
 		return
 	}
-	logger.Info("evacuation completed; source nodes handed off to standby")
+	q.handleDeletionFailure(ctx, cmd, err)
+}
+
+func (q *Queue) handleCommandSuccess(ctx, callbackCtx context.Context, cmd *Command) {
+	if cmd.Action == EvacuateAction {
+		q.handleEvacuationSuccess(callbackCtx, cmd)
+		return
+	}
+	log.FromContext(ctx).V(1).Info("command succeeded")
 }
 
 // waitOrTerminate will wait until launched nodeclaims are ready.
@@ -313,214 +259,7 @@ func (q *Queue) waitOrTerminate(ctx context.Context, callbackCtx context.Context
 	if cmd.Action == EvacuateAction {
 		return q.evacuate(ctx, cmd)
 	}
-	// All replacements have been provisioned.
-	// All we need to do now is get a successful delete call for each node claim,
-	// then the termination controller will handle the eventual deletion of the nodes.
-	errs := make([]error, len(cmd.Candidates))
-	workqueue.ParallelizeUntil(ctx, len(cmd.Candidates), len(cmd.Candidates), func(i int) {
-		candidate := cmd.Candidates[i]
-		providerID := candidate.ProviderID()
-		q.Lock()
-		alreadyDeleted := cmd.deletedCandidates != nil && cmd.deletedCandidates[providerID]
-		callbackDone := cmd.deleteSuccessCallbacks != nil && cmd.deleteSuccessCallbacks[providerID]
-		q.Unlock()
-		if alreadyDeleted {
-			if cmd.OnDeleteSuccess != nil && !callbackDone {
-				if err := cmd.OnDeleteSuccess(ctx, candidate); err != nil {
-					errs[i] = err
-					return
-				}
-				q.Lock()
-				if cmd.deleteSuccessCallbacks == nil {
-					cmd.deleteSuccessCallbacks = map[string]bool{}
-				}
-				cmd.deleteSuccessCallbacks[providerID] = true
-				q.Unlock()
-			}
-			return
-		}
-		if cmd.BeforeDelete != nil {
-			if err := cmd.BeforeDelete(ctx, []*Candidate{candidate}); err != nil {
-				errs[i] = fmt.Errorf("validating node before deletion, %w", err)
-				return
-			}
-		}
-		var deleteErr error
-		if cmd.DeleteWithPreconditions {
-			if candidate.NodeClaim == nil || candidate.NodeClaim.UID == "" || candidate.NodeClaim.ResourceVersion == "" {
-				errs[i] = NewUnrecoverableError(fmt.Errorf("conditional deletion requires a fresh NodeClaim UID and resourceVersion"))
-				return
-			}
-			uid, resourceVersion := candidate.NodeClaim.UID, candidate.NodeClaim.ResourceVersion
-			deleteErr = q.kubeClient.Delete(ctx, candidate.NodeClaim, &client.DeleteOptions{Preconditions: &metav1.Preconditions{
-				UID:             &uid,
-				ResourceVersion: &resourceVersion,
-			}})
-		} else {
-			deleteErr = retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
-				return q.kubeClient.Delete(ctx, candidate.NodeClaim)
-			})
-		}
-		if deleteErr != nil {
-			errs[i] = client.IgnoreNotFound(deleteErr)
-			return
-		}
-		q.Lock()
-		if cmd.deletedCandidates == nil {
-			cmd.deletedCandidates = map[string]bool{}
-		}
-		cmd.deletedCandidates[providerID] = true
-		q.Unlock()
-		q.recorder.Publish(disruptionevents.Terminating(candidate.Node, candidate.NodeClaim, string(cmd.Reason()))...)
-		metrics.NodeClaimsDisruptedTotal.Inc(map[string]string{
-			metrics.ReasonLabel:       pretty.ToSnakeCase(string(cmd.Reason())),
-			metrics.NodePoolLabel:     candidate.NodeClaim.Labels[v1.NodePoolLabelKey],
-			metrics.CapacityTypeLabel: candidate.NodeClaim.Labels[v1.CapacityTypeLabelKey],
-		})
-		if cmd.OnDeleteSuccess != nil {
-			if err := cmd.OnDeleteSuccess(ctx, candidate); err != nil {
-				errs[i] = err
-				return
-			}
-			q.Lock()
-			if cmd.deleteSuccessCallbacks == nil {
-				cmd.deleteSuccessCallbacks = map[string]bool{}
-			}
-			cmd.deleteSuccessCallbacks[providerID] = true
-			q.Unlock()
-		}
-	})
-	// If there were any deletion failures, we should requeue.
-	// In the case where we requeue, but the timeout for the command is reached, we'll mark this as a failure.
-	if err := multierr.Combine(errs...); err != nil {
-		return err
-	}
-	if cmd.OnSuccess != nil {
-		return cmd.OnSuccess(callbackCtx)
-	}
-	return nil
-}
-
-// evacuate asks the shared termination queue to evict non-daemon pods, then hands off an empty node as standby.
-func (q *Queue) evacuate(ctx context.Context, cmd *Command) error {
-	if q.evictionQueue == nil {
-		return NewUnrecoverableError(fmt.Errorf("evacuation requires the shared pod eviction queue"))
-	}
-	waiting, err := q.queueEvacuationPods(ctx, cmd)
-	if err != nil {
-		return err
-	}
-	if waiting > 0 {
-		return fmt.Errorf("waiting for %d non-daemon pod(s) to leave evacuation nodes", waiting)
-	}
-	q.evictionQueue.Cancel(cmd.evictionPods...)
-	return q.completeEvacuation(ctx, cmd)
-}
-
-func (q *Queue) queueEvacuationPods(ctx context.Context, cmd *Command) (int, error) {
-	var waiting int
-	queued := map[terminator.QueueKey]struct{}{}
-	for _, pod := range cmd.evictionPods {
-		queued[terminator.NewQueueKey(pod)] = struct{}{}
-	}
-	for _, candidate := range cmd.Candidates {
-		if candidate.Node == nil || candidate.NodeClaim == nil {
-			return 0, NewUnrecoverableError(fmt.Errorf("evacuation requires a registered node and NodeClaim"))
-		}
-		occupyingPods, err := scoreBasedNodeOccupyingPods(ctx, q.apiReader, candidate.Node)
-		if err != nil {
-			return 0, fmt.Errorf("listing pods on evacuation node, %w", err)
-		}
-		waiting += len(occupyingPods)
-		evictable := lo.Filter(occupyingPods, func(p *corev1.Pod, _ int) bool { return podutils.IsEvictable(p, q.clock, q.recorder) })
-		q.addEvictablePods(cmd, queued, evictable)
-	}
-	return waiting, nil
-}
-
-func (q *Queue) addEvictablePods(cmd *Command, queued map[terminator.QueueKey]struct{}, pods []*corev1.Pod) {
-	if len(pods) == 0 {
-		return
-	}
-	q.evictionQueue.Add(pods...)
-	for _, pod := range pods {
-		key := terminator.NewQueueKey(pod)
-		if _, exists := queued[key]; exists {
-			continue
-		}
-		cmd.evictionPods = append(cmd.evictionPods, pod)
-		queued[key] = struct{}{}
-	}
-}
-
-func (q *Queue) completeEvacuation(ctx context.Context, cmd *Command) error {
-	for _, candidate := range cmd.Candidates {
-		if err := q.persistStandby(ctx, candidate); err != nil {
-			return fmt.Errorf("persisting standby state, %w", err)
-		}
-	}
-	stateNodes := lo.Map(cmd.Candidates, func(c *Candidate, _ int) *state.StateNode { return c.StateNode })
-	if err := state.RequireNoScheduleTaint(ctx, q.kubeClient, false, stateNodes...); err != nil {
-		return fmt.Errorf("removing temporary disruption taint after evacuation, %w", err)
-	}
-	if err := state.ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, stateNodes...); err != nil {
-		return fmt.Errorf("clearing disruption reason after evacuation, %w", err)
-	}
-	return nil
-}
-
-// persistStandby writes the NodeClaim marker and standby taint before removing the temporary disruption taint.
-func (q *Queue) persistStandby(ctx context.Context, candidate *Candidate) error {
-	if err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
-		nodeClaim := &v1.NodeClaim{}
-		if err := q.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
-			return err
-		}
-		if standby.IsNodeClaimStandby(nodeClaim) {
-			return nil
-		}
-		return standby.NewLifecycle(q.kubeClient, q.kubeClient).PatchNodeClaimStandby(ctx, nodeClaim, true)
-	}); err != nil {
-		return err
-	}
-	return q.ensureStandbyTaint(ctx, candidate.Node)
-}
-
-func (q *Queue) ensureStandbyTaint(ctx context.Context, sourceNode *corev1.Node) error {
-	if sourceNode == nil {
-		return fmt.Errorf("cannot restore standby taint without a Node")
-	}
-	return retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
-		return standby.NewLifecycle(q.kubeClient, q.kubeClient).EnsureNodeStandbyTaint(ctx, sourceNode)
-	})
-}
-
-func (q *Queue) rollbackEvacuation(ctx context.Context, candidates []*Candidate) error {
-	var uncordon []*state.StateNode
-	var errs []error
-	for _, candidate := range candidates {
-		current := &v1.NodeClaim{}
-		if err := q.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), current); err != nil {
-			if errors.IsNotFound(err) {
-				uncordon = append(uncordon, candidate.StateNode)
-				continue
-			}
-			errs = append(errs, fmt.Errorf("checking standby marker before evacuation rollback, %w", err))
-			continue
-		}
-		if standby.IsNodeClaimStandby(current) {
-			if err := q.ensureStandbyTaint(ctx, candidate.Node); err != nil {
-				// Keep the disruption taint until standby state is safe to preserve.
-				errs = append(errs, fmt.Errorf("restoring standby taint before evacuation rollback, %w", err))
-				continue
-			}
-		}
-		uncordon = append(uncordon, candidate.StateNode)
-	}
-	uncordonErr := state.RequireNoScheduleTaint(ctx, q.kubeClient, false, uncordon...)
-	stateNodes := lo.Map(candidates, func(c *Candidate, _ int) *state.StateNode { return c.StateNode })
-	conditionErr := state.ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, stateNodes...)
-	return multierr.Combine(append(errs, uncordonErr, conditionErr)...)
+	return q.deleteCandidates(ctx, callbackCtx, cmd)
 }
 
 // markDisrupted taints the node and adds the Disrupted condition to the NodeClaim for a candidate that is about to be disrupted
@@ -592,8 +331,8 @@ func (q *Queue) activateStandbyDestinations(ctx context.Context, cmd *Command) e
 }
 
 func (q *Queue) rollbackStart(ctx context.Context, cmd *Command, candidates []*Candidate, cause error) error {
-	if cmd.Action == EvacuateAction && q.evictionQueue != nil {
-		q.evictionQueue.Cancel(cmd.evictionPods...)
+	if cmd.Action == EvacuateAction {
+		q.cancelEvacuationPods(cmd)
 	}
 	stateNodes := lo.Map(candidates, func(c *Candidate, _ int) *state.StateNode { return c.StateNode })
 	rollbackErr := multierr.Combine(

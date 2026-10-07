@@ -243,10 +243,10 @@ type Command struct {
 	// OnSuccess runs after the action is committed, before the command leaves the orchestration queue.
 	OnSuccess func(context.Context) error
 	// OnDeleteSuccess runs after each source NodeClaim delete succeeds.
-	OnDeleteSuccess        func(context.Context, *Candidate) error
-	deletedCandidates      map[string]bool
-	deleteSuccessCallbacks map[string]bool
-	evictionPods           []*corev1.Pod
+	OnDeleteSuccess func(context.Context, *Candidate) error
+
+	deletionExecution   *deletionExecutionState
+	evacuationExecution *evacuationExecutionState
 
 	CreationTimestamp time.Time
 	ID                uuid.UUID
