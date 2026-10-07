@@ -25,8 +25,10 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	karpopts "sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/test"
 )
 
 func schedulerBaselineTestContext() context.Context {
@@ -70,6 +72,33 @@ func TestNodePoolInputsDeepCopyOwnsProviderCatalog(t *testing.T) {
 	}
 	if _, ok := snapshot.instanceTypes["pool"][0].Requirements["example.com/mutated"]; ok {
 		t.Fatal("node pool inputs copied the caller's instance-type requirements")
+	}
+}
+
+func TestNewNodePoolInputsRetainsCompatibleInstanceTypes(t *testing.T) {
+	nodePool := test.NodePool(v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "pool"}})
+	nodePool.Spec.Template.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{{
+		Key:      corev1.LabelInstanceTypeStable,
+		Operator: corev1.NodeSelectorOpIn,
+		Values:   []string{"compatible"},
+	}}
+	instanceTypes := []*cloudprovider.InstanceType{
+		fake.NewInstanceType("compatible"),
+		fake.NewInstanceType("incompatible"),
+	}
+
+	inputs := NewNodePoolInputs(schedulerBaselineTestContext(), test.NewEventRecorder(), []*v1.NodePool{nodePool}, map[string][]*cloudprovider.InstanceType{
+		nodePool.Name: instanceTypes,
+	})
+	if len(inputs.nodeClaimTemplates) != 1 {
+		t.Fatalf("expected one node claim template, got %d", len(inputs.nodeClaimTemplates))
+	}
+	options := inputs.nodeClaimTemplates[0].InstanceTypeOptions
+	if len(options) != 1 {
+		t.Fatalf("expected only compatible instance type to remain, got %d options", len(options))
+	}
+	if options[0].Name != "compatible" {
+		t.Fatalf("expected compatible instance type to remain, got %q", options[0].Name)
 	}
 }
 
