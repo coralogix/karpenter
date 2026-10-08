@@ -109,16 +109,17 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 		})
 
 		PIt("should not pace empty annotated pool nodes", func() {
-			scoreBasedNodePool.Annotations[v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey] = "1"
+			scoreBasedNodePool.Annotations[v1.DisruptionPacingPerMinuteAnnotationKey] = "1"
 			ExpectApplied(ctx, env.Client, scoreBasedNodePool)
 
-			underutilizedPace := disruption.NewUnderutilizedConsolidationPace(env.Clock)
-			c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, underutilizedPace)
-			scoreBasedWithPace := disruption.NewScoreBasedConsolidation(c)
+			pacingManager := disruption.NewDisruptionPacing(env.Clock)
+			c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, pacingManager)
+			scoreBasedWithPacing := disruption.NewScoreBasedConsolidation(c)
 
 			nonEmptyCandidate, err := createScoreBasedCandidateForPool(scoreBasedNodePool, mostExpensiveInstance, test.Pod())
 			Expect(err).To(BeNil())
-			underutilizedPace.Charge(&disruption.Command{Candidates: []*disruption.Candidate{nonEmptyCandidate}})
+			recordSuccessfulPacingStart(pacingManager, []*disruption.Candidate{nonEmptyCandidate})
+			Expect(pacingManager.CandidateAllowed(scoreBasedNodePool, 0)).To(BeFalse())
 
 			candidate, err := createScoreBasedCandidateForPool(scoreBasedNodePool, leastExpensiveInstance)
 			Expect(err).To(BeNil())
@@ -127,7 +128,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			var cmds []disruption.Command
 			ExpectParallelized(
 				func() {
-					cmds, err = scoreBasedWithPace.ComputeCommands(ctx, budgetMapping, candidate)
+					cmds, err = scoreBasedWithPacing.ComputeCommands(ctx, budgetMapping, candidate)
 				},
 				func() {
 					Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
@@ -260,4 +261,14 @@ func createScoreBasedCandidateForPool(np *v1.NodePool, instanceType *cloudprovid
 		queue,
 		disruption.GracefulDisruptionClass,
 	)
+}
+
+func recordSuccessfulPacingStart(pacing *disruption.DisruptionPacing, candidates []*disruption.Candidate) {
+	command := disruption.Command{Candidates: candidates}
+	accepted := pacing.AdmitCommands([]disruption.Command{command})
+	Expect(accepted).To(Equal([]int{0}))
+	pacing.ChargePass([]disruption.DisruptionPacingSuccessfulStart{{
+		Command:   &command,
+		StartTime: env.Clock.Now(),
+	}})
 }

@@ -106,7 +106,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	start := s.clock.Now()
 	deadline := start.Add(ScoreBasedConsolidationTimeoutDuration)
 	constrainedByBudgets := false
-	constrainedByPace := false
+	constrainedByDisruptionPacing := false
 
 	candidates = s.SortCandidates(candidates)
 	var validCandidates []*Candidate
@@ -115,8 +115,8 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 			constrainedByBudgets = true
 			continue
 		}
-		if len(candidate.reschedulablePods) > 0 && !s.underutilizedPace.candidateAllowed(candidate.NodePool, 0) {
-			constrainedByPace = true
+		if len(candidate.reschedulablePods) > 0 && !s.disruptionPacing.CandidateAllowed(candidate.NodePool, 0) {
+			constrainedByDisruptionPacing = true
 			continue
 		}
 		validCandidates = append(validCandidates, candidate)
@@ -131,7 +131,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		if timedOut {
 			log.FromContext(ctx).V(1).Info(fmt.Sprintf("abandoning score-based consolidation due to timeout after evaluating %d candidates", evaluated))
 		}
-		if !timedOut && !constrainedByBudgets && !constrainedByPace {
+		if !timedOut && !constrainedByBudgets && !constrainedByDisruptionPacing {
 			s.markConsolidated()
 		}
 		return []Command{}, nil

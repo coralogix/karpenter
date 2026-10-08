@@ -37,20 +37,26 @@ import (
 
 // Drift is a subreconciler that deletes drifted candidates.
 type Drift struct {
-	kubeClient  client.Client
-	cluster     *state.Cluster
-	provisioner *provisioning.Provisioner
-	recorder    events.Recorder
-	clock       clock.Clock
+	kubeClient       client.Client
+	cluster          *state.Cluster
+	provisioner      *provisioning.Provisioner
+	recorder         events.Recorder
+	clock            clock.Clock
+	disruptionPacing *DisruptionPacing
 }
 
-func NewDrift(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, recorder events.Recorder, clk clock.Clock) *Drift {
+func NewDrift(kubeClient client.Client, cluster *state.Cluster, provisioner *provisioning.Provisioner, recorder events.Recorder, clk clock.Clock, paces ...*DisruptionPacing) *Drift {
+	var pace *DisruptionPacing
+	if len(paces) > 0 {
+		pace = paces[0]
+	}
 	return &Drift{
-		kubeClient:  kubeClient,
-		cluster:     cluster,
-		provisioner: provisioner,
-		recorder:    recorder,
-		clock:       clk,
+		kubeClient:       kubeClient,
+		cluster:          cluster,
+		provisioner:      provisioner,
+		recorder:         recorder,
+		clock:            clk,
+		disruptionPacing: pace,
 	}
 }
 
@@ -73,17 +79,21 @@ func (d *Drift) ComputeCommands(ctx context.Context, disruptionBudgetMapping map
 	// Prioritize empty candidates since we want them to get priority over non-empty candidates if the budget is constrained.
 	// Disrupting empty candidates first also helps reduce the overall churn because if a non-empty candidate is disrupted first,
 	// the pods from that node can reschedule on the empty nodes and will need to move again when those nodes get disrupted.
+	candidates = lo.Filter(slices.Concat(emptyCandidates, nonEmptyCandidates), func(candidate *Candidate, _ int) bool {
+		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
+			return false
+		}
+		return len(candidate.reschedulablePods) == 0 || d.disruptionPacing.CandidateAllowed(candidate.NodePool, 0)
+	})
+	if len(candidates) == 0 {
+		return []Command{}, nil
+	}
+
 	simulator, err := NewSchedulingSimulator(ctx, d.kubeClient, d.cluster, d.provisioner, d.clock, d.recorder, candidates...)
 	if err != nil {
 		return []Command{}, err
 	}
-	for _, candidate := range slices.Concat(emptyCandidates, nonEmptyCandidates) {
-		// If the disruption budget doesn't allow this candidate to be disrupted,
-		// continue to the next candidate. We don't need to decrement any budget
-		// counter since drift commands can only have one candidate.
-		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
-			continue
-		}
+	for _, candidate := range candidates {
 		// Check if we need to create any NodeClaims.
 		results, err := simulator.Simulate(ctx, candidate)
 		if err != nil {

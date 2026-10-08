@@ -72,6 +72,58 @@ var _ = Describe("StaticDrift", func() {
 		})
 	})
 
+	It("should apply the non-empty batch cap before reserving static drift slots", func() {
+		nodePool = test.StaticNodePool(v1.NodePool{
+			ObjectMeta: metav1.ObjectMeta{Annotations: paceAnnotations("1", "1")},
+			Spec: v1.NodePoolSpec{
+				Replicas: lo.ToPtr(int64(3)),
+				Limits: v1.Limits{
+					resources.Node: resource.MustParse("6"),
+				},
+				Disruption: v1.Disruption{
+					Budgets: []v1.Budget{{Nodes: "100%"}},
+				},
+			},
+		})
+		nodeClaims, nodes := paceConsolidatableNodes(nodePool, 3)
+		for _, nodeClaim := range nodeClaims {
+			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
+		}
+		rs := test.ReplicaSet()
+		ExpectApplied(ctx, env.Client, rs)
+		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())
+		pods := paceReplicaSetPods(rs, 2)
+		ExpectApplied(ctx, env.Client, nodePool)
+		ExpectApplied(ctx, env.Client, asObjects(nodeClaims)...)
+		ExpectApplied(ctx, env.Client, asObjects(nodes)...)
+		ExpectApplied(ctx, env.Client, asObjects(pods)...)
+		ExpectManualBinding(ctx, env.Client, pods[0], nodes[1])
+		ExpectManualBinding(ctx, env.Client, pods[1], nodes[2])
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, nodes, nodeClaims)
+
+		pace := disruption.NewDisruptionPacing(env.Clock)
+		method := disruption.NewStaticDrift(cluster, prov, cloudProvider, pace)
+		candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, method.ShouldDisrupt, method.Class(), queue)
+		Expect(err).To(Succeed())
+		commands, err := method.ComputeCommands(ctx, map[string]int{nodePool.Name: 3}, candidates...)
+		Expect(err).To(Succeed())
+		Expect(commands).To(HaveLen(2)) // one empty and one non-empty candidate
+		selectedNonEmpty := 0
+		selectedEmpty := false
+		for _, command := range commands {
+			Expect(command.Candidates).To(HaveLen(1))
+			claimName := command.Candidates[0].NodeClaim.Name
+			if claimName == nodeClaims[0].Name {
+				selectedEmpty = true
+			} else {
+				selectedNonEmpty++
+			}
+		}
+		Expect(selectedEmpty).To(BeTrue())
+		Expect(selectedNonEmpty).To(Equal(1))
+		Expect(cluster.NodePoolState.ReserveNodeCount(nodePool.Name, 6, 3)).To(BeEquivalentTo(1))
+	})
+
 	Context("Budgets", func() {
 		var numNodes = 5
 		var nodeClaims []*v1.NodeClaim

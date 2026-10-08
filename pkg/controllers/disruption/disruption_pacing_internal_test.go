@@ -17,6 +17,7 @@ limitations under the License.
 package disruption
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -29,10 +30,10 @@ import (
 
 func paceTestNodePool(rate, maxNodes string) *v1.NodePool {
 	annotations := map[string]string{
-		v1.MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey: rate,
+		v1.DisruptionPacingPerMinuteAnnotationKey: rate,
 	}
 	if maxNodes != "" {
-		annotations[v1.MaxUnderutilizedNodesPerConsolidationAnnotationKey] = maxNodes
+		annotations[v1.DisruptionPacingPerBatchAnnotationKey] = maxNodes
 	}
 	return &v1.NodePool{
 		ObjectMeta: metav1.ObjectMeta{
@@ -42,12 +43,8 @@ func paceTestNodePool(rate, maxNodes string) *v1.NodePool {
 	}
 }
 
-func paceCommand(np *v1.NodePool, count int) *Command {
-	candidates := make([]*Candidate, count)
-	for i := range candidates {
-		candidates[i] = &Candidate{NodePool: np}
-	}
-	return &Command{Candidates: candidates}
+func paceCommand(np *v1.NodePool) *Command {
+	return &Command{Candidates: []*Candidate{{NodePool: np}}}
 }
 
 func paceCommandWithPods(np *v1.NodePool, count int) *Command {
@@ -59,6 +56,18 @@ func paceCommandWithPods(np *v1.NodePool, count int) *Command {
 		}
 	}
 	return &Command{Candidates: candidates}
+}
+
+func completePacingCommand(pacing *DisruptionPacing, command *Command) bool {
+	if pacing == nil || command == nil {
+		return false
+	}
+	accepted := pacing.AdmitCommands([]Command{*command})
+	if len(accepted) == 0 {
+		return false
+	}
+	pacing.ChargePass([]DisruptionPacingSuccessfulStart{{Command: command, StartTime: pacing.clock.Now()}})
+	return true
 }
 
 func TestCandidateAllowedBatchCap(t *testing.T) {
@@ -76,10 +85,10 @@ func TestCandidateAllowedBatchCap(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
+			pace := NewDisruptionPacing(clocktesting.NewFakeClock(time.Now()))
 			np := paceTestNodePool(tc.rate, tc.maxNodes)
-			if got := pace.candidateAllowed(np, tc.selectedCount); got != tc.allowed {
-				t.Fatalf("candidateAllowed(selectedCount=%d) = %v, want %v", tc.selectedCount, got, tc.allowed)
+			if got := pace.CandidateAllowed(np, tc.selectedCount); got != tc.allowed {
+				t.Fatalf("CandidateAllowed(selectedCount=%d) = %v, want %v", tc.selectedCount, got, tc.allowed)
 			}
 		})
 	}
@@ -100,23 +109,25 @@ func TestCandidateAllowedRateCooldown(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			testClock := clocktesting.NewFakeClock(time.Now())
-			pace := NewUnderutilizedConsolidationPace(testClock)
+			pace := NewDisruptionPacing(testClock)
 			np := paceTestNodePool(tc.rate, tc.maxNodes)
 
-			if !pace.candidateAllowed(np, 0) {
+			if !pace.CandidateAllowed(np, 0) {
 				t.Fatal("expected first admission before any charge")
 			}
-			pace.Charge(paceCommandWithPods(np, tc.chargeCount))
-			if pace.candidateAllowed(np, 0) {
+			if !completePacingCommand(pace, paceCommandWithPods(np, tc.chargeCount)) {
+				t.Fatal("expected command to be admitted")
+			}
+			if pace.CandidateAllowed(np, 0) {
 				t.Fatal("expected admission to be blocked immediately after charge")
 			}
 
 			testClock.Step(tc.stillBlockedAfter)
-			if pace.candidateAllowed(np, 0) {
+			if pace.CandidateAllowed(np, 0) {
 				t.Fatalf("expected admission to remain blocked after %s", tc.stillBlockedAfter)
 			}
 			testClock.Step(tc.allowedAfter - tc.stillBlockedAfter)
-			if !pace.candidateAllowed(np, 0) {
+			if !pace.CandidateAllowed(np, 0) {
 				t.Fatalf("expected admission after %s elapsed", tc.allowedAfter)
 			}
 		})
@@ -133,12 +144,14 @@ func TestCandidateAllowedUnconfigured(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			pace := NewUnderutilizedConsolidationPace(clocktesting.NewFakeClock(time.Now()))
-			if !pace.candidateAllowed(tc.np, 100) {
+			pace := NewDisruptionPacing(clocktesting.NewFakeClock(time.Now()))
+			if !pace.CandidateAllowed(tc.np, 100) {
 				t.Fatal("expected unconfigured pace to ignore batch cap and allow candidates")
 			}
-			pace.Charge(paceCommand(tc.np, 1))
-			if !pace.candidateAllowed(tc.np, 100) {
+			if !completePacingCommand(pace, paceCommandWithPods(tc.np, 1)) {
+				t.Fatal("expected unconfigured command to be admitted")
+			}
+			if !pace.CandidateAllowed(tc.np, 100) {
 				t.Fatal("expected charge to be a no-op for unconfigured pace")
 			}
 		})
@@ -146,40 +159,68 @@ func TestCandidateAllowedUnconfigured(t *testing.T) {
 }
 
 func TestCandidateAllowedNilPace(t *testing.T) {
-	var pace *UnderutilizedConsolidationPace
-	if !pace.candidateAllowed(paceTestNodePool("0", "1"), 100) {
+	var pace *DisruptionPacing
+	if !pace.CandidateAllowed(paceTestNodePool("0", "1"), 100) {
 		t.Fatal("expected nil pace to disable planning-time checks")
 	}
 }
 
-func TestChargeSkipsEmptyCandidates(t *testing.T) {
+func TestBatchCompletionSkipsEmptyCandidates(t *testing.T) {
 	testClock := clocktesting.NewFakeClock(time.Now())
-	pace := NewUnderutilizedConsolidationPace(testClock)
+	pace := NewDisruptionPacing(testClock)
 	np := paceTestNodePool("1", "")
 
-	pace.Charge(paceCommand(np, 1))
-	if !pace.candidateAllowed(np, 0) {
+	if !completePacingCommand(pace, paceCommand(np)) {
+		t.Fatal("expected empty-only command to be admitted")
+	}
+	if !pace.CandidateAllowed(np, 0) {
 		t.Fatal("expected empty-only charge to be a no-op")
 	}
 
-	pace.Charge(paceCommandWithPods(np, 1))
-	if pace.candidateAllowed(np, 0) {
+	if !completePacingCommand(pace, paceCommandWithPods(np, 1)) {
+		t.Fatal("expected non-empty command to be admitted")
+	}
+	if pace.CandidateAllowed(np, 0) {
 		t.Fatal("expected admission to be blocked after charging non-empty candidate")
 	}
 	testClock.Step(61 * time.Second)
-	if !pace.candidateAllowed(np, 0) {
+	if !pace.CandidateAllowed(np, 0) {
 		t.Fatal("expected admission after cooldown from non-empty charge")
 	}
 
-	pace.Charge(&Command{Candidates: []*Candidate{
+	if !completePacingCommand(pace, &Command{Candidates: []*Candidate{
 		{NodePool: np},
 		{NodePool: np, reschedulablePods: []*corev1.Pod{{}}},
-	}})
-	if pace.candidateAllowed(np, 0) {
+	}}) {
+		t.Fatal("expected mixed command to be admitted")
+	}
+	if pace.CandidateAllowed(np, 0) {
 		t.Fatal("expected mixed command to charge only the non-empty candidate")
 	}
 	testClock.Step(61 * time.Second)
-	if !pace.candidateAllowed(np, 0) {
+	if !pace.CandidateAllowed(np, 0) {
 		t.Fatal("expected admission after cooldown from mixed charge")
+	}
+}
+
+func TestDriftSkipsSimulationWhenAllCandidatesArePaced(t *testing.T) {
+	clk := clocktesting.NewFakeClock(time.Now())
+	pace := NewDisruptionPacing(clk)
+	np := paceTestNodePool("1", "")
+	if !completePacingCommand(pace, paceCommandWithPods(np, 1)) {
+		t.Fatal("expected command to be admitted")
+	}
+
+	// Nil simulation dependencies make this fail if ComputeCommands prepares a simulator.
+	drift := NewDrift(nil, nil, nil, nil, clk, pace)
+	commands, err := drift.ComputeCommands(context.Background(), map[string]int{np.Name: 1}, &Candidate{
+		NodePool:          np,
+		reschedulablePods: []*corev1.Pod{{}},
+	})
+	if err != nil {
+		t.Fatalf("ComputeCommands() error = %v, want nil", err)
+	}
+	if len(commands) != 0 {
+		t.Fatalf("ComputeCommands() returned %d commands, want none", len(commands))
 	}
 }

@@ -290,6 +290,12 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 
 // createReplacementNodeClaims creates replacement NodeClaims
 func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) error {
+	for _, replacement := range cmd.Replacements {
+		if replacement != nil && replacement.NodeClaim != nil && replacement.IsStaticNodeClaim {
+			cmd.staticNodeCountReservationHandedOff = true
+			break
+		}
+	}
 	nodeClaimNames, err := q.provisioner.CreateNodeClaims(ctx, lo.Map(cmd.Replacements, func(r *Replacement, _ int) *pscheduling.NodeClaim { return r.NodeClaim }), provisioning.WithReason(strings.ToLower(string(cmd.Reason()))))
 	if err != nil {
 		return err
