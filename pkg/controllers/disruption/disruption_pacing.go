@@ -19,10 +19,14 @@ package disruption
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	validationutil "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -48,7 +52,7 @@ type DisruptionPacingSuccessfulStart struct {
 	StartTime time.Time
 }
 
-// DisruptionPacing applies a per-NodePool rate and batch cap to non-empty disruption
+// DisruptionPacing applies a shared rate and batch cap to non-empty disruption
 // candidates. It remains in-memory and is reset when the controller restarts.
 type DisruptionPacing struct {
 	clock clock.Clock
@@ -68,9 +72,10 @@ func NewDisruptionPacing(clk clock.Clock) *DisruptionPacing {
 }
 
 // Refresh validates every managed NodePool, including pools with no current
-// candidates. It returns true when pacing policy has changed.
+// candidates. It returns true when effective membership or pacing policy has
+// changed and publishes warning events for invalid grouped configurations.
 func (p *DisruptionPacing) Refresh(nodePools []*v1.NodePool, recorder events.Recorder) bool {
-	policies, scopeConfigs := resolveDisruptionPacingPolicies(nodePools)
+	policies, scopeConfigs, issues := resolveDisruptionPacingPolicies(nodePools)
 
 	p.mu.Lock()
 	changed := p.policyInitialized && !sameDisruptionPacingPolicies(p.policies, policies)
@@ -79,7 +84,26 @@ func (p *DisruptionPacing) Refresh(nodePools []*v1.NodePool, recorder events.Rec
 	p.policyInitialized = true
 	p.mu.Unlock()
 
+	if recorder != nil {
+		for _, issue := range issues {
+			for _, np := range issue.nodePools {
+				recorder.Publish(events.Event{
+					InvolvedObject: np,
+					Type:           corev1.EventTypeWarning,
+					Reason:         "InvalidDisruptionPacing",
+					Message:        issue.message,
+					DedupeValues:   []string{string(np.UID), issue.scope, issue.message},
+				})
+			}
+		}
+	}
 	return changed
+}
+
+type disruptionPacingIssue struct {
+	scope     string
+	nodePools []*v1.NodePool
+	message   string
 }
 
 func (p *DisruptionPacing) migrateCooldownsLocked(policies map[string]disruptionPacingPolicy, scopeConfigs map[string]disruptionPacingConfig) {
@@ -126,23 +150,159 @@ func sameDisruptionPacingPolicies(left, right map[string]disruptionPacingPolicy)
 	return true
 }
 
-func resolveDisruptionPacingPolicies(nodePools []*v1.NodePool) (map[string]disruptionPacingPolicy, map[string]disruptionPacingConfig) {
-	policies := make(map[string]disruptionPacingPolicy, len(nodePools))
-	configs := map[string]disruptionPacingConfig{}
-	for _, np := range nodePools {
-		if np == nil {
-			continue
-		}
-		config := disruptionPacingConfigFor(np)
-		scope := poolPacingScope(np.Name)
-		policies[np.Name] = disruptionPacingPolicy{scope: scope, config: config}
-		configs[scope] = config
-	}
-	return policies, configs
+type disruptionPacingPolicyResolution struct {
+	policies      map[string]disruptionPacingPolicy
+	configs       map[string]disruptionPacingConfig
+	groupMembers  map[string][]*v1.NodePool
+	groupSettings map[string]map[string]disruptionPacingConfig
+	issues        []disruptionPacingIssue
 }
 
-func poolPacingScope(poolName string) string {
-	return "pool/" + poolName
+func resolveDisruptionPacingPolicies(nodePools []*v1.NodePool) (map[string]disruptionPacingPolicy, map[string]disruptionPacingConfig, []disruptionPacingIssue) {
+	resolution := disruptionPacingPolicyResolution{
+		policies:      make(map[string]disruptionPacingPolicy, len(nodePools)),
+		configs:       map[string]disruptionPacingConfig{},
+		groupMembers:  map[string][]*v1.NodePool{},
+		groupSettings: map[string]map[string]disruptionPacingConfig{},
+	}
+	for _, np := range nodePools {
+		if np != nil {
+			resolution.addNodePool(np)
+		}
+	}
+	for _, scope := range sortedPacingGroupScopes(resolution.groupMembers) {
+		resolution.resolveGroup(scope)
+	}
+	resolution.addInvalidGroupScopes()
+	return resolution.policies, resolution.configs, resolution.issues
+}
+
+func (r *disruptionPacingPolicyResolution) addNodePool(np *v1.NodePool) {
+	config := disruptionPacingConfigFor(np)
+	groupRaw, grouped := np.Annotations[v1.DisruptionPacingGroupAnnotationKey]
+	if !grouped {
+		scope := "pool/" + np.Name
+		r.policies[np.Name] = disruptionPacingPolicy{scope: scope, config: config}
+		r.configs[scope] = config
+		return
+	}
+
+	scope := "invalid-group/" + np.Name
+	validGroup := groupRaw != "" && len(validationutil.IsDNS1123Label(groupRaw)) == 0
+	if validGroup {
+		scope = "group/" + groupRaw
+		r.groupMembers[scope] = append(r.groupMembers[scope], np)
+		if r.groupSettings[scope] == nil {
+			r.groupSettings[scope] = map[string]disruptionPacingConfig{}
+		}
+		r.groupSettings[scope][np.Name] = config
+	} else {
+		config.blocked = true
+		config.error = fmt.Sprintf("invalid group value %q", groupRaw)
+		r.issues = append(r.issues, disruptionPacingIssue{
+			scope: scope, nodePools: []*v1.NodePool{np},
+			message: fmt.Sprintf("NodePool %q has invalid disruption pacing group %q with settings {%s}; non-empty disruption pacing is blocked", np.Name, groupRaw, pacingAnnotationSettings(np)),
+		})
+	}
+	r.policies[np.Name] = disruptionPacingPolicy{scope: scope, config: config}
+}
+
+func sortedPacingGroupScopes(groups map[string][]*v1.NodePool) []string {
+	scopes := make([]string, 0, len(groups))
+	for scope := range groups {
+		scopes = append(scopes, scope)
+	}
+	sort.Strings(scopes)
+	return scopes
+}
+
+func (r *disruptionPacingPolicyResolution) resolveGroup(scope string) {
+	members := r.groupMembers[scope]
+	sort.Slice(members, func(i, j int) bool { return members[i].Name < members[j].Name })
+	common, errors := comparePacingGroupSettings(members, r.groupSettings[scope])
+	if len(errors) == 0 {
+		r.acceptGroup(scope, members, common)
+		return
+	}
+	r.blockGroup(scope, members, errors)
+}
+
+func comparePacingGroupSettings(members []*v1.NodePool, settings map[string]disruptionPacingConfig) (disruptionPacingConfig, []string) {
+	var common disruptionPacingConfig
+	var errors []string
+	for i, np := range members {
+		config := settings[np.Name]
+		if config.error != "" {
+			errors = append(errors, fmt.Sprintf("%s: %s", np.Name, config.error))
+		}
+		if !config.configured {
+			errors = append(errors, fmt.Sprintf("%s: a finite positive per-minute rate is required", np.Name))
+		}
+		if i == 0 {
+			common = config
+		} else if !samePacingValues(common, config) {
+			errors = append(errors, fmt.Sprintf("%s: settings differ from group members", np.Name))
+		}
+	}
+	return common, errors
+}
+
+func (r *disruptionPacingPolicyResolution) acceptGroup(scope string, members []*v1.NodePool, common disruptionPacingConfig) {
+	common.blocked = false
+	r.configs[scope] = common
+	for _, np := range members {
+		policy := r.policies[np.Name]
+		policy.config = common
+		r.policies[np.Name] = policy
+	}
+}
+
+func (r *disruptionPacingPolicyResolution) blockGroup(scope string, members []*v1.NodePool, errors []string) {
+	memberSettings := make([]string, 0, len(members))
+	messageErrors := strings.Join(errors, "; ")
+	for _, np := range members {
+		memberSettings = append(memberSettings, fmt.Sprintf("%s={%s}", np.Name, pacingAnnotationSettings(np)))
+		policy := r.policies[np.Name]
+		policy.config.blocked = true
+		policy.config.configured = false
+		policy.config.error = messageErrors
+		r.policies[np.Name] = policy
+	}
+	message := fmt.Sprintf("disruption pacing group %q is invalid; non-empty consolidation and drift are blocked for member NodePools: %s (errors: %s)", strings.TrimPrefix(scope, "group/"), strings.Join(memberSettings, ", "), messageErrors)
+	r.issues = append(r.issues, disruptionPacingIssue{scope: scope, nodePools: members, message: message})
+	r.configs[scope] = disruptionPacingConfig{blocked: true, error: messageErrors}
+}
+
+func (r *disruptionPacingPolicyResolution) addInvalidGroupScopes() {
+	// Invalid group values use a per-pool blocking scope, while valid groups
+	// have already been collected above.
+	for _, policy := range r.policies {
+		if strings.HasPrefix(policy.scope, "invalid-group/") {
+			r.configs[policy.scope] = policy.config
+		}
+	}
+}
+
+func samePacingValues(left, right disruptionPacingConfig) bool {
+	return left.configured && right.configured && left.rate == right.rate && left.maxNodesPerBatch == right.maxNodesPerBatch && left.error == "" && right.error == ""
+}
+
+func pacingAnnotationSettings(np *v1.NodePool) string {
+	if np == nil || np.Annotations == nil {
+		return ""
+	}
+	keys := []string{
+		v1.DisruptionPacingGroupAnnotationKey,
+		v1.DisruptionPacingPerMinuteAnnotationKey,
+		v1.DisruptionPacingPerBatchAnnotationKey,
+	}
+	values := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if value, ok := np.Annotations[key]; ok {
+			values = append(values, fmt.Sprintf("%s=%q", key, value))
+		}
+	}
+	return strings.Join(values, ",")
 }
 
 func disruptionPacingConfigFor(np *v1.NodePool) disruptionPacingConfig {
@@ -186,12 +346,24 @@ func parsePacingCap(raw string) (int, error) {
 	return cap, nil
 }
 
-// Scope returns the effective pacing scope for batch accounting during planning.
+// Scope returns the effective pacing scope. It is also used by planning code
+// to account tentative selections across NodePools in the same group.
 func (p *DisruptionPacing) Scope(np *v1.NodePool) string {
-	if np == nil {
+	if p == nil || np == nil {
 		return ""
 	}
-	return poolPacingScope(np.Name)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if policy, ok := p.policies[np.Name]; ok {
+		return policy.scope
+	}
+	if group, ok := np.Annotations[v1.DisruptionPacingGroupAnnotationKey]; ok && group != "" && len(validationutil.IsDNS1123Label(group)) == 0 {
+		return "group/" + group
+	}
+	if _, ok := np.Annotations[v1.DisruptionPacingGroupAnnotationKey]; ok {
+		return "invalid-group/" + np.Name
+	}
+	return "pool/" + np.Name
 }
 
 // CandidateAllowed is advisory planning. Whole-command admission is checked
@@ -220,10 +392,26 @@ func (p *DisruptionPacing) policyForLocked(np *v1.NodePool) disruptionPacingPoli
 	if policy, ok := p.policies[np.Name]; ok {
 		return policy
 	}
-	if np == nil {
-		return disruptionPacingPolicy{}
+	if p.policyInitialized {
+		if _, grouped := np.Annotations[v1.DisruptionPacingGroupAnnotationKey]; grouped {
+			return disruptionPacingPolicy{scope: "invalid-group/" + np.Name, config: disruptionPacingConfig{blocked: true}}
+		}
+		// A previously unseen ungrouped pool has no shared membership; parse its
+		// annotations directly until the next complete managed-pool snapshot.
+		return disruptionPacingPolicy{scope: "pool/" + np.Name, config: disruptionPacingConfigFor(np)}
 	}
-	return disruptionPacingPolicy{scope: poolPacingScope(np.Name), config: disruptionPacingConfigFor(np)}
+	if _, grouped := np.Annotations[v1.DisruptionPacingGroupAnnotationKey]; grouped {
+		group := np.Annotations[v1.DisruptionPacingGroupAnnotationKey]
+		if group == "" || len(validationutil.IsDNS1123Label(group)) != 0 {
+			return disruptionPacingPolicy{scope: "invalid-group/" + np.Name, config: disruptionPacingConfig{blocked: true}}
+		}
+		config := disruptionPacingConfigFor(np)
+		if !config.configured || config.error != "" {
+			config.blocked = true
+		}
+		return disruptionPacingPolicy{scope: "group/" + group, config: config}
+	}
+	return disruptionPacingPolicy{scope: "pool/" + np.Name, config: disruptionPacingConfigFor(np)}
 }
 
 // CommandAllowed checks whether a whole command could be admitted right now.
@@ -240,7 +428,7 @@ func (p *DisruptionPacing) CommandAllowed(cmd Command) bool {
 
 // AdmitCommands admits whole commands against current cooldowns and aggregate
 // per-scope batch caps. It aggregates commands from one ComputeCommands pass,
-// which lets multiple static-drift commands share one NodePool batch cap. The
+// which lets multiple static-drift commands share one group batch cap. The
 // singleton controller charges the pass before the next one and refreshes policy
 // only between passes.
 func (p *DisruptionPacing) AdmitCommands(commands []Command) []int {

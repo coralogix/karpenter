@@ -6,7 +6,7 @@ Warning: At the moment this documentation is mostly LLM generated (quality may v
 
 ## Features
 
-- [Disruption pacing](disruption-pacing.md) — optional per-NodePool rate limit for non-empty node disruptions
+- [Disruption pacing](disruption-pacing.md) — optional per-NodePool or per-NodePool-group rate limit for non-empty node disruptions
 - [Simulation max capacity](simulation-max-capacity.md) — optional per-NodePool nominal CPU/memory ceiling for new-node packing simulations
 
 ## Experimental Features
