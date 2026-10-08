@@ -6,9 +6,11 @@ Warning: At the moment this documentation is mostly LLM generated (quality may v
 
 ## Features
 
-- [Underutilized consolidation pace](underutilized-consolidation-pace.md) — optional per-NodePool rate limit for underutilized consolidation
+- [Disruption pacing](disruption-pacing.md) — optional per-NodePool rate limit for non-empty node disruptions
 - [Simulation max capacity](simulation-max-capacity.md) — optional per-NodePool nominal CPU/memory ceiling for new-node packing simulations
-- [Disruption pacing](disruption-pacing.md) — optional per-NodePool rate limit for non-empty consolidation and drift
+
+## Experimental Features
+
 - [Score-based consolidation](score-based-consolidation.md) — alternate consolidation path for opted-in NodePools
 - OpenTelemetry tracing (`pkg/cxtracing`) — spans aligned with fork scheduling/disruption phase metrics; export via standard `OTEL_*` env vars (configured in [eng-karpenter](https://github.com/coralogix/eng-karpenter))
 
