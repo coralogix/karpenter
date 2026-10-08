@@ -435,6 +435,7 @@ func candidateWithPrice(t *testing.T, price float64) *Candidate {
 	return &Candidate{
 		StateNode:    node,
 		instanceType: instanceType,
+		Price:        price,
 	}
 }
 
@@ -482,6 +483,9 @@ func scoreBasedTestCandidate(scoreBasedConsolidation bool) *Candidate {
 				},
 			},
 		},
-		instanceType: &cloudprovider.InstanceType{Name: "m5.large"},
+		instanceType:             &cloudprovider.InstanceType{Name: "m5.large"},
+		reschedulablePods:        []*corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "pod"}}},
+		DisruptionCost:           PerNodeBaseDisruptionCost + 1,
+		RescheduleDisruptionCost: PerNodeBaseDisruptionCost + 1,
 	}
 }

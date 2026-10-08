@@ -77,6 +77,7 @@ func TestNodePriorityScore(t *testing.T) {
 	candidate := &Candidate{
 		StateNode:    node,
 		instanceType: instanceType,
+		Price:        offering.Price,
 	}
 
 	if nodePriorityScore(nil) != 0 {
@@ -139,6 +140,7 @@ func TestNodePriorityScore(t *testing.T) {
 	loadedCandidate := &Candidate{
 		StateNode:    loadedNode,
 		instanceType: instanceType,
+		Price:        offering.Price,
 	}
 	if got := nodePriorityScore(loadedCandidate); got != want {
 		t.Fatalf("loaded workload: nodePriorityScore() = %v, want %v", got, want)
