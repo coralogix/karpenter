@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/awslabs/operatorpkg/option"
@@ -31,11 +30,8 @@ import (
 	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/awslabs/operatorpkg/singleton"
 
-	"github.com/google/uuid"
 	"github.com/samber/lo"
-	"go.uber.org/multierr"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -55,26 +51,28 @@ import (
 )
 
 type Controller struct {
-	queue             *Queue
-	kubeClient        client.Client
-	cluster           *state.Cluster
-	provisioner       *provisioning.Provisioner
-	recorder          events.Recorder
-	clock             clock.Clock
-	cloudProvider     cloudprovider.CloudProvider
-	clusterCost       *cost.ClusterCost
-	underutilizedPace *UnderutilizedConsolidationPace
-	methods           []Method
-	mu                sync.Mutex
-	lastRun           map[string]time.Time
+	queue            *Queue
+	kubeClient       client.Client
+	nodePoolReader   client.Reader
+	cluster          *state.Cluster
+	provisioner      *provisioning.Provisioner
+	recorder         events.Recorder
+	clock            clock.Clock
+	cloudProvider    cloudprovider.CloudProvider
+	clusterCost      *cost.ClusterCost
+	disruptionPacing *DisruptionPacing
+	methods          []Method
+	mu               sync.Mutex
+	lastRun          map[string]time.Time
 }
 
 // pollingPeriod that we inspect cluster to look for opportunities to disrupt
 const pollingPeriod = 10 * time.Second
 
 type ControllerOptions struct {
-	methods           []Method
-	underutilizedPace *UnderutilizedConsolidationPace
+	methods          []Method
+	disruptionPacing *DisruptionPacing
+	nodePoolReader   client.Reader
 }
 
 func WithMethods(methods ...Method) option.Function[ControllerOptions] {
@@ -83,39 +81,48 @@ func WithMethods(methods ...Method) option.Function[ControllerOptions] {
 	}
 }
 
-func WithUnderutilizedPace(pace *UnderutilizedConsolidationPace) option.Function[ControllerOptions] {
-	return func(o *ControllerOptions) { o.underutilizedPace = pace }
+func WithDisruptionPacing(pace *DisruptionPacing) option.Function[ControllerOptions] {
+	return func(o *ControllerOptions) { o.disruptionPacing = pace }
+}
+
+func WithNodePoolReader(reader client.Reader) option.Function[ControllerOptions] {
+	return func(o *ControllerOptions) { o.nodePoolReader = reader }
 }
 
 func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
 	cp cloudprovider.CloudProvider, recorder events.Recorder, cluster *state.Cluster, queue *Queue, clusterCost *cost.ClusterCost, opts ...option.Function[ControllerOptions]) *Controller {
 
 	o := option.Resolve(opts...)
-	pace := o.underutilizedPace
+	pace := o.disruptionPacing
 	if pace == nil {
-		pace = NewUnderutilizedConsolidationPace(clk)
+		pace = NewDisruptionPacing(clk)
 	}
 	methods := o.methods
 	if methods == nil {
 		methods = NewMethods(clk, cluster, kubeClient, provisioner, cp, recorder, queue, pace)
 	}
+	nodePoolReader := o.nodePoolReader
+	if nodePoolReader == nil {
+		nodePoolReader = kubeClient
+	}
 	return &Controller{
-		queue:             queue,
-		clock:             clk,
-		kubeClient:        kubeClient,
-		cluster:           cluster,
-		provisioner:       provisioner,
-		recorder:          recorder,
-		cloudProvider:     cp,
-		clusterCost:       clusterCost,
-		underutilizedPace: pace,
-		lastRun:           map[string]time.Time{},
-		methods:           methods,
+		queue:            queue,
+		clock:            clk,
+		kubeClient:       kubeClient,
+		nodePoolReader:   nodePoolReader,
+		cluster:          cluster,
+		provisioner:      provisioner,
+		recorder:         recorder,
+		cloudProvider:    cp,
+		clusterCost:      clusterCost,
+		disruptionPacing: pace,
+		lastRun:          map[string]time.Time{},
+		methods:          methods,
 	}
 }
 
-func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue, paces ...*UnderutilizedConsolidationPace) []Method {
-	var pace *UnderutilizedConsolidationPace
+func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Client, provisioner *provisioning.Provisioner, cp cloudprovider.CloudProvider, recorder events.Recorder, queue *Queue, paces ...*DisruptionPacing) []Method {
+	var pace *DisruptionPacing
 	if len(paces) > 0 {
 		pace = paces[0]
 	}
@@ -124,9 +131,9 @@ func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Clien
 		// Delete empty nodes across all consolidation policies (WhenEmpty, WhenEmptyOrUnderutilized, Balanced).
 		NewEmptiness(c),
 		// Terminate and create replacement for drifted NodeClaims in Static NodePool
-		NewStaticDrift(cluster, provisioner, cp),
+		NewStaticDrift(cluster, provisioner, cp, pace),
 		// Terminate any NodeClaims that have drifted from provisioning specifications, allowing the pods to reschedule.
-		NewDrift(kubeClient, cluster, provisioner, recorder, clk),
+		NewDrift(kubeClient, cluster, provisioner, recorder, clk, pace),
 		// Attempt to identify multiple NodeClaims that we can consolidate simultaneously to reduce pod churn
 		NewMultiNodeConsolidation(c),
 		// Score-based consolidation for NodePools that opt in via annotation.
@@ -165,6 +172,9 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	if !c.cluster.Synced(ctx) {
 		return reconciler.Result{RequeueAfter: time.Second}, nil
 	}
+	if err := c.refreshDisruptionPacing(ctx); err != nil {
+		return reconciler.Result{}, fmt.Errorf("refreshing disruption pacing policy, %w", err)
+	}
 
 	// Karpenter taints nodes with a karpenter.sh/disruption taint as part of the disruption process while it progresses in memory.
 	// If Karpenter restarts or fails with an error during a disruption action, some nodes can be left tainted.
@@ -185,6 +195,10 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{}, serrors.Wrap(fmt.Errorf("removing condition from nodeclaims, %w", err), "condition", v1.ConditionTypeDisruptionReason)
 	}
 
+	return c.reconcileMethods(ctx)
+}
+
+func (c *Controller) reconcileMethods(ctx context.Context) (reconciler.Result, error) {
 	// Attempt different disruption methods. We'll only let one method perform an action
 	for _, m := range c.methods {
 		c.recordRun(fmt.Sprintf("%T", m))
@@ -238,31 +252,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 	if len(cmds) == 0 {
 		return false, nil
 	}
-
-	var started atomic.Int64
-	errs := make([]error, len(cmds))
-	workqueue.ParallelizeUntil(ctx, len(cmds), len(cmds), func(i int) {
-		cmd := cmds[i]
-
-		// Assign common fields
-		cmd.CreationTimestamp = c.clock.Now()
-		cmd.ID = uuid.New()
-		cmd.Method = disruption
-
-		// Attempt to disrupt
-		if err := c.queue.StartCommand(ctx, &cmd); err != nil {
-			errs[i] = fmt.Errorf("disrupting candidates, %w", err)
-			return
-		}
-		if disruption.Reason() == v1.DisruptionReasonUnderutilized {
-			c.underutilizedPace.Charge(&cmd)
-		}
-		started.Add(1)
-	})
-	if err = multierr.Combine(errs...); err != nil {
-		return false, fmt.Errorf("disrupting candidates, %w", err)
-	}
-	return started.Load() > 0, nil
+	return c.dispatchCommands(ctx, disruption, cmds)
 }
 
 func (c *Controller) recordRun(s string) {

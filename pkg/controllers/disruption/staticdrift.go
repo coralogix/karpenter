@@ -19,6 +19,7 @@ package disruption
 import (
 	"context"
 	"math"
+	"sort"
 
 	"github.com/samber/lo"
 
@@ -33,16 +34,22 @@ import (
 
 // StaticDrift is a subreconciler that deletes drifted static candidates.
 type StaticDrift struct {
-	cluster       *state.Cluster
-	provisioner   *provisioning.Provisioner
-	cloudprovider cloudprovider.CloudProvider
+	cluster          *state.Cluster
+	provisioner      *provisioning.Provisioner
+	cloudprovider    cloudprovider.CloudProvider
+	disruptionPacing *DisruptionPacing
 }
 
-func NewStaticDrift(cluster *state.Cluster, provisioner *provisioning.Provisioner, cloudprovider cloudprovider.CloudProvider) *StaticDrift {
+func NewStaticDrift(cluster *state.Cluster, provisioner *provisioning.Provisioner, cloudprovider cloudprovider.CloudProvider, paces ...*DisruptionPacing) *StaticDrift {
+	var pace *DisruptionPacing
+	if len(paces) > 0 {
+		pace = paces[0]
+	}
 	return &StaticDrift{
-		cluster:       cluster,
-		provisioner:   provisioner,
-		cloudprovider: cloudprovider,
+		cluster:          cluster,
+		provisioner:      provisioner,
+		cloudprovider:    cloudprovider,
+		disruptionPacing: pace,
 	}
 }
 
@@ -58,51 +65,73 @@ func (d *StaticDrift) ComputeCommands(ctx context.Context, disruptionBudgetMappi
 	})
 
 	var cmds []Command
-	for npName, npCandidates := range candidatesByNodePool {
-		np := npCandidates[0].NodePool
-
-		if disruptionBudgetMapping[npName] == 0 {
-			continue
-		}
-
-		limit, ok := np.Spec.Limits[resources.Node]
-		nodeLimit := lo.Ternary(ok, limit.Value(), int64(math.MaxInt64))
-		// Current nodes (includes in‑flight per your cluster state)
-		runningNodes, _, nodesPendingDisruptionCount := d.cluster.NodePoolState.GetNodeCount(npName)
-
-		// We dont want to disrupt nodes until scale down is complete
-		if int64(runningNodes+nodesPendingDisruptionCount) > lo.FromPtr(np.Spec.Replicas) {
-			continue
-		}
-
-		maxDrifts := lo.Min([]int64{
-			int64(disruptionBudgetMapping[np.Name]),
-			int64(len(npCandidates)),
-		})
-
-		// Acquire limits from cluster state without bursting over
-		maxAllowedDrifts := d.cluster.NodePoolState.ReserveNodeCount(npName, nodeLimit, maxDrifts)
-
-		// We will not get a negative value here
-		if maxAllowedDrifts == 0 {
-			continue
-		}
-
-		// Select candidates up to maxAllowedDrifts
-		for _, c := range npCandidates[:maxAllowedDrifts] {
-			nct := scheduling.NewNodeClaimTemplate(np)
-			result := scheduling.Results{
-				NewNodeClaims: []*scheduling.NodeClaim{{NodeClaimTemplate: *nct}},
-			}
-			cmds = append(cmds, Command{
-				Candidates:          []*Candidate{c},
-				Replacements:        replacementsFromNodeClaims(result.NewNodeClaims...),
-				Results:             result,
-				PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{c}),
-			})
-		}
+	nodePoolNames := make([]string, 0, len(candidatesByNodePool))
+	for npName := range candidatesByNodePool {
+		nodePoolNames = append(nodePoolNames, npName)
+	}
+	sort.Strings(nodePoolNames)
+	scopeBatchCounts := map[string]int{}
+	for _, npName := range nodePoolNames {
+		cmds = append(cmds, d.computeCommandsForNodePool(npName, candidatesByNodePool[npName], disruptionBudgetMapping[npName], scopeBatchCounts)...)
 	}
 	return cmds, nil
+}
+
+func (d *StaticDrift) computeCommandsForNodePool(npName string, npCandidates []*Candidate, disruptionBudget int, scopeBatchCounts map[string]int) []Command {
+	if disruptionBudget == 0 {
+		return nil
+	}
+	np := npCandidates[0].NodePool
+	limit, ok := np.Spec.Limits[resources.Node]
+	nodeLimit := lo.Ternary(ok, limit.Value(), int64(math.MaxInt64))
+	// Current nodes (includes in-flight per your cluster state)
+	runningNodes, _, nodesPendingDisruptionCount := d.cluster.NodePoolState.GetNodeCount(npName)
+	if int64(runningNodes+nodesPendingDisruptionCount) > lo.FromPtr(np.Spec.Replicas) {
+		return nil
+	}
+
+	scope := d.disruptionPacing.Scope(np)
+	pacedCandidates := make([]*Candidate, 0, len(npCandidates))
+	selectedNonEmpty := scopeBatchCounts[scope]
+	for _, candidate := range npCandidates {
+		if len(candidate.reschedulablePods) > 0 && !d.disruptionPacing.CandidateAllowed(np, selectedNonEmpty) {
+			continue
+		}
+		pacedCandidates = append(pacedCandidates, candidate)
+		if len(candidate.reschedulablePods) > 0 {
+			selectedNonEmpty++
+		}
+	}
+	if len(pacedCandidates) == 0 {
+		return nil
+	}
+
+	maxDrifts := lo.Min([]int64{
+		int64(disruptionBudget),
+		int64(len(pacedCandidates)),
+	})
+	maxAllowedDrifts := d.cluster.NodePoolState.ReserveNodeCount(npName, nodeLimit, maxDrifts)
+	if maxAllowedDrifts == 0 {
+		return nil
+	}
+
+	commands := make([]Command, 0, maxAllowedDrifts)
+	for _, candidate := range pacedCandidates[:maxAllowedDrifts] {
+		nct := scheduling.NewNodeClaimTemplate(np)
+		result := scheduling.Results{
+			NewNodeClaims: []*scheduling.NodeClaim{{NodeClaimTemplate: *nct}},
+		}
+		commands = append(commands, Command{
+			Candidates:          []*Candidate{candidate},
+			Replacements:        replacementsFromNodeClaims(result.NewNodeClaims...),
+			Results:             result,
+			PoolDisruptionCosts: computePoolDisruptionCosts([]*Candidate{candidate}),
+		})
+		if len(candidate.reschedulablePods) > 0 {
+			scopeBatchCounts[scope]++
+		}
+	}
+	return commands
 }
 
 func (d *StaticDrift) Reason() v1.DisruptionReason {

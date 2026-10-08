@@ -229,6 +229,8 @@ type Command struct {
 
 	Succeeded bool
 
+	staticNodeCountReservationHandedOff bool
+
 	CreationTimestamp time.Time
 	ID                uuid.UUID
 

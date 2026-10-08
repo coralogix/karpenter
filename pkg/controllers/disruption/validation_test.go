@@ -42,15 +42,19 @@ func (n NopValidator) Validate(_ context.Context, command disruption.Command, _ 
 	return command, nil
 }
 
-func NewMethodsWithNopValidator() []disruption.Method {
-	c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue)
+func NewMethodsWithNopValidator(paces ...*disruption.DisruptionPacing) []disruption.Method {
+	var pace *disruption.DisruptionPacing
+	if len(paces) > 0 {
+		pace = paces[0]
+	}
+	c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, pace)
 	emptiness := disruption.NewEmptiness(c, disruption.WithValidator(NopValidator{}))
 	multiNodeConsolidation := disruption.NewMultiNodeConsolidation(c, disruption.WithValidator(NopValidator{}))
 	singleNodeConsolidation := disruption.NewSingleNodeConsolidation(c, disruption.WithValidator(NopValidator{}))
 	scoreBasedConsolidation := disruption.NewScoreBasedConsolidation(c, disruption.WithValidator(NopValidator{}))
 	return []disruption.Method{
-		disruption.NewStaticDrift(cluster, prov, cloudProvider),
-		disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+		disruption.NewStaticDrift(cluster, prov, cloudProvider, pace),
+		disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock, pace),
 		emptiness,
 		multiNodeConsolidation,
 		scoreBasedConsolidation,

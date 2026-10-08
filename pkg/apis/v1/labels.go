@@ -56,10 +56,10 @@ const (
 	// DRADriversAnnotationKey records the comma-separated set of DRA driver names whose devices were allocated to pods
 	// scheduled to this NodeClaim. The initialization controller can gate on these drivers having published their
 	// ResourceSlices before marking the node initialized.
-	DRADriversAnnotationKey                               = apis.Group + "/requested-dra-drivers"
-	MaxUnderutilizedNodeDisruptionsPerMinuteAnnotationKey = "karpenter.coralogix.net/max-underutilized-node-disruptions-per-minute"
-	MaxUnderutilizedNodesPerConsolidationAnnotationKey    = "karpenter.coralogix.net/max-underutilized-nodes-per-consolidation"
-	ScoreBasedConsolidationAnnotationKey                  = "karpenter.coralogix.net/score-based-consolidation"
+	DRADriversAnnotationKey                = apis.Group + "/requested-dra-drivers"
+	DisruptionPacingPerMinuteAnnotationKey = "karpenter.coralogix.net/disruption-pacing-per-minute"
+	DisruptionPacingPerBatchAnnotationKey  = "karpenter.coralogix.net/disruption-pacing-per-batch"
+	ScoreBasedConsolidationAnnotationKey   = "karpenter.coralogix.net/score-based-consolidation"
 )
 
 // Karpenter specific finalizers
