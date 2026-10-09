@@ -228,18 +228,13 @@ type Command struct {
 	Method
 
 	Succeeded bool
-	// Action overrides the default replace/delete behavior inferred from candidates and replacements.
-	Action CommandAction
-	// BeforeDelete validates candidates immediately before a delete action is applied. It may
-	// refresh candidate objects so conditional deletion uses the validated resource versions.
+	Action    CommandAction
+	// BeforeDelete runs immediately before delete; may refresh candidates for conditional deletion.
 	BeforeDelete func(context.Context, []*Candidate) error
-	// DeleteWithPreconditions makes the queue delete candidates using their current UID and
-	// resourceVersion, so a concurrent update invalidates the delete instead of being lost.
+	// DeleteWithPreconditions deletes using UID and resourceVersion so concurrent updates invalidate the delete.
 	DeleteWithPreconditions bool
-	// OnSuccess runs after the action is committed, before the command leaves the orchestration queue.
-	OnSuccess func(context.Context) error
-	// OnDeleteSuccess runs after each source NodeClaim delete succeeds.
-	OnDeleteSuccess func(context.Context, *Candidate) error
+	OnSuccess               func(context.Context) error
+	OnDeleteSuccess         func(context.Context, *Candidate) error
 
 	deletionExecution   *deletionExecutionState
 	evacuationExecution *evacuationExecutionState
@@ -396,9 +391,7 @@ func (c Command) SourceCost() float64 {
 // them.
 func (c Command) EstimatedSavings() float64 {
 	if c.Action == EvacuateAction || c.Action == StandbyAction {
-		// Evacuation and empty-to-standby both retain the source node. Savings are realized only if
-		// a later reclamation pass removes it.
-		return 0
+		return 0 // retained nodes; savings apply only if reclamation later removes them
 	}
 	sourcePrice := c.SourceCost()
 
@@ -410,7 +403,6 @@ func (c Command) EstimatedSavings() float64 {
 	return sourcePrice - replacementCostUSDPerHour(c)
 }
 
-// replacementCostUSDPerHour returns the estimated replacement cost for realized savings.
 func replacementCostUSDPerHour(cmd Command) float64 {
 	destPrice := 0.0
 	for _, nodeClaim := range cmd.Results.NewNodeClaims {

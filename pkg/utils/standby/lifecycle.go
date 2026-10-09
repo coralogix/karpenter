@@ -30,9 +30,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
-// Lifecycle coordinates the live API mutations that move capacity between active and standby.
-// Construct it at the call site so controllers use the current API reader, including one
-// registered after their construction.
+// Lifecycle performs optimistic standby mutations against live API objects.
 type Lifecycle struct {
 	reader client.Reader
 	writer client.Client
@@ -66,8 +64,6 @@ func (l Lifecycle) ReadLivePair(ctx context.Context, nodeRef *corev1.Node, nodeC
 	return node, nodeClaim, true, nil
 }
 
-// EnsureNodeStandbyTaint restores the taint from a live Node read. Callers decide whether and
-// how to retry, which keeps evacuation's retry behavior distinct from periodic cleanup.
 func (l Lifecycle) EnsureNodeStandbyTaint(ctx context.Context, nodeRef *corev1.Node) error {
 	if nodeRef == nil {
 		return fmt.Errorf("cannot restore standby taint without a Node")
@@ -79,9 +75,6 @@ func (l Lifecycle) EnsureNodeStandbyTaint(ctx context.Context, nodeRef *corev1.N
 	return l.ensureNodeStandbyTaint(ctx, node)
 }
 
-// EnsureStandbyTaintForClaim restores a standby taint only while the live NodeClaim remains
-// standby. It reads the Node first and uses that resourceVersion for the patch, so an activation
-// marker written concurrently causes a conflict instead of re-tainting activated capacity.
 func (l Lifecycle) EnsureStandbyTaintForClaim(ctx context.Context, nodeRef *corev1.Node, nodeClaimRef *v1.NodeClaim) error {
 	if nodeRef == nil || nodeClaimRef == nil {
 		return nil
@@ -103,8 +96,6 @@ func (l Lifecycle) EnsureStandbyTaintForClaim(ctx context.Context, nodeRef *core
 	return l.ensureNodeStandbyTaint(ctx, node)
 }
 
-// Activate runs the shared activation protocol. onActivated is called immediately after the
-// standby taint is removed, matching the point at which activation metrics are recorded.
 func (l Lifecycle) Activate(ctx context.Context, nodeSnapshot *corev1.Node, nodeClaimSnapshot *v1.NodeClaim, requestedSource ActivationSource, onActivated func(ActivationSource)) error {
 	if nodeClaimSnapshot == nil {
 		return fmt.Errorf("reserving nodeclaim activation, missing NodeClaim")
@@ -132,9 +123,6 @@ func (l Lifecycle) Activate(ctx context.Context, nodeSnapshot *corev1.Node, node
 	return l.completeActivation(ctx, nodeSnapshot.Name, nodeClaimSnapshot)
 }
 
-// PatchNodeClaimStandby changes the marker on a freshly-read NodeClaim using its resourceVersion.
-// It always patches, even when the marker is unchanged; callers own idempotency checks so this
-// write can remain a concurrency barrier for a transition.
 func (l Lifecycle) PatchNodeClaimStandby(ctx context.Context, nodeClaim *v1.NodeClaim, standby bool, since time.Time) error {
 	if nodeClaim == nil {
 		return fmt.Errorf("cannot update standby marker on a missing NodeClaim")
@@ -144,9 +132,6 @@ func (l Lifecycle) PatchNodeClaimStandby(ctx context.Context, nodeClaim *v1.Node
 	return l.writer.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
 }
 
-// PatchNodeStandbyTaint changes the standby taint on a live Node using its resourceVersion. It
-// always patches, even when the taint is unchanged; callers own idempotency checks so this write
-// can remain a concurrency barrier for a transition.
 func (l Lifecycle) PatchNodeStandbyTaint(ctx context.Context, node *corev1.Node, standby bool) error {
 	if node == nil {
 		return fmt.Errorf("cannot update standby taint on a missing Node")

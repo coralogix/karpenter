@@ -137,11 +137,8 @@ func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Clien
 	}
 	c := MakeConsolidation(clk, cluster, kubeClient, provisioner, cp, recorder, queue, pace)
 	return []Method{
-		// Delete empty nodes across all consolidation policies (WhenEmpty, WhenEmptyOrUnderutilized, Balanced).
 		NewEmptiness(c),
-		// Move naturally empty active nodes into standby before considering their reclamation.
 		NewStandbyMarking(c),
-		// Reclaim empty capacity in NodePools that opt in to score-based consolidation.
 		NewReclamation(c),
 		// Terminate and create replacement for drifted NodeClaims in Static NodePool
 		NewStaticDrift(cluster, provisioner, cp, pace),
@@ -149,7 +146,6 @@ func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Clien
 		NewDrift(kubeClient, cluster, provisioner, recorder, clk, pace),
 		// Attempt to identify multiple NodeClaims that we can consolidate simultaneously to reduce pod churn
 		NewMultiNodeConsolidation(c),
-		// Compact non-empty nodes in NodePools that opt in via annotation.
 		NewScoreBasedConsolidation(c),
 		// And finally fall back our single NodeClaim consolidation to further reduce cluster cost.
 		NewSingleNodeConsolidation(c),

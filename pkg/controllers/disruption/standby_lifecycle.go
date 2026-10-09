@@ -31,8 +31,6 @@ import (
 
 const defaultReclamationStandbyDelay = 15 * time.Second
 
-// standbyLifecycleEnabled reports whether this pool uses standby marking and reclamation.
-// consolidateAfter does not affect this mode.
 func standbyLifecycleEnabled(nodePool *v1.NodePool) bool {
 	return NodePoolUsesScoreBasedConsolidation(nodePool) &&
 		nodePool.Spec.Replicas == nil &&
@@ -58,8 +56,6 @@ func reclamationStandbyDelay(nodePool *v1.NodePool) time.Duration {
 	return delay
 }
 
-// standbyReclamationSoakElapsed reports whether a standby NodeClaim may be reclaimed.
-// Legacy standby markers without a timestamp skip the soak gate.
 func standbyReclamationSoakElapsed(nodePool *v1.NodePool, nodeClaim *v1.NodeClaim, now time.Time) bool {
 	if !standby.IsNodeClaimStandby(nodeClaim) {
 		return false

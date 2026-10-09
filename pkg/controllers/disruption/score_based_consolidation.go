@@ -99,7 +99,6 @@ func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candida
 	return s.shouldCompact(ctx, cn)
 }
 
-// shouldCompact admits only eligible, non-empty active nodes into normal compaction.
 func (s *ScoreBasedConsolidation) shouldCompact(_ context.Context, cn *Candidate) bool {
 	if !s.compactionCandidateEligible(cn) {
 		return false

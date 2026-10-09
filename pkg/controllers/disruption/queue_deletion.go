@@ -42,14 +42,10 @@ const (
 	deletionComplete
 )
 
-// deletionExecutionState tracks each candidate's delete and callback lifecycle across
-// queue retries, preventing a callback failure from repeating delete side effects.
 type deletionExecutionState struct {
 	candidates map[string]deletionCandidatePhase
 }
 
-// deleteCandidates removes source NodeClaims after replacement readiness has been checked.
-// The termination controller handles the eventual deletion of the corresponding Nodes.
 func (q *Queue) deleteCandidates(ctx, callbackCtx context.Context, cmd *Command) error {
 	q.Lock()
 	if cmd.deletionExecution == nil {
@@ -67,7 +63,6 @@ func (q *Queue) deleteCandidates(ctx, callbackCtx context.Context, cmd *Command)
 			errs[i] = err
 		}
 	})
-	// On error, the queue retries. If the command timeout is reached, Reconcile marks it failed.
 	if err := multierr.Combine(errs...); err != nil {
 		return err
 	}

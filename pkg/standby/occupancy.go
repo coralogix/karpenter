@@ -26,7 +26,6 @@ import (
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
 
-// NodeOccupyingPods returns bound workload pods that occupy a node for standby transitions.
 func NodeOccupyingPods(ctx context.Context, reader client.Reader, node *corev1.Node) ([]*corev1.Pod, error) {
 	if node == nil {
 		return nil, fmt.Errorf("checking node occupancy without a Node")
@@ -49,7 +48,6 @@ func NodeOccupyingPods(ctx context.Context, reader client.Reader, node *corev1.N
 	return occupying, nil
 }
 
-// NodeEmpty reports whether a node has no occupying workload pods.
 func NodeEmpty(ctx context.Context, reader client.Reader, node *corev1.Node) (bool, error) {
 	pods, err := NodeOccupyingPods(ctx, reader, node)
 	return len(pods) == 0, err

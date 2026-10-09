@@ -35,8 +35,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/pdb"
 )
 
-// reclamationValidator refreshes only selected empty-node candidates without applying
-// NodePool disruption budgets. It retains NewCandidate's queue, Node, PDB, and pod annotation gates.
 type reclamationValidator struct {
 	validation
 	reclamation *Reclamation
@@ -54,7 +52,6 @@ func (s *reclamationValidator) Validate(ctx context.Context, cmd Command, valida
 	if err != nil {
 		return Command{}, err
 	}
-	// Refresh a second time to catch changes while the selected batch was being validated.
 	validatedCandidates, err = s.validateCandidates(ctx, validatedCandidates...)
 	if err != nil {
 		return Command{}, err
@@ -150,8 +147,6 @@ func (s *reclamationValidator) validateCandidateSet(candidates, validated []*Can
 	return nil
 }
 
-// selectedStateNodes takes small snapshots while the cluster iterator holds its read lock. It
-// preserves in-memory nominations and deletion marks without deep-copying unrelated fleet state.
 func (s *reclamationValidator) selectedStateNodes(candidates []*Candidate) map[string]*state.StateNode {
 	selected := make(map[string]*Candidate, len(candidates))
 	for _, candidate := range candidates {
@@ -222,8 +217,6 @@ func (s *reclamationValidator) refreshSelectedCandidate(ctx context.Context, can
 	if err := reader.Get(ctx, client.ObjectKeyFromObject(candidate.Node), node); err != nil {
 		return nil, false
 	}
-	// Keep the selected objects' identity fixed across validation. A same-name replacement cannot
-	// become the object authorized by the original reclamation decision.
 	if nodeClaim.UID != candidate.NodeClaim.UID || node.UID != candidate.Node.UID ||
 		nodeClaim.Status.ProviderID != candidate.ProviderID() || node.Spec.ProviderID != candidate.ProviderID() {
 		return nil, false
@@ -234,7 +227,6 @@ func (s *reclamationValidator) refreshSelectedCandidate(ctx context.Context, can
 	fresh, err := NewCandidate(ctx, s.kubeClient, s.recorder, s.clock, stateNode, pdbLimits,
 		map[string]*v1.NodePool{pool.Name: pool}, map[string]map[string]*cloudprovider.InstanceType{pool.Name: instanceTypes}, s.queue, GracefulDisruptionClass)
 	if err != nil {
-		// GetCandidates treats candidate-construction failures as candidates that are no longer valid.
 		return nil, false
 	}
 	if !s.reclamation.ShouldDisrupt(ctx, fresh) {

@@ -49,17 +49,14 @@ func NodeTaint() corev1.Taint {
 	return corev1.Taint{Key: NodeTaintKey, Value: NodeTaintValue, Effect: corev1.TaintEffectNoSchedule}
 }
 
-// IsNodeClaimActivating reports whether activation of this NodeClaim was interrupted and needs resuming.
 func IsNodeClaimActivating(nodeClaim *v1.NodeClaim) bool {
 	return nodeClaim != nil && nodeClaim.Annotations[NodeClaimActivatingAnnotationKey] == "true"
 }
 
-// HasNodeActivationMarker reports whether activation reserved a Node.
 func HasNodeActivationMarker(node *corev1.Node) bool {
 	return node != nil && node.Annotations[NodeClaimActivatingAnnotationKey] == "true"
 }
 
-// SetNodeClaimActivating updates the persistent activation-in-progress marker on a NodeClaim in memory.
 func SetNodeClaimActivating(nodeClaim *v1.NodeClaim, activating bool) {
 	if nodeClaim == nil {
 		return
@@ -76,7 +73,6 @@ func SetNodeClaimActivating(nodeClaim *v1.NodeClaim, activating bool) {
 	}
 }
 
-// NodeClaimActivationSource returns the source persisted with an in-progress activation.
 func NodeClaimActivationSource(nodeClaim *v1.NodeClaim) ActivationSource {
 	if nodeClaim == nil {
 		return ""
@@ -84,7 +80,6 @@ func NodeClaimActivationSource(nodeClaim *v1.NodeClaim) ActivationSource {
 	return ActivationSource(nodeClaim.Annotations[NodeClaimActivationSourceAnnotationKey])
 }
 
-// SetNodeClaimActivationSource updates the source persisted with an in-progress activation.
 func SetNodeClaimActivationSource(nodeClaim *v1.NodeClaim, source ActivationSource) {
 	if nodeClaim == nil {
 		return
@@ -101,7 +96,6 @@ func SetNodeClaimActivationSource(nodeClaim *v1.NodeClaim, source ActivationSour
 	nodeClaim.Annotations[NodeClaimActivationSourceAnnotationKey] = string(source)
 }
 
-// IsNodeClaimStandby reports whether a NodeClaim carries the persistent standby marker.
 func IsNodeClaimStandby(nodeClaim *v1.NodeClaim) bool {
 	if nodeClaim == nil || nodeClaim.Annotations == nil {
 		return false
@@ -134,7 +128,6 @@ func NodeClaimStandbySince(nodeClaim *v1.NodeClaim) (time.Time, bool) {
 	return since, true
 }
 
-// SetNodeClaimStandby updates the persistent standby marker on a NodeClaim in memory.
 func SetNodeClaimStandby(nodeClaim *v1.NodeClaim, standby bool, since time.Time) {
 	if nodeClaim == nil {
 		return
@@ -151,7 +144,6 @@ func SetNodeClaimStandby(nodeClaim *v1.NodeClaim, standby bool, since time.Time)
 	}
 }
 
-// HasNodeTaint reports whether a node has the standby NoSchedule taint.
 func HasNodeTaint(node *corev1.Node) bool {
 	if node == nil {
 		return false
@@ -165,7 +157,6 @@ func HasNodeTaint(node *corev1.Node) bool {
 	return false
 }
 
-// SetNodeTaint adds or removes the standby taint from a node in memory.
 func SetNodeTaint(node *corev1.Node, standby bool) {
 	if node == nil {
 		return

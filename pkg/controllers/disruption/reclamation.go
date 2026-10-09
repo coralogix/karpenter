@@ -97,8 +97,6 @@ func (s *Reclamation) ConsolidationType() string {
 	return ReclamationType
 }
 
-// computeReclamationCommand chooses empty candidates for removal without applying NodePool
-// disruption budgets. Reclamation runs as its own method before score-based compaction.
 func (s *Reclamation) computeReclamationCommand(ctx context.Context, candidates []*Candidate) (*Command, error) {
 	if err := s.refreshReclamationInventory(ctx); err != nil {
 		return nil, err
@@ -192,8 +190,6 @@ func selectReclamationCandidates(byPool map[string][]*Candidate) []*Candidate {
 }
 
 func (s *Reclamation) validateReclamationCommand(ctx context.Context, cmd Command) (*Command, error) {
-	// Reclamation considers only nodes already marked and tainted as standby. Refresh candidates
-	// immediately before admission; the queue performs a final live check and conditional delete.
 	validated, err := s.validator.Validate(ctx, cmd, 0)
 	if err != nil {
 		if IsValidationError(err) {
@@ -218,7 +214,6 @@ func (s *Reclamation) refreshReclamationInventory(ctx context.Context) error {
 	return nil
 }
 
-// collectReclamationInventory counts managed, non-terminating empty nodes in configured score-based pools.
 func (s *Reclamation) collectReclamationInventory(ctx context.Context) (*reclamationInventory, error) {
 	nodePools, inventoryCounts, err := s.reclamationPools(ctx)
 	if err != nil {
@@ -292,8 +287,7 @@ func (s *Reclamation) reclamationCandidateBeforeDelete(ctx context.Context, cand
 	nodeClaim := &v1.NodeClaim{}
 	if err := s.apiReader().Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
 		if apierrors.IsNotFound(err) {
-			// The original object is already gone. Queue's UID-preconditioned Delete will treat
-			// NotFound as completion and cannot delete a same-name replacement.
+			// NotFound is OK: conditional delete cannot remove a same-name replacement.
 			return nil
 		}
 		return fmt.Errorf("getting reclamation candidate NodeClaim before deletion, %w", err)
@@ -302,7 +296,6 @@ func (s *Reclamation) reclamationCandidateBeforeDelete(ctx context.Context, cand
 		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q was replaced", candidate.Name()))
 	}
 	if !nodeClaim.DeletionTimestamp.IsZero() {
-		// Refresh the resourceVersion so an already-started deletion is idempotently completed.
 		candidate.NodeClaim = nodeClaim
 		return nil
 	}
@@ -409,8 +402,6 @@ func (s *Reclamation) apiReader() client.Reader {
 	return s.kubeClient
 }
 
-// isReclamationCandidateAvailable filters candidates that have become unsafe to remove since candidate collection.
-//
 //nolint:gocyclo // Keep the candidate's live NodeClaim, Node, and pod safety checks in one predicate.
 func (s *Reclamation) isReclamationCandidateAvailable(ctx context.Context, candidate *Candidate) bool {
 	if !s.reclamationCandidateEligible(candidate) {

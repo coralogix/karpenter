@@ -73,8 +73,6 @@ func (c emptyNodeCounts) add(isStandby bool) emptyNodeCounts {
 	return c
 }
 
-// updateReclamationEmptyNodeMetrics replaces the previously reported inventory after a complete
-// scan. Keeping the last successful pool set here lets us remove series when pools leave scope.
 func updateReclamationEmptyNodeMetrics(counts map[string]emptyNodeCounts) {
 	reclamationEmptyNodeMetricState.Lock()
 	defer reclamationEmptyNodeMetricState.Unlock()

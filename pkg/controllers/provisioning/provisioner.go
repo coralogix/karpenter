@@ -431,9 +431,6 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	// as persistent capacity for the cluster (since it will soon be removed). Additionally, we are scheduling for
 	// the pods that are on these nodes so the MarkedForDeletion node capacity can't be considered.
 	nodes := p.cluster.DeepCopyNodes()
-	// Finish activation transactions left by an interrupted provisioning pass.
-	// The activation marker reserves these nodes from scheduling and reclamation
-	// until the taint and persistent standby marker are both cleared.
 	if err := p.resumeStandbyActivations(ctx, nodes); err != nil {
 		return scheduler.Results{}, fmt.Errorf("resuming standby activation, %w", err)
 	}

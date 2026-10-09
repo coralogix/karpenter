@@ -197,7 +197,6 @@ func reclamationTestNode(poolName, name string, standbyMarker, standbyTaint, del
 		if nodeClaim.Annotations == nil {
 			nodeClaim.Annotations = map[string]string{}
 		}
-		// Legacy marker keeps existing reclamation tests immediately soak-eligible.
 		nodeClaim.Annotations[standby.NodeClaimAnnotationKey] = "true"
 	}
 	if standbyTaint {

@@ -36,9 +36,7 @@ func (c *Controller) cleanupStaleDisruptionState(ctx context.Context) error {
 	if err := c.recoverOccupiedStandbyNodes(ctx); err != nil {
 		return fmt.Errorf("recovering occupied standby nodes, %w", err)
 	}
-	// Karpenter taints nodes with a karpenter.sh/disruption taint as part of the disruption process while it progresses in memory.
-	// If Karpenter restarts or fails with an error during a disruption action, some nodes can be left tainted.
-	// Idempotently remove this taint from candidates that are not in the orchestration queue before continuing.
+	// Clear stale karpenter.sh/disruption taints from nodes that are not in the orchestration queue.
 	outdatedNodes := lo.Reject(c.cluster.DeepCopyNodes(), func(s *state.StateNode, _ int) bool {
 		return c.queue.HasAny(s.ProviderID()) || s.MarkedForDeletion() || standby.IsNodeClaimActivating(s.NodeClaim)
 	})

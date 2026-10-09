@@ -38,8 +38,7 @@ import (
 
 const StandbyMarkingType = "standby-marking"
 
-// StandbyMarking marks naturally empty active nodes in score-based NodePools as standby
-// capacity. It does not evict pods, consume disruption budgets, or participate in compaction.
+// StandbyMarking marks empty active nodes in score-based NodePools as standby capacity.
 type StandbyMarking struct {
 	consolidation
 }
@@ -62,9 +61,6 @@ func (s *StandbyMarking) ShouldDisrupt(ctx context.Context, candidate *Candidate
 	if standby.IsNodeClaimStandby(candidate.NodeClaim) || standby.IsNodeClaimActivating(candidate.NodeClaim) || standby.HasNodeTaint(candidate.Node) {
 		return false
 	}
-	// Keep candidate discovery on the informer snapshot. Empty candidates still get a live API
-	// check below before they are marked; a stale occupied snapshot only delays this transition
-	// until the next watch-driven reconciliation.
 	if len(candidate.reschedulablePods) > 0 {
 		return false
 	}
@@ -107,9 +103,6 @@ func (s *StandbyMarking) apiReader() client.Reader {
 	return s.kubeClient
 }
 
-// standbyCandidateMatchesLiveObjects verifies that the Node and NodeClaim still identify the
-// same active, empty node before the queue changes its scheduling state.
-//
 //nolint:gocyclo // The live identity, policy, nomination, and pod checks are one transition precondition.
 func (s *StandbyMarking) standbyCandidateMatchesLiveObjects(ctx context.Context, candidate *Candidate) (*corev1.Node, *v1.NodeClaim, bool, error) {
 	if candidate == nil || candidate.Node == nil || candidate.NodeClaim == nil || candidate.NodePool == nil {
@@ -147,8 +140,6 @@ func (s *StandbyMarking) standbyCandidateMatchesLiveObjects(ctx context.Context,
 	return node, nodeClaim, true, nil
 }
 
-// updateStandbyState refreshes the internal cluster snapshot before another disruption pass can
-// make a decision using the just-updated Node and NodeClaim.
 func updateStandbyState(ctx context.Context, cluster *state.Cluster, reader client.Reader, node *corev1.Node, nodeClaim *v1.NodeClaim) error {
 	var pods corev1.PodList
 	if err := reader.List(ctx, &pods, client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
@@ -158,9 +149,6 @@ func updateStandbyState(ctx context.Context, cluster *state.Cluster, reader clie
 	return cluster.UpdateNodeWithPods(ctx, node, lo.ToSlicePtr(pods.Items))
 }
 
-// startStandbyCommand reserves the candidates while their empty-to-standby state change is
-// committed. This is synchronous because there are no pods to evict or replacements to launch.
-//
 //nolint:gocyclo // Reservation, transition, and per-candidate reporting form one synchronous command.
 func (q *Queue) startStandbyCommand(ctx context.Context, cmd *Command) error {
 	providerIDs := lo.Map(cmd.Candidates, func(candidate *Candidate, _ int) string { return candidate.ProviderID() })

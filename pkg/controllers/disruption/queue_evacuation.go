@@ -38,7 +38,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-// evacuationExecutionState owns the in-flight pod work associated with one evacuation.
 type evacuationExecutionState struct {
 	evictionPods []*corev1.Pod
 }
@@ -53,7 +52,6 @@ func (q *Queue) handleEvacuationSuccess(ctx context.Context, cmd *Command) {
 	q.recordEvacuationOutcome(ctx, cmd, evacuationOutcomeCompleted, nil)
 }
 
-// evacuate asks the shared termination queue to evict non-daemon pods, then hands off an empty node as standby.
 func (q *Queue) evacuate(ctx context.Context, cmd *Command) error {
 	if q.evictionQueue == nil {
 		return NewUnrecoverableError(fmt.Errorf("evacuation requires the shared pod eviction queue"))
@@ -161,7 +159,6 @@ func (q *Queue) rollbackEvacuation(ctx context.Context, candidates []*Candidate)
 		}
 		if standby.IsNodeClaimStandby(current) {
 			if err := q.standbyCoordinator.EnsureStandbyTaintForClaim(ctx, candidate.Node, current); err != nil {
-				// Keep the disruption taint until standby state is safe to preserve.
 				errs = append(errs, fmt.Errorf("restoring standby taint before evacuation rollback, %w", err))
 				continue
 			}

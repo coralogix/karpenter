@@ -49,7 +49,6 @@ func NewCoordinator(reader client.Reader, writer client.Client, clk clock.Clock)
 	return &Coordinator{reader: reader, writer: writer, clock: clk}
 }
 
-// TestCoordinator returns a coordinator that uses the same client for reads and writes.
 func TestCoordinator(c client.Client, clk clock.Clock) *Coordinator {
 	return NewCoordinator(c, c, clk)
 }
@@ -58,7 +57,6 @@ func (c *Coordinator) lifecycle() utilstandby.Lifecycle {
 	return utilstandby.NewLifecycle(c.reader, c.writer)
 }
 
-// Activate runs the shared activation protocol and records activation metrics once per successful taint removal.
 func (c *Coordinator) Activate(ctx context.Context, source utilstandby.ActivationSource, nodes ...*state.StateNode) error {
 	var errs []error
 	for _, node := range nodes {
@@ -88,14 +86,12 @@ type EnterStandbyOptions struct {
 	Eligibility func(context.Context, *corev1.Node, *v1.NodeClaim) (bool, error)
 }
 
-// EnterStandbyRequest identifies the node pair undergoing empty-to-standby transition.
 type EnterStandbyRequest struct {
 	NodeRef      *corev1.Node
 	NodeClaimRef *v1.NodeClaim
 	ProviderID   string
 }
 
-// EnterStandby performs the empty-to-standby handoff.
 func (c *Coordinator) EnterStandby(ctx context.Context, req EnterStandbyRequest, opts EnterStandbyOptions) (TransitionResult, error) {
 	if req.NodeRef == nil || req.NodeClaimRef == nil {
 		return TransitionResult{Outcome: OutcomeFailed}, fmt.Errorf("standby entry requires a Node and NodeClaim")
@@ -273,14 +269,12 @@ func (c *Coordinator) recoverOccupiedStandby(ctx context.Context, node *corev1.N
 	return true, nil
 }
 
-// RepairRequest identifies capacity to reconcile without a full policy pass.
 type RepairRequest struct {
 	NodeRef      *corev1.Node
 	NodeClaimRef *v1.NodeClaim
 	ProviderID   string
 }
 
-// RepairOccupied activates occupied standby capacity and clears the temporary disruption taint.
 func (c *Coordinator) RepairOccupied(ctx context.Context, req RepairRequest) error {
 	node, nodeClaim, matches, err := c.lifecycle().ReadLivePair(ctx, req.NodeRef, req.NodeClaimRef, req.ProviderID)
 	if err != nil {
@@ -306,7 +300,6 @@ func (c *Coordinator) RepairOccupied(ctx context.Context, req RepairRequest) err
 	return nil
 }
 
-// RepairOrphanStandbyTaint removes a standby taint that has no matching standby marker.
 func (c *Coordinator) RepairOrphanStandbyTaint(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
 	if node == nil || nodeClaim == nil {
 		return false, nil
@@ -329,22 +322,18 @@ func (c *Coordinator) RepairOrphanStandbyTaint(ctx context.Context, node *corev1
 	return true, nil
 }
 
-// EnsureStandbyTaintForClaim restores the standby taint while the NodeClaim remains standby.
 func (c *Coordinator) EnsureStandbyTaintForClaim(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) error {
 	return c.lifecycle().EnsureStandbyTaintForClaim(ctx, node, nodeClaim)
 }
 
-// ReadLivePair exposes the shared live identity read used by disruption policy checks.
 func (c *Coordinator) ReadLivePair(ctx context.Context, nodeRef *corev1.Node, nodeClaimRef *v1.NodeClaim, providerID string) (*corev1.Node, *v1.NodeClaim, bool, error) {
 	return c.lifecycle().ReadLivePair(ctx, nodeRef, nodeClaimRef, providerID)
 }
 
-// RemoveDisruptionTaint clears the temporary disruption scheduling barrier from a node.
 func (c *Coordinator) RemoveDisruptionTaint(ctx context.Context, nodeName string) error {
 	return removeDisruptionTaint(ctx, c.reader, c.writer, nodeName)
 }
 
-// ActivationComplete reports whether standby activation finished on live objects.
 func ActivationComplete(node *corev1.Node, nodeClaim *v1.NodeClaim) bool {
 	if node == nil || nodeClaim == nil {
 		return false
@@ -353,7 +342,6 @@ func ActivationComplete(node *corev1.Node, nodeClaim *v1.NodeClaim) bool {
 		!utilstandby.HasNodeTaint(node) && node.Annotations[utilstandby.NodeClaimActivatingAnnotationKey] != "true"
 }
 
-// FilterActivating returns nodes with an in-progress activation reservation or marker.
 func FilterActivating(nodes state.StateNodes) []*state.StateNode {
 	return lo.Filter(nodes, func(node *state.StateNode, _ int) bool {
 		return node != nil && !node.MarkedForDeletion() &&

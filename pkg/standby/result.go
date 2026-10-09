@@ -22,7 +22,6 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
-// Outcome describes how a standby transition completed from the caller's perspective.
 type Outcome string
 
 const (
@@ -33,7 +32,6 @@ const (
 	OutcomeFailed    Outcome = "failed"
 )
 
-// TransitionResult is the persisted API outcome for one Node / NodeClaim pair.
 type TransitionResult struct {
 	Outcome   Outcome
 	Node      *corev1.Node

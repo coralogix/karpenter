@@ -109,7 +109,6 @@ type Queue struct {
 	evictionQueue       *terminator.Queue
 }
 
-// SetEvictionQueue supplies the shared queue used by the node termination controller for pod evictions.
 func (q *Queue) SetEvictionQueue(evictionQueue *terminator.Queue) {
 	q.evictionQueue = evictionQueue
 }
@@ -134,7 +133,6 @@ func NewQueue(kubeClient client.Client, apiReader client.Reader, recorder events
 	return queue
 }
 
-// NewTestQueue wires the API reader and standby coordinator for unit tests.
 func NewTestQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clk clock.Clock, provisioner *provisioning.Provisioner) *Queue {
 	coordinator := standby.TestCoordinator(kubeClient, clk)
 	return NewQueue(kubeClient, kubeClient, recorder, cluster, clk, provisioner, coordinator)
