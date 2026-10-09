@@ -17,6 +17,8 @@ limitations under the License.
 package disruption_test
 
 import (
+	"context"
+	"errors"
 	"strconv"
 	"time"
 
@@ -30,6 +32,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -37,8 +40,11 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
+	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 var (
@@ -49,6 +55,9 @@ var (
 
 var _ = Describe("Queue", func() {
 	BeforeEach(func() {
+		disruption.EvacuationCommandsTotal.Reset()
+		disruption.EvacuationDurationSeconds.Reset()
+		disruption.NodeClaimsEvacuatedTotal.Reset()
 		nodePool = test.NodePool()
 		nodeClaim1, node1 = test.NodeClaimAndNode(
 			v1.NodeClaim{
@@ -335,6 +344,185 @@ var _ = Describe("Queue", func() {
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim1)
 			// And expect the nodeClaim and node to be deleted
 			ExpectNotFound(ctx, env.Client, nodeClaim1, node1)
+		})
+		It("should retry a failed per-candidate callback without repeating a successful deletion", func() {
+			metricPoolName := "callback-retry-" + uuid.NewString()
+			nodePool.Name = metricPoolName
+			nodeClaim1.Labels[v1.NodePoolLabelKey] = metricPoolName
+			node1.Labels[v1.NodePoolLabelKey] = metricPoolName
+			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+
+			callbackAttempts := 0
+			cmd := &disruption.Command{
+				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+				CreationTimestamp: env.Clock.Now(),
+				ID:                uuid.New(),
+				Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
+				OnDeleteSuccess: func(context.Context, *disruption.Candidate) error {
+					callbackAttempts++
+					if callbackAttempts == 1 {
+						return errors.New("retry callback once")
+					}
+					return nil
+				},
+			}
+			Expect(queue.StartCommand(ctx, cmd)).To(Succeed())
+
+			result, err := queue.Reconcile(ctx, stateNode.NodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(time.Second))
+			Expect(callbackAttempts).To(Equal(1))
+			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
+				metrics.ReasonLabel:       "drifted",
+				metrics.NodePoolLabel:     metricPoolName,
+				metrics.CapacityTypeLabel: stateNode.NodeClaim.Labels[v1.CapacityTypeLabelKey],
+			})
+
+			result, err = queue.Reconcile(ctx, stateNode.NodeClaim)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeZero())
+			Expect(callbackAttempts).To(Equal(2))
+			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
+				metrics.ReasonLabel:       "drifted",
+				metrics.NodePoolLabel:     metricPoolName,
+				metrics.CapacityTypeLabel: stateNode.NodeClaim.Labels[v1.CapacityTypeLabelKey],
+			})
+			Expect(queue.HasAny(stateNode.ProviderID())).To(BeFalse())
+		})
+		It("should wait for non-daemon pods to disappear before retaining an evacuated node", func() {
+			evictionQueue := terminator.NewQueue(env.Client, recorder)
+			queue.SetEvictionQueue(evictionQueue)
+			pod := test.Pod(test.PodOptions{NodeName: node1.Name})
+			terminalPod := test.Pod(test.PodOptions{NodeName: node1.Name})
+			terminalPod.Finalizers = []string{"testing/terminal-finalizer"}
+			mirrorPod := test.Pod(test.PodOptions{NodeName: node1.Name})
+			mirrorPod.Annotations = map[string]string{corev1.MirrorPodAnnotationKey: "static-pod"}
+			mirrorPod.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: node1.Name, UID: types.UID("mirror-node")}}
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1, pod, terminalPod, mirrorPod)
+			storedTerminalPod := &corev1.Pod{}
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(terminalPod), storedTerminalPod)).To(Succeed())
+			storedTerminalPod.Status.Phase = corev1.PodSucceeded
+			Expect(env.Client.Status().Update(ctx, storedTerminalPod)).To(Succeed())
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+			cmd := &disruption.Command{
+				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+				CreationTimestamp: env.Clock.Now(),
+				ID:                uuid.New(),
+				Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
+				Action:            disruption.EvacuateAction,
+			}
+			Expect(queue.StartCommand(ctx, cmd)).To(Succeed())
+
+			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			Expect(evictionQueue.Has(pod)).To(BeTrue())
+			Expect(queue.HasAny(stateNode.ProviderID())).To(BeTrue())
+
+			// Terminating pods still occupy the source node until their objects disappear.
+			terminatingPod := &corev1.Pod{}
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(pod), terminatingPod)).To(Succeed())
+			terminatingPod.Finalizers = append(terminatingPod.Finalizers, "testing/finalizer")
+			Expect(env.Client.Update(ctx, terminatingPod)).To(Succeed())
+			zeroGracePeriod := int64(0)
+			Expect(env.Client.Delete(ctx, terminatingPod, &client.DeleteOptions{GracePeriodSeconds: &zeroGracePeriod})).To(Succeed())
+			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			currentNodeClaim := &v1.NodeClaim{}
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim1), currentNodeClaim)).To(Succeed())
+			Expect(standby.IsNodeClaimStandby(currentNodeClaim)).To(BeFalse())
+
+			ExpectFinalizersRemoved(ctx, env.Client, pod)
+			Eventually(func() bool {
+				current := &corev1.Pod{}
+				return apierrors.IsNotFound(env.Client.Get(ctx, client.ObjectKeyFromObject(pod), current))
+			}, 10*time.Second, 100*time.Millisecond).Should(BeTrue())
+			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+
+			currentNodeClaim = &v1.NodeClaim{}
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim1), currentNodeClaim)).To(Succeed())
+			Expect(standby.IsNodeClaimStandby(currentNodeClaim)).To(BeTrue())
+			node := ExpectNodeExists(ctx, env.Client, node1.Name)
+			Expect(node.Spec.Taints).To(ContainElement(standby.NodeTaint()))
+			Expect(node.Spec.Taints).ToNot(ContainElement(v1.DisruptedNoScheduleTaint))
+			Expect(evictionQueue.Has(pod)).To(BeFalse())
+			Expect(queue.HasAny(stateNode.ProviderID())).To(BeFalse())
+			ExpectMetricCounterValue(disruption.EvacuationCommandsTotal, 1, map[string]string{
+				"outcome":           "completed",
+				metrics.ReasonLabel: "drifted",
+			})
+			ExpectMetricCounterValue(disruption.NodeClaimsEvacuatedTotal, 1, map[string]string{
+				metrics.ReasonLabel:       "drifted",
+				metrics.NodePoolLabel:     nodePool.Name,
+				metrics.CapacityTypeLabel: nodeClaim1.Labels[v1.CapacityTypeLabelKey],
+			})
+			ExpectMetricHistogramSampleCountValue("karpenter_voluntary_disruption_evacuation_duration_seconds", 1, map[string]string{
+				metrics.ReasonLabel: "drifted",
+			})
+		})
+		It("should count each source NodeClaim evacuated by one completed command", func() {
+			evictionQueue := terminator.NewQueue(env.Client, recorder)
+			queue.SetEvictionQueue(evictionQueue)
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1, nodeClaim2, node2)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
+			stateNode1 := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+			stateNode2 := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim2)
+			cmd := &disruption.Command{
+				Method: disruption.NewScoreBasedConsolidation(disruption.MakeConsolidation(
+					env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil,
+				)),
+				CreationTimestamp: env.Clock.Now(),
+				ID:                uuid.New(),
+				Candidates: []*disruption.Candidate{
+					{StateNode: stateNode1, NodePool: nodePool},
+					{StateNode: stateNode2, NodePool: nodePool},
+				},
+				Action: disruption.EvacuateAction,
+			}
+			Expect(queue.StartCommand(ctx, cmd)).To(Succeed())
+
+			ExpectObjectReconciled(ctx, env.Client, queue, stateNode1.NodeClaim)
+
+			labels := map[string]string{
+				metrics.ReasonLabel:       "underutilized",
+				metrics.NodePoolLabel:     nodePool.Name,
+				metrics.CapacityTypeLabel: nodeClaim1.Labels[v1.CapacityTypeLabelKey],
+			}
+			ExpectMetricCounterValue(disruption.EvacuationCommandsTotal, 1, map[string]string{
+				"outcome":           "completed",
+				metrics.ReasonLabel: "underutilized",
+			})
+			ExpectMetricCounterValue(disruption.NodeClaimsEvacuatedTotal, 2, labels)
+		})
+		It("should count evacuation failures without replacements", func() {
+			queue.SetEvictionQueue(nil)
+			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1)
+			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+			cmd := &disruption.Command{
+				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+				CreationTimestamp: env.Clock.Now(),
+				ID:                uuid.New(),
+				Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
+				Action:            disruption.EvacuateAction,
+			}
+			Expect(queue.StartCommand(ctx, cmd)).To(Succeed())
+
+			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+
+			ExpectMetricCounterValue(disruption.EvacuationCommandsTotal, 1, map[string]string{
+				"outcome":           "failed",
+				metrics.ReasonLabel: "drifted",
+			})
+			_, evacuatedMetricExists := FindMetricWithLabelValues("karpenter_nodeclaims_evacuated_total", map[string]string{
+				metrics.ReasonLabel:       "drifted",
+				metrics.NodePoolLabel:     nodePool.Name,
+				metrics.CapacityTypeLabel: nodeClaim1.Labels[v1.CapacityTypeLabelKey],
+			})
+			Expect(evacuatedMetricExists).To(BeFalse(), "failed evacuations should not create an evacuated NodeClaim metric")
+			ExpectMetricHistogramSampleCountValue("karpenter_voluntary_disruption_evacuation_duration_seconds", 1, map[string]string{
+				metrics.ReasonLabel: "drifted",
+			})
 		})
 		It("should finish two commands in order as replacements are initialized", func() {
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1, nodeClaim2, node2)

@@ -95,18 +95,23 @@ type Queue struct {
 
 	source chan event.TypedGenericEvent[*corev1.Pod]
 	set    sets.Set[QueueKey]
+	active map[QueueKey]bool
+	cond   *sync.Cond
 
 	kubeClient client.Client
 	recorder   events.Recorder
 }
 
 func NewQueue(kubeClient client.Client, recorder events.Recorder) *Queue {
-	return &Queue{
+	q := &Queue{
 		source:     make(chan event.TypedGenericEvent[*corev1.Pod], 10000),
 		set:        sets.New[QueueKey](),
+		active:     map[QueueKey]bool{},
 		kubeClient: kubeClient,
 		recorder:   recorder,
 	}
+	q.cond = sync.NewCond(&q.Mutex)
+	return q
 }
 
 func (q *Queue) Name() string {
@@ -150,6 +155,20 @@ func (q *Queue) Add(pods ...*corev1.Pod) {
 	}
 }
 
+// Cancel removes queued pods from the eviction set. It waits for any in-flight eviction request to finish,
+// ensuring no queued request can begin after this method returns.
+func (q *Queue) Cancel(pods ...*corev1.Pod) {
+	q.Lock()
+	defer q.Unlock()
+	for _, pod := range pods {
+		key := NewQueueKey(pod)
+		q.set.Delete(key)
+		for q.active[key] {
+			q.cond.Wait()
+		}
+	}
+}
+
 func (q *Queue) Has(pod *corev1.Pod) bool {
 	q.Lock()
 	defer q.Unlock()
@@ -159,16 +178,33 @@ func (q *Queue) Has(pod *corev1.Pod) bool {
 
 func (q *Queue) Reconcile(ctx context.Context, pod *corev1.Pod) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, q.Name())
-
-	if !q.Has(pod) {
-		//This is a different pod than the one the queue, we should exit without evicting
-		//This race happens when a pod is replaced with one that has the same namespace and name
-		//but a different UID after the original pod is added to the queue but before the
-		//controller can reconcile on it
+	key := NewQueueKey(pod)
+	if !q.beginEviction(key) {
+		// This can be a replacement pod with the same namespace and name but a different UID.
 		return reconcile.Result{}, nil
 	}
-	// Evict the pod
-	if err := q.kubeClient.SubResource("eviction").Create(ctx,
+	err := q.evict(ctx, pod)
+	q.finishEviction(key, err)
+	if err != nil {
+		return q.handleEvictionError(ctx, pod, err)
+	}
+	q.recordSuccessfulEviction(ctx, pod)
+	return reconcile.Result{}, nil
+}
+
+// beginEviction serializes membership with Cancel without holding the queue lock during the API call.
+func (q *Queue) beginEviction(key QueueKey) bool {
+	q.Lock()
+	defer q.Unlock()
+	if !q.set.Has(key) || q.active[key] {
+		return false
+	}
+	q.active[key] = true
+	return true
+}
+
+func (q *Queue) evict(ctx context.Context, pod *corev1.Pod) error {
+	return q.kubeClient.SubResource("eviction").Create(ctx,
 		pod,
 		&policyv1.Eviction{
 			DeleteOptions: &metav1.DeleteOptions{
@@ -176,7 +212,21 @@ func (q *Queue) Reconcile(ctx context.Context, pod *corev1.Pod) (reconcile.Resul
 					UID: new(pod.UID),
 				},
 			},
-		}); err != nil {
+		})
+}
+
+func (q *Queue) finishEviction(key QueueKey, err error) {
+	q.Lock()
+	defer q.Unlock()
+	delete(q.active, key)
+	if err == nil || apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+		q.set.Delete(key)
+	}
+	q.cond.Broadcast()
+}
+
+func (q *Queue) handleEvictionError(ctx context.Context, pod *corev1.Pod, err error) (reconcile.Result, error) {
+	if err != nil {
 		var apiStatus apierrors.APIStatus
 		var message string
 		if errors.As(err, &apiStatus) {
@@ -209,15 +259,14 @@ func (q *Queue) Reconcile(ctx context.Context, pod *corev1.Pod) (reconcile.Resul
 		// Its not a PDB, we should requeue
 		return reconcile.Result{}, err
 	}
+	return reconcile.Result{}, nil
+}
+
+func (q *Queue) recordSuccessfulEviction(ctx context.Context, pod *corev1.Pod) {
 	PodsEvictionRequestsTotal.Inc(map[string]string{CodeLabel: "200"})
 	reason := evictionReason(ctx, pod, q.kubeClient)
 	q.recorder.Publish(terminatorevents.EvictPod(pod, reason))
 	PodsDrainedTotal.Inc(map[string]string{ReasonLabel: reason})
-
-	q.Lock()
-	defer q.Unlock()
-	q.set.Delete(NewQueueKey(pod))
-	return reconcile.Result{}, nil
 }
 
 func evictionReason(ctx context.Context, pod *corev1.Pod, kubeClient client.Client) string {

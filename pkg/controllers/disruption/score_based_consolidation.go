@@ -26,10 +26,15 @@ import (
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/destel/rill"
+	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/events"
+	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
+	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 var ScoreBasedConsolidationTimeoutDuration = 20 * time.Second
@@ -85,16 +90,68 @@ func NewScoreBasedConsolidationValidator(c consolidation) *ConsolidationValidato
 			queue:         c.queue,
 			reason:        v1.DisruptionReasonUnderutilized,
 		},
-		filter:         s.ShouldDisrupt,
+		filter:         s.shouldCompact,
 		validationType: s.ConsolidationType(),
 	}
 }
 
 func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
+	return s.shouldCompact(ctx, cn)
+}
+
+// shouldCompact admits only eligible, non-empty active nodes into normal compaction.
+func (s *ScoreBasedConsolidation) shouldCompact(_ context.Context, cn *Candidate) bool {
+	if !s.compactionCandidateEligible(cn) {
+		return false
+	}
+	return lo.SomeBy(cn.reschedulablePods, func(pod *corev1.Pod) bool {
+		return podutils.IsActive(pod) && podutils.IsReschedulable(pod)
+	})
+}
+
+func (s *ScoreBasedConsolidation) compactionCandidateEligible(cn *Candidate) bool {
+	if cn == nil || cn.Node == nil || cn.NodeClaim == nil || cn.NodePool == nil {
+		return false
+	}
 	if !NodePoolUsesScoreBasedConsolidation(cn.NodePool) {
 		return false
 	}
-	return s.consolidation.ShouldDisrupt(ctx, cn)
+	if cn.NodePool.Spec.Disruption.ConsolidationPolicy != v1.ConsolidationPolicyWhenEmptyOrUnderutilized {
+		return false
+	}
+	if standby.IsNodeClaimActivating(cn.NodeClaim) || standby.IsNodeClaimStandby(cn.NodeClaim) || standby.HasNodeTaint(cn.Node) {
+		return false
+	}
+	return s.compactionConsolidationMetadataEligible(cn)
+}
+
+// compactionConsolidationMetadataEligible duplicates the static-pool, label, and consolidation-policy
+// checks at the start of consolidation.ShouldDisrupt in consolidation.go so score-based compaction
+// does not call into that upstream type. It omits consolidateAfter (including Never), empty-node
+// exclusion (standby/reclamation own empties), and ConditionTypeConsolidatable (score-based pools
+// ignore consolidateAfter timing in the nodeclaim disruption controller).
+func (s *ScoreBasedConsolidation) compactionConsolidationMetadataEligible(cn *Candidate) bool {
+	if cn.OwnedByStaticNodePool() {
+		return false
+	}
+	if cn.instanceType == nil {
+		s.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("Instance Type %q not found", cn.Labels()[corev1.LabelInstanceTypeStable]))...)
+		return false
+	}
+	if _, ok := cn.Labels()[v1.CapacityTypeLabelKey]; !ok {
+		s.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("Node does not have label %q", v1.CapacityTypeLabelKey))...)
+		return false
+	}
+	if _, ok := cn.Labels()[corev1.LabelTopologyZone]; !ok {
+		s.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("Node does not have label %q", corev1.LabelTopologyZone))...)
+		return false
+	}
+	policy := cn.NodePool.Spec.Disruption.ConsolidationPolicy
+	if policy != v1.ConsolidationPolicyWhenEmptyOrUnderutilized && !policy.IsBalanced() {
+		s.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("NodePool %q has non-empty consolidation disabled", cn.NodePool.Name))...)
+		return false
+	}
+	return true
 }
 
 //nolint:gocyclo
@@ -111,6 +168,10 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	candidates = s.SortCandidates(candidates)
 	var validCandidates []*Candidate
 	for _, candidate := range candidates {
+		if candidate == nil || candidate.NodePool == nil ||
+			standby.IsNodeClaimActivating(candidate.NodeClaim) || standby.IsNodeClaimStandby(candidate.NodeClaim) || standby.HasNodeTaint(candidate.Node) {
+			continue
+		}
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			constrainedByBudgets = true
 			continue
@@ -149,13 +210,14 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		case <-s.clock.After(remainingValidationDelay):
 		}
 	}
-	cmd, err := selectFirstStillValidCommand(ctx, s.validator, s.recorder, evals)
+	cmd, err := selectFirstStillValidCommand(ctx, s.validator, s.recorder, evals, s.validateLiveCompactionCommand)
 	if err != nil {
 		return []Command{}, err
 	}
 	if len(cmd.Candidates) == 0 {
 		return []Command{}, nil
 	}
+	cmd.Action = EvacuateAction
 	return []Command{cmd}, nil
 }
 
@@ -279,11 +341,20 @@ func moveSetPriorityScore(moveSet moveSet) float64 {
 	return maxScore
 }
 
-func selectFirstStillValidCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation) (Command, error) {
+func selectFirstStillValidCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation, checks ...func(context.Context, *Command) error) (Command, error) {
 	var firstValidationReason string
 
 	for i, eval := range evals {
-		if _, err := validator.Validate(ctx, eval.Command, 0); err != nil {
+		validated, err := validator.Validate(ctx, eval.Command, 0)
+		if err == nil && len(checks) > 0 {
+			for _, check := range checks {
+				if checkErr := check(ctx, &validated); checkErr != nil {
+					err = checkErr
+					break
+				}
+			}
+		}
+		if err != nil {
 			if IsValidationError(err) {
 				if i == 0 {
 					firstValidationReason = getValidationFailureReason(err)
@@ -292,7 +363,7 @@ func selectFirstStillValidCommand(ctx context.Context, validator Validator, reco
 			}
 			return Command{}, fmt.Errorf("validating score-based consolidation, %w", err)
 		}
-		return eval.Command, nil
+		return validated, nil
 	}
 	if firstValidationReason != "" {
 		evals[0].Command.EmitRejectedEvents(recorder, firstValidationReason)

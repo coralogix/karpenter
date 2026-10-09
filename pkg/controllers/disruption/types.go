@@ -228,6 +228,21 @@ type Command struct {
 	Method
 
 	Succeeded bool
+	// Action overrides the default replace/delete behavior inferred from candidates and replacements.
+	Action CommandAction
+	// BeforeDelete validates candidates immediately before a delete action is applied. It may
+	// refresh candidate objects so conditional deletion uses the validated resource versions.
+	BeforeDelete func(context.Context, []*Candidate) error
+	// DeleteWithPreconditions makes the queue delete candidates using their current UID and
+	// resourceVersion, so a concurrent update invalidates the delete instead of being lost.
+	DeleteWithPreconditions bool
+	// OnSuccess runs after the action is committed, before the command leaves the orchestration queue.
+	OnSuccess func(context.Context) error
+	// OnDeleteSuccess runs after each source NodeClaim delete succeeds.
+	OnDeleteSuccess func(context.Context, *Candidate) error
+
+	deletionExecution   *deletionExecutionState
+	evacuationExecution *evacuationExecutionState
 
 	staticNodeCountReservationHandedOff bool
 
@@ -250,13 +265,30 @@ func (c Command) Reason() v1.DisruptionReason {
 
 type Decision string
 
+type CommandAction string
+
 var (
-	NoOpDecision    Decision = "no-op"
-	ReplaceDecision Decision = "replace"
-	DeleteDecision  Decision = "delete"
+	NoOpDecision     Decision = "no-op"
+	ReplaceDecision  Decision = "replace"
+	DeleteDecision   Decision = "delete"
+	EvacuateDecision Decision = "evacuate"
+	StandbyDecision  Decision = "standby"
+
+	DeleteAction   CommandAction = "delete"
+	EvacuateAction CommandAction = "evacuate"
+	StandbyAction  CommandAction = "standby"
 )
 
 func (c Command) Decision() Decision {
+	if c.Action == StandbyAction && len(c.Candidates) > 0 {
+		return StandbyDecision
+	}
+	if c.Action == EvacuateAction && len(c.Candidates) > 0 {
+		return EvacuateDecision
+	}
+	if c.Action == DeleteAction && len(c.Candidates) > 0 {
+		return DeleteDecision
+	}
 	switch {
 	case len(c.Candidates) > 0 && len(c.Replacements) > 0:
 		return ReplaceDecision
@@ -363,6 +395,11 @@ func (c Command) SourceCost() float64 {
 // available compatible offering contributes 0 to destination cost and inflates
 // them.
 func (c Command) EstimatedSavings() float64 {
+	if c.Action == EvacuateAction || c.Action == StandbyAction {
+		// Evacuation and empty-to-standby both retain the source node. Savings are realized only if
+		// a later reclamation pass removes it.
+		return 0
+	}
 	sourcePrice := c.SourceCost()
 
 	// For delete consolidation, all source cost is savings
@@ -370,20 +407,22 @@ func (c Command) EstimatedSavings() float64 {
 		return sourcePrice
 	}
 
-	// For replace consolidation, sum destination costs from all replacement NodeClaims.
+	return sourcePrice - replacementCostUSDPerHour(c)
+}
+
+// replacementCostUSDPerHour returns the estimated replacement cost for realized savings.
+func replacementCostUSDPerHour(cmd Command) float64 {
 	destPrice := 0.0
-	for _, nodeClaim := range c.Results.NewNodeClaims {
-		if len(nodeClaim.InstanceTypeOptions) > 0 {
-			available := nodeClaim.InstanceTypeOptions[0].Offerings.
-				Available().                       // Filter to available offerings so ICE'd zones don't produce an optimistic estimate.
-				Compatible(nodeClaim.Requirements) // Filter to only consider allowed offerings
-			if len(available) > 0 {
-				destPrice += available.Cheapest().Price
-			}
+	for _, nodeClaim := range cmd.Results.NewNodeClaims {
+		if len(nodeClaim.InstanceTypeOptions) == 0 {
+			continue
+		}
+		offerings := nodeClaim.InstanceTypeOptions[0].Offerings.Available().Compatible(nodeClaim.Requirements)
+		if len(offerings) > 0 {
+			destPrice += offerings.Cheapest().Price
 		}
 	}
-
-	return sourcePrice - destPrice
+	return destPrice
 }
 
 // EmitCandidateEvents emits ConsolidationCandidate events for all candidates in this command

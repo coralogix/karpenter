@@ -109,8 +109,8 @@ func newClusterFixtureBench(dir string) (*clusterFixtureBench, error) {
 
 	env.Provisioner = provisioning.NewProvisioner(env.Client, env.Recorder, env.CloudProvider, env.Cluster, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client))
 	queue := NewQueue(env.Client, env.Recorder, env.Cluster, env.Clock, env.Provisioner)
-	consolidation := MakeConsolidation(env.Clock, env.Cluster, env.Client, env.Provisioner, env.CloudProvider, env.Recorder, queue, nil)
-	scoreBased := &ScoreBasedConsolidation{consolidation: consolidation}
+	consolidator := MakeConsolidation(env.Clock, env.Cluster, env.Client, env.Provisioner, env.CloudProvider, env.Recorder, queue, nil)
+	scoreBased := &ScoreBasedConsolidation{consolidation: consolidator}
 
 	candidates, err := GetCandidates(ctx, env.Cluster, env.Client, env.Recorder, env.Clock, env.CloudProvider, scoreBased.ShouldDisrupt, GracefulDisruptionClass, queue)
 	if err != nil {

@@ -61,6 +61,10 @@ const (
 	DisruptionPacingPerMinuteAnnotationKey = "karpenter.coralogix.net/disruption-pacing-per-minute"
 	DisruptionPacingPerBatchAnnotationKey  = "karpenter.coralogix.net/disruption-pacing-per-batch"
 	ScoreBasedConsolidationAnnotationKey   = "karpenter.coralogix.net/score-based-consolidation"
+	// ReclamationStandbyDelayAnnotationKey configures how long empty standby nodes must
+	// remain in standby before reclamation may remove them. Values use Go duration
+	// syntax; missing or invalid values use the 15s default. Explicit 0s disables the soak.
+	ReclamationStandbyDelayAnnotationKey = "karpenter.coralogix.net/reclamation-standby-delay"
 )
 
 // Karpenter specific finalizers

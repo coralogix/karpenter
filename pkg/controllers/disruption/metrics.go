@@ -35,6 +35,9 @@ const (
 	phaseGetPendingPods          = "get_pending_pods"
 	phaseNewScheduler            = "new_scheduler"
 	phaseSolve                   = "solve"
+	evacuationOutcomeLabel       = "outcome"
+	evacuationOutcomeCompleted   = "completed"
+	evacuationOutcomeFailed      = "failed"
 )
 
 func init() {
@@ -186,5 +189,26 @@ var (
 			Help:      "Number of balanced consolidation moves. Labeled by decision, NodePool, and policy.",
 		},
 		[]string{decisionLabel, metrics.NodePoolLabel, policyLabel},
+	)
+	EvacuationCommandsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "evacuation_commands_total",
+			Help:      "Number of evacuation commands completed or failed. Completion means source nodes were handed off to standby. Labeled by outcome and disruption reason.",
+		},
+		[]string{evacuationOutcomeLabel, metrics.ReasonLabel},
+	)
+	EvacuationDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "evacuation_duration_seconds",
+			Help:      "Time from starting an evacuation command until it completes or fails. Labeled by disruption reason.",
+			Buckets:   metrics.DurationBuckets(),
+		},
+		[]string{metrics.ReasonLabel},
 	)
 )
