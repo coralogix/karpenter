@@ -328,7 +328,7 @@ func TestSelectFirstValidatedCommand_validationFallback(t *testing.T) {
 	}
 	validator := rejectFirstCommandValidator{}
 
-	cmd, err := selectFirstStillValidCommand(ctx, validator, recorder, evals)
+	cmd, err := selectFirstStillValidCommand(ctx, validator, recorder, evals, nil)
 	if err != nil {
 		t.Fatalf("selectFirstValidatedCommand() error = %v", err)
 	}
@@ -358,7 +358,7 @@ func TestSelectFirstValidatedCommand_emitsRejectedEventOnlyForFirstEvalWhenAllFa
 		{Command: Command{Candidates: []*Candidate{lowScoreCandidate}}, Score: 0.10},
 	}
 
-	cmd, err := selectFirstStillValidCommand(ctx, rejectAllCommandValidator{}, recorder, evals)
+	cmd, err := selectFirstStillValidCommand(ctx, rejectAllCommandValidator{}, recorder, evals, nil)
 	if err != nil {
 		t.Fatalf("selectFirstValidatedCommand() error = %v", err)
 	}

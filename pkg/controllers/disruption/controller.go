@@ -38,7 +38,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
-	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -47,13 +46,11 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
-	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
 
 type Controller struct {
 	queue            *Queue
 	kubeClient       client.Client
-	nodePoolReader   client.Reader
 	cluster          *state.Cluster
 	provisioner      *provisioning.Provisioner
 	recorder         events.Recorder
@@ -72,7 +69,6 @@ const pollingPeriod = 10 * time.Second
 type ControllerOptions struct {
 	methods          []Method
 	disruptionPacing *DisruptionPacing
-	nodePoolReader   client.Reader
 }
 
 func WithMethods(methods ...Method) option.Function[ControllerOptions] {
@@ -83,10 +79,6 @@ func WithMethods(methods ...Method) option.Function[ControllerOptions] {
 
 func WithDisruptionPacing(pace *DisruptionPacing) option.Function[ControllerOptions] {
 	return func(o *ControllerOptions) { o.disruptionPacing = pace }
-}
-
-func WithNodePoolReader(reader client.Reader) option.Function[ControllerOptions] {
-	return func(o *ControllerOptions) { o.nodePoolReader = reader }
 }
 
 func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
@@ -101,15 +93,10 @@ func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provi
 	if methods == nil {
 		methods = NewMethods(clk, cluster, kubeClient, provisioner, cp, recorder, queue, pace)
 	}
-	nodePoolReader := o.nodePoolReader
-	if nodePoolReader == nil {
-		nodePoolReader = kubeClient
-	}
 	return &Controller{
 		queue:            queue,
 		clock:            clk,
 		kubeClient:       kubeClient,
-		nodePoolReader:   nodePoolReader,
 		cluster:          cluster,
 		provisioner:      provisioner,
 		recorder:         recorder,
@@ -128,15 +115,15 @@ func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Clien
 	}
 	c := MakeConsolidation(clk, cluster, kubeClient, provisioner, cp, recorder, queue, pace)
 	return []Method{
-		// Delete empty nodes across all consolidation policies (WhenEmpty, WhenEmptyOrUnderutilized, Balanced).
 		NewEmptiness(c),
+		NewStandbyMarking(c),
+		NewReclamation(c),
 		// Terminate and create replacement for drifted NodeClaims in Static NodePool
 		NewStaticDrift(cluster, provisioner, cp, pace),
 		// Terminate any NodeClaims that have drifted from provisioning specifications, allowing the pods to reschedule.
 		NewDrift(kubeClient, cluster, provisioner, recorder, clk, pace),
 		// Attempt to identify multiple NodeClaims that we can consolidate simultaneously to reduce pod churn
 		NewMultiNodeConsolidation(c),
-		// Score-based consolidation for NodePools that opt in via annotation.
 		NewScoreBasedConsolidation(c),
 		// And finally fall back our single NodeClaim consolidation to further reduce cluster cost.
 		NewSingleNodeConsolidation(c),
@@ -176,23 +163,11 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{}, fmt.Errorf("refreshing disruption pacing policy, %w", err)
 	}
 
-	// Karpenter taints nodes with a karpenter.sh/disruption taint as part of the disruption process while it progresses in memory.
-	// If Karpenter restarts or fails with an error during a disruption action, some nodes can be left tainted.
-	// Idempotently remove this taint from candidates that are not in the orchestration queue before continuing.
-	outdatedNodes := lo.Reject(c.cluster.DeepCopyNodes(), func(s *state.StateNode, _ int) bool {
-		return c.queue.HasAny(s.ProviderID()) || s.MarkedForDeletion()
-	})
-	if err := state.RequireNoScheduleTaint(ctx, c.kubeClient, false, outdatedNodes...); err != nil {
+	if err := c.queue.cleanupStaleDisruptionState(ctx); err != nil {
 		if errors.IsConflict(err) {
 			return reconciler.Result{Requeue: true}, nil
 		}
-		return reconciler.Result{}, serrors.Wrap(fmt.Errorf("removing taint from nodes, %w", err), "taint", pretty.Taint(v1.DisruptedNoScheduleTaint))
-	}
-	if err := state.ClearNodeClaimsCondition(ctx, c.kubeClient, c.clock, v1.ConditionTypeDisruptionReason, outdatedNodes...); err != nil {
-		if errors.IsConflict(err) {
-			return reconciler.Result{Requeue: true}, nil
-		}
-		return reconciler.Result{}, serrors.Wrap(fmt.Errorf("removing condition from nodeclaims, %w", err), "condition", v1.ConditionTypeDisruptionReason)
+		return reconciler.Result{}, err
 	}
 
 	return c.reconcileMethods(ctx)
@@ -223,7 +198,16 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		metrics.ReasonLabel:    strings.ToLower(string(disruption.Reason())),
 		ConsolidationTypeLabel: disruption.ConsolidationType(),
 	})()
-	candidates, nodePoolTotals, err := GetCandidatesWithTotals(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, disruption.ShouldDisrupt, disruption.Class(), c.queue, c.clusterCost)
+	var (
+		candidates     []*Candidate
+		nodePoolTotals map[string]NodePoolTotals
+		err            error
+	)
+	if reclamation, ok := disruption.(*Reclamation); ok {
+		candidates, err = reclamation.candidates(ctx)
+	} else {
+		candidates, nodePoolTotals, err = GetCandidatesWithTotals(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, disruption.ShouldDisrupt, disruption.Class(), c.queue, c.clusterCost)
+	}
 	if err != nil {
 		return false, fmt.Errorf("determining candidates, %w", err)
 	}
@@ -236,10 +220,10 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		return false, nil
 	}
 	// Pass precomputed NodePool totals to consolidation methods for balanced scoring
-	if setter, ok := disruption.(NodePoolTotalsSetter); ok {
+	if setter, ok := disruption.(NodePoolTotalsSetter); ok && nodePoolTotals != nil {
 		setter.SetNodePoolTotals(nodePoolTotals)
 	}
-	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, c.recorder, disruption.Reason())
+	disruptionBudgetMapping, err := c.budgetMappingForMethod(ctx, disruption)
 	if err != nil {
 		return false, fmt.Errorf("building disruption budgets, %w", err)
 	}

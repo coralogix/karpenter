@@ -40,6 +40,23 @@ type Consolidation struct {
 func (c *Consolidation) Reconcile(ctx context.Context, nodePool *v1.NodePool, nodeClaim *v1.NodeClaim) (reconcile.Result, error) {
 	clockOpt := status.WithClock(c.clock)
 	hasConsolidatableCondition := nodeClaim.StatusConditions().Get(v1.ConditionTypeConsolidatable) != nil
+	initialized := nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized)
+
+	// Score-based consolidation does not use consolidateAfter as an eligibility floor.
+	if nodePoolUsesScoreBasedConsolidation(nodePool) {
+		if !initialized.IsTrue() {
+			if hasConsolidatableCondition {
+				_ = nodeClaim.StatusConditions().Clear(v1.ConditionTypeConsolidatable)
+				log.FromContext(ctx).V(1).Info("removing consolidatable status condition, isn't initialized")
+			}
+			return reconcile.Result{}, nil
+		}
+		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+		if !hasConsolidatableCondition {
+			log.FromContext(ctx).V(1).Info("marking consolidatable")
+		}
+		return reconcile.Result{}, nil
+	}
 
 	// 1. If Consolidation isn't enabled, remove the consolidatable status condition
 	if nodePool.Spec.Disruption.ConsolidateAfter.Duration == nil {
@@ -49,7 +66,6 @@ func (c *Consolidation) Reconcile(ctx context.Context, nodePool *v1.NodePool, no
 		}
 		return reconcile.Result{}, nil
 	}
-	initialized := nodeClaim.StatusConditions().Get(v1.ConditionTypeInitialized)
 	// 2. If NodeClaim is not initialized, remove the consolidatable status condition
 	if !initialized.IsTrue() {
 		if hasConsolidatableCondition {
@@ -82,4 +98,12 @@ func (c *Consolidation) Reconcile(ctx context.Context, nodePool *v1.NodePool, no
 		log.FromContext(ctx).V(1).Info("marking consolidatable")
 	}
 	return reconcile.Result{}, nil
+}
+
+func nodePoolUsesScoreBasedConsolidation(nodePool *v1.NodePool) bool {
+	if nodePool.Spec.Replicas != nil || nodePool.Spec.Disruption.ConsolidationPolicy != v1.ConsolidationPolicyWhenEmptyOrUnderutilized {
+		return false
+	}
+	_, ok := nodePool.Annotations[v1.ScoreBasedConsolidationAnnotationKey]
+	return ok
 }

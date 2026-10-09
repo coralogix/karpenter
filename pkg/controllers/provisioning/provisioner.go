@@ -58,6 +58,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
+	"sigs.k8s.io/karpenter/pkg/standby"
 	"sigs.k8s.io/karpenter/pkg/utils/daemonset"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
@@ -84,6 +85,7 @@ func WithReason(reason string) func(*LaunchOptions) {
 type Provisioner struct {
 	cloudProvider              cloudprovider.CloudProvider
 	kubeClient                 client.Client
+	standbyCoordinator         *standby.Coordinator
 	batcher                    *Batcher[types.UID]
 	volumeTopology             *scheduler.VolumeTopology
 	cluster                    *state.Cluster
@@ -97,11 +99,13 @@ type Provisioner struct {
 func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 	cloudProvider cloudprovider.CloudProvider, cluster *state.Cluster,
 	clock clock.Clock, deviceAllocationController *deviceallocation.Controller, virtualPodCache *virtualpods.Cache,
+	standbyCoordinator *standby.Coordinator,
 ) *Provisioner {
 	p := &Provisioner{
 		batcher:                    NewBatcher[types.UID](clock),
 		cloudProvider:              cloudProvider,
 		kubeClient:                 kubeClient,
+		standbyCoordinator:         standbyCoordinator,
 		volumeTopology:             scheduler.NewVolumeTopology(kubeClient),
 		cluster:                    cluster,
 		recorder:                   recorder,
@@ -427,23 +431,15 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	// as persistent capacity for the cluster (since it will soon be removed). Additionally, we are scheduling for
 	// the pods that are on these nodes so the MarkedForDeletion node capacity can't be considered.
 	nodes := p.cluster.DeepCopyNodes()
+	if err := p.resumeStandbyActivations(ctx, nodes); err != nil {
+		return scheduler.Results{}, fmt.Errorf("resuming standby activation, %w", err)
+	}
 
 	// Get pods, exit if nothing to do
-	pendingPods, err := p.GetPendingPods(ctx)
+	pendingPods, deletingNodePods, pods, err := p.schedulingPods(ctx, nodes)
 	if err != nil {
 		return scheduler.Results{}, err
 	}
-
-	// Get pods from nodes that are preparing for deletion
-	// We do this after getting the pending pods so that we undershoot if pods are
-	// actively migrating from a node that is being deleted
-	// NOTE: The assumption is that these nodes are cordoned and no additional pods will schedule to them
-	deletingNodePods, err := nodes.Deleting().CurrentlyReschedulablePods(ctx, p.kubeClient, p.clock, p.recorder)
-	if err != nil {
-		return scheduler.Results{}, err
-	}
-
-	pods := append(pendingPods, deletingNodePods...)
 	// nothing to schedule, so just return success
 	if len(pods) == 0 {
 		return scheduler.Results{}, nil
@@ -459,34 +455,25 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	if options.FromContext(ctx).PreferencePolicy == options.PreferencePolicyIgnore {
 		opts = append(opts, scheduler.IgnorePreferences)
 	}
-	s, err := p.NewScheduler(
-		ctx,
-		pods,
-		nodes.Active(),
-		deletingPodUIDs,
-		opts...,
-	)
+	results, err := p.solveWithStandbyActivation(ctx, pods, nodes, deletingPodUIDs, opts)
 	if err != nil {
-		if errors.Is(err, ErrNodePoolsNotFound) {
-			log.FromContext(ctx).Info("no dynamic nodepools found")
-			p.cluster.MarkPodSchedulingDecisions(ctx, lo.SliceToMap(pods, func(p *corev1.Pod) (*corev1.Pod, error) {
-				return p, fmt.Errorf("no dynamic nodepools found")
-			}), nil, nil)
-			return scheduler.Results{}, nil
-		}
-		return scheduler.Results{}, fmt.Errorf("creating scheduler, %w", err)
-	}
-
-	// Timeout the Solve() method after 1m to ensure that we move faster through provisioning
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-
-	results, err := s.Solve(timeoutCtx, pods)
-	// context errors are ignored because we want to finish provisioning for what has already been scheduled
-	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
 		return scheduler.Results{}, err
 	}
-	results = results.TruncateInstanceTypes(ctx, scheduler.MaxInstanceTypes)
+	p.logSchedulingResults(ctx, results, pods, start)
+	// Mark in memory when these pods were marked as schedulable or when we made a decision on the pods.
+	// Virtual buffer pods are excluded — they never exist in etcd, so their entries would never be
+	// cleaned up and would leak memory when buffers are deleted or scaled down.
+	p.cluster.MarkPodSchedulingDecisions(ctx,
+		filterVirtualPodErrors(results.PodErrors),
+		filterVirtualPodMapping(results.NodePoolToPodMapping()),
+		// Only passing existing nodes here and not new nodeClaims because
+		// these nodeClaims don't have a name until they are created
+		filterVirtualPodMapping(results.ExistingNodeToPodMapping()))
+	results.Record(ctx, p.recorder, p.cluster)
+	return results, nil
+}
+
+func (p *Provisioner) logSchedulingResults(ctx context.Context, results scheduler.Results, pods []*corev1.Pod, start time.Time) {
 	reservedOfferingErrors := results.ReservedOfferingErrors()
 	if len(reservedOfferingErrors) != 0 {
 		log.FromContext(ctx).V(1).WithValues(
@@ -510,17 +497,20 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 			"duration", time.Since(start),
 		).Info("found provisionable pod(s)")
 	}
-	// Mark in memory when these pods were marked as schedulable or when we made a decision on the pods.
-	// Virtual buffer pods are excluded — they never exist in etcd, so their entries would never be
-	// cleaned up and would leak memory when buffers are deleted or scaled down.
-	p.cluster.MarkPodSchedulingDecisions(ctx,
-		filterVirtualPodErrors(results.PodErrors),
-		filterVirtualPodMapping(results.NodePoolToPodMapping()),
-		// Only passing existing nodes here and not new nodeClaims because
-		// these nodeClaims don't have a name until they are created
-		filterVirtualPodMapping(results.ExistingNodeToPodMapping()))
-	results.Record(ctx, p.recorder, p.cluster)
-	return results, nil
+}
+
+func (p *Provisioner) schedulingPods(ctx context.Context, nodes state.StateNodes) ([]*corev1.Pod, []*corev1.Pod, []*corev1.Pod, error) {
+	pendingPods, err := p.GetPendingPods(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// Get pods from nodes that are preparing for deletion after pending pods
+	// so nodes only contribute capacity before their pods start migrating.
+	deletingNodePods, err := nodes.Deleting().CurrentlyReschedulablePods(ctx, p.kubeClient, p.clock, p.recorder)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return pendingPods, deletingNodePods, append(pendingPods, deletingNodePods...), nil
 }
 
 func (p *Provisioner) Create(ctx context.Context, n *scheduler.NodeClaim, opts ...option.Function[LaunchOptions]) (string, error) {

@@ -38,20 +38,21 @@ func TestAdmissionRejectsEmptyCandidateMissingFromFinalManagedSnapshot(t *testin
 		Kind:  "TestNodeClass",
 		Name:  "test",
 	}
-	planningClient := fake.NewClientBuilder().WithScheme(clientgoscheme.Scheme).WithObjects(nodePool).Build()
-	finalReader := fake.NewClientBuilder().WithScheme(clientgoscheme.Scheme).Build()
+	kubeClient := fake.NewClientBuilder().WithScheme(clientgoscheme.Scheme).WithObjects(nodePool).Build()
 	cloudProvider := cloudproviderfake.NewCloudProvider()
 
-	plannedPools, err := listManagedNodePools(ctx, planningClient, cloudProvider)
+	plannedPools, err := listManagedNodePools(ctx, kubeClient, cloudProvider)
 	if err != nil || len(plannedPools) != 1 {
 		t.Fatalf("planned managed NodePools = %d, error = %v; want one pool", len(plannedPools), err)
 	}
 
 	controller := &Controller{
-		kubeClient:       planningClient,
-		nodePoolReader:   finalReader,
+		kubeClient:       kubeClient,
 		cloudProvider:    cloudProvider,
 		disruptionPacing: NewDisruptionPacing(clocktesting.NewFakeClock(time.Now())),
+	}
+	if err := kubeClient.Delete(ctx, nodePool); err != nil {
+		t.Fatalf("deleting NodePool from cached view before admission: %v", err)
 	}
 	accepted, err := controller.admitCommands(ctx, &Drift{}, []Command{*paceCommand(nodePool)}, true)
 	if err != nil {

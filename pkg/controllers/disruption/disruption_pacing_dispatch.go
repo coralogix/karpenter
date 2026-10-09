@@ -162,11 +162,7 @@ func (c *Controller) refreshDisruptionPacing(ctx context.Context) error {
 }
 
 func (c *Controller) refreshDisruptionPacingForAdmission(ctx context.Context) error {
-	reader := c.nodePoolReader
-	if reader == nil {
-		reader = c.kubeClient
-	}
-	return c.refreshDisruptionPacingFrom(ctx, reader)
+	return c.refreshDisruptionPacingFrom(ctx, c.kubeClient)
 }
 
 func (c *Controller) refreshDisruptionPacingFrom(ctx context.Context, reader client.Reader) error {

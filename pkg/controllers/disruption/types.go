@@ -37,6 +37,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -228,6 +229,12 @@ type Command struct {
 	Method
 
 	Succeeded bool
+	Action    CommandAction
+
+	// The queue schedules a command through its first candidate and serializes that request.
+	// Deletion workers own distinct progress entries and join before the next retry.
+	deletionProgress []deletionProgress
+	evacuationPods   map[terminator.QueueKey]*corev1.Pod
 
 	staticNodeCountReservationHandedOff bool
 
@@ -250,13 +257,26 @@ func (c Command) Reason() v1.DisruptionReason {
 
 type Decision string
 
+type CommandAction string
+
 var (
-	NoOpDecision    Decision = "no-op"
-	ReplaceDecision Decision = "replace"
-	DeleteDecision  Decision = "delete"
+	NoOpDecision     Decision = "no-op"
+	ReplaceDecision  Decision = "replace"
+	DeleteDecision   Decision = "delete"
+	EvacuateDecision Decision = "evacuate"
+	StandbyDecision  Decision = "standby"
+
+	EvacuateAction CommandAction = "evacuate"
+	StandbyAction  CommandAction = "standby"
 )
 
 func (c Command) Decision() Decision {
+	if c.Action == StandbyAction && len(c.Candidates) > 0 {
+		return StandbyDecision
+	}
+	if c.Action == EvacuateAction && len(c.Candidates) > 0 {
+		return EvacuateDecision
+	}
 	switch {
 	case len(c.Candidates) > 0 && len(c.Replacements) > 0:
 		return ReplaceDecision
@@ -363,6 +383,9 @@ func (c Command) SourceCost() float64 {
 // available compatible offering contributes 0 to destination cost and inflates
 // them.
 func (c Command) EstimatedSavings() float64 {
+	if c.Action == EvacuateAction || c.Action == StandbyAction {
+		return 0 // retained nodes; savings apply only if reclamation later removes them
+	}
 	sourcePrice := c.SourceCost()
 
 	// For delete consolidation, all source cost is savings
@@ -370,20 +393,21 @@ func (c Command) EstimatedSavings() float64 {
 		return sourcePrice
 	}
 
-	// For replace consolidation, sum destination costs from all replacement NodeClaims.
+	return sourcePrice - replacementCostUSDPerHour(c)
+}
+
+func replacementCostUSDPerHour(cmd Command) float64 {
 	destPrice := 0.0
-	for _, nodeClaim := range c.Results.NewNodeClaims {
-		if len(nodeClaim.InstanceTypeOptions) > 0 {
-			available := nodeClaim.InstanceTypeOptions[0].Offerings.
-				Available().                       // Filter to available offerings so ICE'd zones don't produce an optimistic estimate.
-				Compatible(nodeClaim.Requirements) // Filter to only consider allowed offerings
-			if len(available) > 0 {
-				destPrice += available.Cheapest().Price
-			}
+	for _, nodeClaim := range cmd.Results.NewNodeClaims {
+		if len(nodeClaim.InstanceTypeOptions) == 0 {
+			continue
+		}
+		offerings := nodeClaim.InstanceTypeOptions[0].Offerings.Available().Compatible(nodeClaim.Requirements)
+		if len(offerings) > 0 {
+			destPrice += offerings.Cheapest().Price
 		}
 	}
-
-	return sourcePrice - destPrice
+	return destPrice
 }
 
 // EmitCandidateEvents emits ConsolidationCandidate events for all candidates in this command

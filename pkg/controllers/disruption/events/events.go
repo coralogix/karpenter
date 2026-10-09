@@ -67,6 +67,26 @@ func Terminating(node *corev1.Node, nodeClaim *v1.NodeClaim, reason string) []ev
 	}
 }
 
+// StandbyMarked reports that an already-empty Node was retained as standby capacity.
+func StandbyMarked(node *corev1.Node, nodeClaim *v1.NodeClaim) []events.Event {
+	return []events.Event{
+		{
+			InvolvedObject: node,
+			Type:           corev1.EventTypeNormal,
+			Reason:         "Standby",
+			Message:        "Marked empty Node as standby",
+			DedupeValues:   []string{string(node.UID)},
+		},
+		{
+			InvolvedObject: nodeClaim,
+			Type:           corev1.EventTypeNormal,
+			Reason:         "Standby",
+			Message:        "Marked empty NodeClaim as standby",
+			DedupeValues:   []string{string(nodeClaim.UID)},
+		},
+	}
+}
+
 // Unconsolidatable is an event that informs the user that a NodeClaim/Node combination cannot be consolidated
 // due to the state of the NodeClaim/Node or due to some state of the pods that are scheduled to the NodeClaim/Node
 func Unconsolidatable(node *corev1.Node, nodeClaim *v1.NodeClaim, msg string) []events.Event {

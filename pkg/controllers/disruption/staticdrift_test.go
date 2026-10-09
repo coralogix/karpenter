@@ -17,6 +17,8 @@ limitations under the License.
 package disruption_test
 
 import (
+	"context"
+	"fmt"
 	"strconv"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -30,7 +32,12 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	"sigs.k8s.io/karpenter/pkg/controllers/disruption/testsupport"
+	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/standby"
+	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
@@ -70,6 +77,42 @@ var _ = Describe("StaticDrift", func() {
 				},
 			},
 		})
+	})
+
+	It("restores static NodePool accounting when replacement creation fails", func() {
+		nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
+		ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController,
+			[]*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
+
+		failedClient := &nodeClaimCreateFailureClient{
+			Client: env.Client,
+			pendingDisruptionCount: func() int {
+				_, _, pending := cluster.NodePoolState.GetNodeCount(nodePool.Name)
+				return pending
+			},
+		}
+		failedProvisioner := provisioning.NewProvisioner(failedClient, recorder, cloudProvider, cluster, env.Clock,
+			deviceallocation.NewController(failedClient), virtualpods.NewVirtualPodCache(failedClient), standby.NewCoordinator(failedClient, failedClient))
+		failedQueue := testsupport.NewTestQueue(failedClient, recorder, cluster, env.Clock, failedProvisioner, nil)
+		method := disruption.NewStaticDrift(cluster, failedProvisioner, cloudProvider, disruptionPacing)
+		candidates, err := disruption.GetCandidates(ctx, cluster, failedClient, recorder, env.Clock, cloudProvider,
+			method.ShouldDisrupt, method.Class(), failedQueue)
+		Expect(err).To(Succeed())
+		commands, err := method.ComputeCommands(ctx, map[string]int{nodePool.Name: 1}, candidates...)
+		Expect(err).To(Succeed())
+		Expect(commands).To(HaveLen(1))
+		commands[0].Method = method
+
+		Expect(failedQueue.StartCommand(ctx, &commands[0])).To(HaveOccurred())
+		Expect(failedClient.pendingDisruption).To(Equal(1), "marking must reach pending disruption before replacement creation")
+
+		ExpectStateNodePoolCount(cluster, nodePool.Name, 1, 0, 0)
+		currentNode := ExpectNodeExists(ctx, env.Client, node.Name)
+		Expect(currentNode.Spec.Taints).ToNot(ContainElement(v1.DisruptedNoScheduleTaint))
+		currentClaim := &v1.NodeClaim{}
+		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), currentClaim)).To(Succeed())
+		Expect(currentClaim.StatusConditions().Get(v1.ConditionTypeDisruptionReason).IsTrue()).To(BeFalse())
 	})
 
 	It("should apply the non-empty batch cap before reserving static drift slots", func() {
@@ -976,3 +1019,17 @@ var _ = Describe("StaticDrift", func() {
 		})
 	})
 })
+
+type nodeClaimCreateFailureClient struct {
+	client.Client
+	pendingDisruptionCount func() int
+	pendingDisruption      int
+}
+
+func (c *nodeClaimCreateFailureClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	if _, ok := obj.(*v1.NodeClaim); ok {
+		c.pendingDisruption = c.pendingDisruptionCount()
+		return fmt.Errorf("injected replacement NodeClaim creation failure")
+	}
+	return c.Client.Create(ctx, obj, opts...)
+}
