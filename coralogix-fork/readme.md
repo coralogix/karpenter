@@ -11,9 +11,8 @@ Warning: At the moment this documentation is mostly LLM generated (quality may v
 
 ## Experimental Features
 
-- [Score-based consolidation](score-based-consolidation.md) — compaction, standby, and reclamation for opted-in NodePools
-- [Compaction and reclamation design](compaction-and-reclamation-design.md) — separation of workload evacuation, standby retention, and empty-node deletion
-- [Standby coordinator](standby-coordinator-design.md) — `pkg/standby.Coordinator` owns activation, enter-standby, and repair transitions
+- [Score-based consolidation](score-based-consolidation.md) — compaction search, pacing, and scoring for opted-in NodePools
+- [Compaction, standby, and reclamation](compaction-standby-reclamation.md) — evacuation retention, standby marking, reclamation, and configuration
 - OpenTelemetry tracing (`pkg/cxtracing`) — spans aligned with fork scheduling/disruption phase metrics; export via standard `OTEL_*` env vars (configured in [eng-karpenter](https://github.com/coralogix/eng-karpenter))
 
 ## Rollback to upstream

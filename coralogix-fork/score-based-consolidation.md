@@ -1,12 +1,12 @@
 # Score-based consolidation
 
-This fork adds score-based disruption for NodePools that opt in via annotation. **Compaction** evicts workloads from underused nodes but leaves the emptied node in place (evacuation). **Standby** marks naturally empty active nodes as retained capacity. **Reclamation** deletes all validated standby empty nodes that have completed the standby soak on each disruption pass. Compaction still uses `nodePriorityScore` as a search-guidance heuristic (price divided by non-daemon pod CPU/memory requests). See [Compaction and reclamation design](compaction-and-reclamation-design.md) for the full flow.
+This fork adds score-based disruption for NodePools that opt in via annotation. **Compaction** evicts workloads from underused nodes but leaves the emptied node in place (evacuation). **Standby** marks naturally empty active nodes as retained capacity. **Reclamation** deletes all validated standby empty nodes that have completed the standby soak on each disruption pass. Compaction still uses `nodePriorityScore` as a search-guidance heuristic (price divided by non-daemon pod CPU/memory requests). See [Compaction, standby, and reclamation](compaction-standby-reclamation.md) for lifecycle, configuration, and observability.
 
 | Annotation | Meaning |
 |------------|---------|
 | `karpenter.coralogix.net/reclamation-standby-delay` | Minimum time empty standby nodes must remain in standby before reclamation (default 15s; `0s` disables) |
 
-NodeClaims in standby store `karpenter.coralogix.net/standby` as the RFC3339Nano UTC time standby began. Legacy `true` values remain supported and skip soak gating.
+NodeClaims in standby store `karpenter.coralogix.net/standby` as the RFC3339Nano UTC time standby began. Legacy `true` values remain supported and skip soak gating. Full annotation and taint reference is in [Compaction, standby, and reclamation](compaction-standby-reclamation.md).
 
 ## Configuration
 
