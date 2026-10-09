@@ -607,7 +607,7 @@ var _ = Describe("Queue", func() {
 		Context("CalculateRetryDuration", func() {
 			DescribeTable("should calculate correct timeout based on queue length",
 				func(numCommands int, expectedDuration time.Duration) {
-					q := disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov)
+					q := disruption.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov)
 					q.Lock()
 					for i := range numCommands {
 						q.ProviderIDToCommand[strconv.Itoa(i)] = &disruption.Command{}

@@ -66,6 +66,7 @@ import (
 	staticprovisioning "sigs.k8s.io/karpenter/pkg/controllers/static/provisioning"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/standby"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	"sigs.k8s.io/karpenter/pkg/state/nodepoolhealth"
 )
@@ -99,16 +100,19 @@ func NewControllers(
 	o := option.Resolve(opts...)
 	deviceAllocationController := deviceallocation.NewController(kubeClient)
 	virtualPodCache := virtualpods.NewVirtualPodCache(kubeClient)
-	p := provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache)
+	apiReader := mgr.GetAPIReader()
+	standbyCoordinator := standby.NewCoordinator(apiReader, kubeClient, clock)
+	p := provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache, standbyCoordinator)
 	evictionQueue := terminator.NewQueue(kubeClient, recorder)
-	disruptionQueue := disruption.NewQueue(kubeClient, recorder, cluster, clock, p)
+	disruptionQueue := disruption.NewQueue(kubeClient, apiReader, recorder, cluster, clock, p, standbyCoordinator)
 	disruptionQueue.SetEvictionQueue(evictionQueue)
 	npState := nodepoolhealth.NewState()
 	clusterCost := cost.NewClusterCost(ctx, cloudProvider, kubeClient)
 	controllers := []controller.Controller{
 		p, evictionQueue, disruptionQueue,
 		disruption.NewController(clock, kubeClient, p, cloudProvider, recorder, cluster, disruptionQueue, clusterCost,
-			disruption.WithNodePoolReader(mgr.GetAPIReader())),
+			disruption.WithAPIReader(apiReader),
+			disruption.WithNodePoolReader(apiReader)),
 		provisioning.NewPodController(kubeClient, p, cluster),
 		provisioning.NewNodeController(kubeClient, p),
 		nodepoolhash.NewController(kubeClient, cloudProvider),

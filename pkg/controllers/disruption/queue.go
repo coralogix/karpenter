@@ -56,9 +56,10 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	"sigs.k8s.io/karpenter/pkg/standby"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
-	"sigs.k8s.io/karpenter/pkg/utils/standby"
+	utilstandby "sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 const (
@@ -104,6 +105,7 @@ type Queue struct {
 	cluster             *state.Cluster
 	clock               clock.Clock
 	provisioner         *provisioning.Provisioner
+	standbyCoordinator  *standby.Coordinator
 	evictionQueue       *terminator.Queue
 }
 
@@ -112,15 +114,9 @@ func (q *Queue) SetEvictionQueue(evictionQueue *terminator.Queue) {
 	q.evictionQueue = evictionQueue
 }
 
-func (q *Queue) SetAPIReader(reader client.Reader) {
-	if reader != nil {
-		q.apiReader = reader
-	}
-}
-
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands
-func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clock clock.Clock,
-	provisioner *provisioning.Provisioner,
+func NewQueue(kubeClient client.Client, apiReader client.Reader, recorder events.Recorder, cluster *state.Cluster, clock clock.Clock,
+	provisioner *provisioning.Provisioner, standbyCoordinator *standby.Coordinator,
 ) *Queue {
 	queue := &Queue{
 		// nolint:staticcheck
@@ -128,13 +124,20 @@ func NewQueue(kubeClient client.Client, recorder events.Recorder, cluster *state
 		source:              make(chan event.TypedGenericEvent[*v1.NodeClaim], 10000),
 		ProviderIDToCommand: map[string]*Command{},
 		kubeClient:          kubeClient,
-		apiReader:           kubeClient,
+		apiReader:           apiReader,
 		recorder:            recorder,
 		cluster:             cluster,
 		clock:               clock,
 		provisioner:         provisioner,
+		standbyCoordinator:  standbyCoordinator,
 	}
 	return queue
+}
+
+// NewTestQueue wires the API reader and standby coordinator for unit tests.
+func NewTestQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clk clock.Clock, provisioner *provisioning.Provisioner) *Queue {
+	coordinator := standby.TestCoordinator(kubeClient, clk)
+	return NewQueue(kubeClient, kubeClient, recorder, cluster, clk, provisioner, coordinator)
 }
 
 func (q *Queue) Name() string {
@@ -142,7 +145,6 @@ func (q *Queue) Name() string {
 }
 
 func (q *Queue) Register(ctx context.Context, m manager.Manager) error {
-	q.apiReader = m.GetAPIReader()
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(q.Name()).
 		WatchesRawSource(source.Channel(q.source, &handler.TypedEnqueueRequestForObject[*v1.NodeClaim]{})).
@@ -325,7 +327,7 @@ func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) e
 func (q *Queue) activateStandbyDestinations(ctx context.Context, cmd *Command) error {
 	stateNodes := lo.FilterMap(cmd.Results.ExistingNodes, func(existing *pscheduling.ExistingNode, _ int) (*state.StateNode, bool) {
 		if len(existing.Pods) == 0 || existing.StateNode == nil ||
-			(!standby.IsNodeClaimStandby(existing.NodeClaim) && !standby.IsNodeClaimActivating(existing.NodeClaim)) {
+			(!utilstandby.IsNodeClaimStandby(existing.NodeClaim) && !utilstandby.IsNodeClaimActivating(existing.NodeClaim)) {
 			return nil, false
 		}
 		return existing.StateNode, true
@@ -333,7 +335,7 @@ func (q *Queue) activateStandbyDestinations(ctx context.Context, cmd *Command) e
 	if len(stateNodes) == 0 {
 		return nil
 	}
-	return q.provisioner.ActivateStandbyNodes(ctx, standby.ActivationSourceCompaction, stateNodes...)
+	return q.standbyCoordinator.Activate(ctx, utilstandby.ActivationSourceCompaction, stateNodes...)
 }
 
 func (q *Queue) rollbackStart(ctx context.Context, cmd *Command, candidates []*Candidate, cause error) error {

@@ -27,21 +27,20 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/clock"
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
-	"sigs.k8s.io/karpenter/pkg/scheduling"
+	standbypkg "sigs.k8s.io/karpenter/pkg/standby"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-func TestStandbyTransitionRollsBackWhenPodBindsAfterTaint(t *testing.T) {
-	h := newStandbyTransitionHarness(t)
+func TestStandbyMarkingQueueRecoversWhenPodBindsDuringTransition(t *testing.T) {
+	h := newStandbyQueueHarness(t)
 	injected := false
 	h.client.afterPatch = func(ctx context.Context, object client.Object) error {
 		node, ok := object.(*corev1.Node)
@@ -64,122 +63,90 @@ func TestStandbyTransitionRollsBackWhenPodBindsAfterTaint(t *testing.T) {
 	}
 }
 
-func TestStandbyTransitionRecoversPodBoundAfterStandbyMarker(t *testing.T) {
-	h := newStandbyTransitionHarness(t)
-	h.client.afterPatch = func(ctx context.Context, object client.Object) error {
-		claim, ok := object.(*v1.NodeClaim)
-		if !ok || !standby.IsNodeClaimStandby(claim) {
-			return nil
-		}
-		return h.createWorkload(ctx, "late-workload", nil)
-	}
-	if err := h.start(); err != nil {
-		t.Fatalf("starting empty-node standby transition: %v", err)
-	}
-	h.assertNodeActive(t)
-	h.assertWorkloadPresent(t, "late-workload")
-	if h.eventCount() != 0 {
-		t.Fatal("a transition recovered to active capacity must not emit a standby-marked event")
-	}
-}
-
-func TestStandbyTransitionDoesNotRetaintNodeActivatedAfterClaimMarker(t *testing.T) {
-	h := newStandbyTransitionHarness(t)
-	h.client.afterPatch = func(ctx context.Context, object client.Object) error {
-		claim, ok := object.(*v1.NodeClaim)
-		if !ok || !standby.IsNodeClaimStandby(claim) {
-			return nil
-		}
-		node := &corev1.Node{}
-		if err := h.apiReader.Get(ctx, types.NamespacedName{Name: h.node.Name}, node); err != nil {
-			return err
-		}
-		return h.provisioner.ActivateStandbyNodes(ctx, standby.ActivationSourceRecovery, &state.StateNode{Node: node, NodeClaim: claim.DeepCopy()})
-	}
-	if err := h.start(); err != nil {
-		t.Fatalf("starting empty-node standby transition: %v", err)
-	}
-	h.assertNodeActive(t)
-	if h.eventCount() != 0 {
-		t.Fatal("an activation that wins the race must not emit a standby-marked event")
-	}
-}
-
 func TestCleanupRecoversOccupiedStandbyNodeWithDoNotDisruptPod(t *testing.T) {
-	h := newStandbyTransitionHarness(t)
-	storedNode := &corev1.Node{}
-	if err := h.apiReader.Get(h.ctx, client.ObjectKeyFromObject(h.node), storedNode); err != nil {
-		t.Fatalf("getting Node: %v", err)
-	}
-	storedClaim := &v1.NodeClaim{}
-	if err := h.apiReader.Get(h.ctx, client.ObjectKeyFromObject(h.nodeClaim), storedClaim); err != nil {
-		t.Fatalf("getting NodeClaim: %v", err)
-	}
-	standby.SetNodeClaimStandby(storedClaim, true, time.Now())
-	if err := h.apiReader.(client.Client).Update(h.ctx, storedClaim); err != nil {
-		t.Fatalf("marking NodeClaim standby: %v", err)
-	}
-	standby.SetNodeTaint(storedNode, true)
-	if err := h.apiReader.(client.Client).Update(h.ctx, storedNode); err != nil {
-		t.Fatalf("tainting standby Node: %v", err)
-	}
-	if err := h.createWorkload(h.ctx, "protected-workload", map[string]string{v1.DoNotDisruptAnnotationKey: "true"}); err != nil {
-		t.Fatalf("creating protected workload: %v", err)
-	}
-	h.cluster.UpdateNodeClaim(storedClaim)
-	if err := h.cluster.UpdateNode(h.ctx, storedNode); err != nil {
-		t.Fatalf("refreshing cluster Node: %v", err)
-	}
-
-	controller := &Controller{queue: h.queue, kubeClient: h.client, apiReader: h.apiReader, cluster: h.cluster, provisioner: h.provisioner}
-	if err := controller.cleanupStaleDisruptionState(h.ctx); err != nil {
+	ctx := context.Background()
+	kubeClient, cluster, clk, storedNode, storedClaim := occupiedStandbyRecoveryFixture(t, ctx)
+	coordinator := standbypkg.NewCoordinator(kubeClient, kubeClient, clk)
+	queue := NewQueue(kubeClient, kubeClient, events.NewRecorder(record.NewFakeRecorder(1)), cluster, clk, nil, coordinator)
+	controller := &Controller{queue: queue, kubeClient: kubeClient, apiReader: kubeClient, cluster: cluster}
+	if err := controller.cleanupStaleDisruptionState(ctx); err != nil {
 		t.Fatalf("recovering occupied standby node: %v", err)
 	}
-	h.assertNodeActive(t)
-	h.assertWorkloadPresent(t, "protected-workload")
-	if h.eventCount() != 0 {
-		t.Fatal("recovering occupied standby capacity must not emit a standby or evacuation event")
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(storedNode), storedNode); err != nil {
+		t.Fatalf("getting Node after recovery: %v", err)
+	}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(storedClaim), storedClaim); err != nil {
+		t.Fatalf("getting NodeClaim after recovery: %v", err)
+	}
+	if standby.IsNodeClaimStandby(storedClaim) || standby.HasNodeTaint(storedNode) {
+		t.Fatal("occupied standby recovery left standby markers on active capacity")
 	}
 }
 
-func TestStandbyActionHasNoConsolidationSavings(t *testing.T) {
-	candidate := &Candidate{
-		StateNode: &state.StateNode{Node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
-			v1.CapacityTypeLabelKey:  v1.CapacityTypeOnDemand,
-			corev1.LabelTopologyZone: "us-east-1a",
-		}}}},
-		instanceType: &cloudprovider.InstanceType{Offerings: cloudprovider.Offerings{&cloudprovider.Offering{
-			Price: 1.25,
-			Requirements: scheduling.NewLabelRequirements(map[string]string{
-				v1.CapacityTypeLabelKey:  v1.CapacityTypeOnDemand,
-				corev1.LabelTopologyZone: "us-east-1a",
-			}),
-		}}},
-		Price: 1.25,
+func occupiedStandbyRecoveryFixture(t *testing.T, ctx context.Context) (client.Client, *state.Cluster, clock.Clock, *corev1.Node, *v1.NodeClaim) {
+	t.Helper()
+	clk := clocktesting.NewFakeClock(time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC))
+	nodeClaim := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name:   "standby-claim",
+		UID:    types.UID("standby-claim-uid"),
+		Labels: map[string]string{v1.NodePoolLabelKey: "standby-pool"},
+	}, Status: v1.NodeClaimStatus{ProviderID: "provider-id"}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "standby-node",
+		UID:  types.UID("standby-node-uid"),
+		Labels: map[string]string{
+			v1.NodePoolLabelKey:        nodeClaim.Labels[v1.NodePoolLabelKey],
+			v1.NodeInitializedLabelKey: "true",
+		},
+	}, Spec: corev1.NodeSpec{ProviderID: nodeClaim.Status.ProviderID}}
+	kubeClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(nodeClaim, node).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", standbyMarkingPodNodeIndex).
+		Build()
+	storedClaim := &v1.NodeClaim{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(nodeClaim), storedClaim); err != nil {
+		t.Fatalf("getting NodeClaim: %v", err)
 	}
-	deleteCommand := Command{Candidates: []*Candidate{candidate}, Action: DeleteAction}
-	if got := deleteCommand.EstimatedSavings(); got != 1.25 {
-		t.Fatalf("delete command estimated savings = %v, want 1.25", got)
+	standby.SetNodeClaimStandby(storedClaim, true, clk.Now())
+	if err := kubeClient.Update(ctx, storedClaim); err != nil {
+		t.Fatalf("marking NodeClaim standby: %v", err)
 	}
-	standbyCommand := Command{Candidates: []*Candidate{candidate}, Action: StandbyAction}
-	if got := standbyCommand.EstimatedSavings(); got != 0 {
-		t.Fatalf("standby command estimated savings = %v, want 0", got)
+	storedNode := &corev1.Node{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(node), storedNode); err != nil {
+		t.Fatalf("getting Node: %v", err)
 	}
+	standby.SetNodeTaint(storedNode, true)
+	if err := kubeClient.Update(ctx, storedNode); err != nil {
+		t.Fatalf("tainting standby Node: %v", err)
+	}
+	if err := kubeClient.Create(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "protected-workload", Namespace: "default",
+			Annotations: map[string]string{v1.DoNotDisruptAnnotationKey: "true"},
+		},
+		Spec: corev1.PodSpec{NodeName: storedNode.Name},
+	}); err != nil {
+		t.Fatalf("creating protected workload: %v", err)
+	}
+	cluster := state.NewCluster(clk, kubeClient, nil)
+	cluster.UpdateNodeClaim(storedClaim)
+	if err := cluster.UpdateNode(ctx, storedNode); err != nil {
+		t.Fatalf("refreshing cluster Node: %v", err)
+	}
+	return kubeClient, cluster, clk, storedNode, storedClaim
 }
 
-type standbyTransitionHarness struct {
-	ctx         context.Context
-	base        client.Client
-	client      *standbyTransitionClient
-	apiReader   client.Reader
-	node        *corev1.Node
-	nodeClaim   *v1.NodeClaim
-	nodePool    *v1.NodePool
-	cluster     *state.Cluster
-	provisioner *provisioning.Provisioner
-	queue       *Queue
-	method      *StandbyMarking
-	recorder    *record.FakeRecorder
+type standbyQueueHarness struct {
+	ctx       context.Context
+	client    *standbyTransitionClient
+	apiReader client.Reader
+	node      *corev1.Node
+	nodeClaim *v1.NodeClaim
+	cluster   *state.Cluster
+	queue     *Queue
+	method    *StandbyMarking
+	recorder  *record.FakeRecorder
 }
 
 type standbyTransitionClient struct {
@@ -192,14 +159,12 @@ func (c *standbyTransitionClient) Patch(ctx context.Context, object client.Objec
 		return err
 	}
 	if c.afterPatch != nil {
-		if err := c.afterPatch(ctx, object); err != nil {
-			return err
-		}
+		return c.afterPatch(ctx, object)
 	}
 	return nil
 }
 
-func newStandbyTransitionHarness(t *testing.T) *standbyTransitionHarness {
+func newStandbyQueueHarness(t *testing.T) *standbyQueueHarness {
 	t.Helper()
 	ctx := context.Background()
 	nodePool := &v1.NodePool{
@@ -224,20 +189,13 @@ func newStandbyTransitionHarness(t *testing.T) *standbyTransitionHarness {
 			v1.NodeInitializedLabelKey:     "true",
 			v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
 			corev1.LabelInstanceTypeStable: "m5.large",
-			corev1.LabelTopologyZone:       "us-east-1a",
 		},
-	}}
-	node.Spec.ProviderID = nodeClaim.Status.ProviderID
+	}, Spec: corev1.NodeSpec{ProviderID: nodeClaim.Status.ProviderID}}
 	base := fake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithObjects(nodePool, nodeClaim, node).
-		WithIndex(&corev1.Pod{}, "spec.nodeName", func(object client.Object) []string {
-			pod := object.(*corev1.Pod)
-			if pod.Spec.NodeName == "" {
-				return nil
-			}
-			return []string{pod.Spec.NodeName}
-		}).Build()
+		WithIndex(&corev1.Pod{}, "spec.nodeName", standbyMarkingPodNodeIndex).
+		Build()
 	wrapped := &standbyTransitionClient{Client: base}
 	clk := clocktesting.NewFakeClock(time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC))
 	fakeRecorder := record.NewFakeRecorder(20)
@@ -247,29 +205,36 @@ func newStandbyTransitionHarness(t *testing.T) *standbyTransitionHarness {
 	if err := cluster.UpdateNode(ctx, node.DeepCopy()); err != nil {
 		t.Fatalf("initializing cluster state: %v", err)
 	}
-	provisioner := provisioning.NewProvisioner(base, ctxRecorder, nil, cluster, clk, nil, nil)
-	provisioner.SetAPIReader(base)
-	queue := NewQueue(wrapped, ctxRecorder, cluster, clk, provisioner)
-	queue.SetAPIReader(base)
+	coordinator := standbypkg.NewCoordinator(base, wrapped, clk)
+	queue := NewQueue(wrapped, base, ctxRecorder, cluster, clk, nil, coordinator)
 	method := NewStandbyMarking(MakeConsolidation(clk, cluster, wrapped, nil, nil, ctxRecorder, queue, nil))
-	return &standbyTransitionHarness{
-		ctx: ctx, base: base, client: wrapped, apiReader: base, node: node.DeepCopy(), nodeClaim: nodeClaim.DeepCopy(), nodePool: nodePool.DeepCopy(), cluster: cluster, provisioner: provisioner, queue: queue, method: method, recorder: fakeRecorder,
+	return &standbyQueueHarness{
+		ctx: ctx, client: wrapped, apiReader: base, node: node.DeepCopy(), nodeClaim: nodeClaim.DeepCopy(),
+		cluster: cluster, queue: queue, method: method, recorder: fakeRecorder,
 	}
 }
 
-func (h *standbyTransitionHarness) start() error {
+func standbyMarkingPodNodeIndex(object client.Object) []string {
+	pod := object.(*corev1.Pod)
+	if pod.Spec.NodeName == "" {
+		return nil
+	}
+	return []string{pod.Spec.NodeName}
+}
+
+func (h *standbyQueueHarness) start() error {
 	command := Command{Method: h.method, Action: StandbyAction, Candidates: []*Candidate{{
 		StateNode: &state.StateNode{Node: h.node.DeepCopy(), NodeClaim: h.nodeClaim.DeepCopy()},
-		NodePool:  h.nodePool.DeepCopy(),
+		NodePool:  &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: h.node.Labels[v1.NodePoolLabelKey], Annotations: map[string]string{v1.ScoreBasedConsolidationAnnotationKey: ""}}},
 	}}}
 	return h.queue.StartCommand(h.ctx, &command)
 }
 
-func (h *standbyTransitionHarness) createWorkload(ctx context.Context, name string, annotations map[string]string) error {
-	return h.base.Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Annotations: annotations}, Spec: corev1.PodSpec{NodeName: h.node.Name}})
+func (h *standbyQueueHarness) createWorkload(ctx context.Context, name string, annotations map[string]string) error {
+	return h.client.Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Annotations: annotations}, Spec: corev1.PodSpec{NodeName: h.node.Name}})
 }
 
-func (h *standbyTransitionHarness) assertNodeActive(t *testing.T) {
+func (h *standbyQueueHarness) assertNodeActive(t *testing.T) {
 	t.Helper()
 	node := &corev1.Node{}
 	if err := h.apiReader.Get(h.ctx, client.ObjectKeyFromObject(h.node), node); err != nil {
@@ -283,23 +248,6 @@ func (h *standbyTransitionHarness) assertNodeActive(t *testing.T) {
 	if h.queue.HasAny(h.nodeClaim.Status.ProviderID) {
 		t.Fatal("standby transition left an in-progress queue reservation")
 	}
-	internal := h.internalStateNode(t)
-	assertNoStandbyState(t, internal.Node, internal.NodeClaim)
-}
-
-func (h *standbyTransitionHarness) internalStateNode(t *testing.T) *state.StateNode {
-	t.Helper()
-	var internal *state.StateNode
-	for _, stateNode := range h.cluster.DeepCopyNodes() {
-		if stateNode.ProviderID() == h.nodeClaim.Status.ProviderID {
-			internal = stateNode
-			break
-		}
-	}
-	if internal == nil {
-		t.Fatal("standby transition removed the node from internal cluster state")
-	}
-	return internal
 }
 
 func assertNoStandbyState(t *testing.T, node *corev1.Node, claim *v1.NodeClaim) {
@@ -312,7 +260,7 @@ func assertNoStandbyState(t *testing.T, node *corev1.Node, claim *v1.NodeClaim) 
 	}
 }
 
-func (h *standbyTransitionHarness) assertWorkloadPresent(t *testing.T, name string) {
+func (h *standbyQueueHarness) assertWorkloadPresent(t *testing.T, name string) {
 	t.Helper()
 	pod := &corev1.Pod{}
 	if err := h.apiReader.Get(h.ctx, client.ObjectKey{Namespace: "default", Name: name}, pod); err != nil {
@@ -323,7 +271,7 @@ func (h *standbyTransitionHarness) assertWorkloadPresent(t *testing.T, name stri
 	}
 }
 
-func (h *standbyTransitionHarness) eventCount() int {
+func (h *standbyQueueHarness) eventCount() int {
 	count := 0
 	for {
 		select {

@@ -23,11 +23,11 @@ import (
 	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	standbypkg "sigs.k8s.io/karpenter/pkg/standby"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
@@ -57,10 +57,7 @@ func (c *Controller) cleanupStaleDisruptionState(ctx context.Context) error {
 
 //nolint:gocyclo // This recovery pass intentionally keeps each live-state check beside the mutation it gates.
 func (c *Controller) recoverOccupiedStandbyNodes(ctx context.Context) error {
-	reader := c.apiReader
-	if reader == nil {
-		reader = c.kubeClient
-	}
+	coordinator := c.queue.standbyCoordinator
 	for _, stateNode := range c.cluster.DeepCopyNodes() {
 		if stateNode == nil || stateNode.Node == nil || stateNode.NodeClaim == nil || stateNode.MarkedForDeletion() || c.queue.HasAny(stateNode.ProviderID()) {
 			continue
@@ -69,7 +66,7 @@ func (c *Controller) recoverOccupiedStandbyNodes(ctx context.Context) error {
 			!standby.HasNodeTaint(stateNode.Node) && stateNode.Node.Annotations[standby.NodeClaimActivatingAnnotationKey] != "true" {
 			continue
 		}
-		node, nodeClaim, matches, err := standby.NewLifecycle(reader, c.kubeClient).ReadLivePair(ctx, stateNode.Node, stateNode.NodeClaim, stateNode.ProviderID())
+		node, nodeClaim, matches, err := coordinator.ReadLivePair(ctx, stateNode.Node, stateNode.NodeClaim, stateNode.ProviderID())
 		if err != nil {
 			return fmt.Errorf("getting live standby objects for Node %q, %w", stateNode.Name(), err)
 		}
@@ -78,39 +75,29 @@ func (c *Controller) recoverOccupiedStandbyNodes(ctx context.Context) error {
 			nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
 			continue
 		}
-		claimStandby := standby.IsNodeClaimStandby(nodeClaim)
-		claimActivating := standby.IsNodeClaimActivating(nodeClaim)
-		nodeActivating := node.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true"
-		if !claimStandby && !claimActivating && !nodeActivating {
-			if standby.HasNodeTaint(node) {
-				// A crash between tainting a node and persisting its standby marker can leave a
-				// node permanently unschedulable. Remove only the orphan taint, using the live
-				// Node resourceVersion so a concurrent activation marker wins.
-				if err := standby.NewLifecycle(reader, c.kubeClient).PatchNodeStandbyTaint(ctx, node, false); err != nil {
-					if errors.IsConflict(err) || errors.IsNotFound(err) {
-						continue
-					}
-					return fmt.Errorf("removing orphan standby taint from Node %q, %w", node.Name, err)
-				}
-				if err := updateStandbyState(ctx, c.cluster, reader, node, nodeClaim); err != nil {
-					return fmt.Errorf("refreshing Node %q after removing orphan standby taint, %w", node.Name, err)
-				}
+		repaired, err := coordinator.RepairOrphanStandbyTaint(ctx, node, nodeClaim)
+		if err != nil {
+			return err
+		}
+		if repaired {
+			if err := updateStandbyState(ctx, c.cluster, c.apiReader, node, nodeClaim); err != nil {
+				return fmt.Errorf("refreshing Node %q after removing orphan standby taint, %w", node.Name, err)
 			}
 			continue
 		}
-		empty, err := nodeEmpty(ctx, reader, node)
+		empty, err := nodeEmpty(ctx, c.apiReader, node)
 		if err != nil {
 			return fmt.Errorf("checking standby Node %q for bound workloads, %w", node.Name, err)
 		}
 		if empty {
 			continue
 		}
-		activationNode := &state.StateNode{Node: node, NodeClaim: nodeClaim}
-		if err := c.provisioner.ActivateStandbyNodes(ctx, standby.ActivationSourceRecovery, activationNode); err != nil {
-			return fmt.Errorf("activating occupied standby Node %q, %w", node.Name, err)
-		}
-		if err := c.queue.removeDisruptionTaint(ctx, node.Name); err != nil {
-			return fmt.Errorf("removing temporary disruption taint from recovered Node %q, %w", node.Name, err)
+		if err := coordinator.RepairOccupied(ctx, standbypkg.RepairRequest{
+			NodeRef:      stateNode.Node,
+			NodeClaimRef: stateNode.NodeClaim,
+			ProviderID:   stateNode.ProviderID(),
+		}); err != nil {
+			return err
 		}
 		if err := c.refreshStandbyState(ctx, node.Name, nodeClaim.Name); err != nil {
 			return err
@@ -120,22 +107,18 @@ func (c *Controller) recoverOccupiedStandbyNodes(ctx context.Context) error {
 }
 
 func (c *Controller) refreshStandbyState(ctx context.Context, nodeName, nodeClaimName string) error {
-	reader := c.apiReader
-	if reader == nil {
-		reader = c.kubeClient
-	}
 	node := &corev1.Node{}
-	if err := reader.Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
+	if err := c.apiReader.Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
 		return fmt.Errorf("refreshing standby Node %q, %w", nodeName, err)
 	}
 	nodeClaim := &v1.NodeClaim{}
-	if err := reader.Get(ctx, client.ObjectKey{Name: nodeClaimName}, nodeClaim); err != nil {
+	if err := c.apiReader.Get(ctx, client.ObjectKey{Name: nodeClaimName}, nodeClaim); err != nil {
 		return fmt.Errorf("refreshing standby NodeClaim %q, %w", nodeClaimName, err)
 	}
-	if standby.IsNodeClaimStandby(nodeClaim) || standby.IsNodeClaimActivating(nodeClaim) || standby.HasNodeTaint(node) || node.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" {
+	if !standbypkg.ActivationComplete(node, nodeClaim) {
 		return fmt.Errorf("standby activation for NodeClaim %q has not completed", nodeClaimName)
 	}
-	return updateStandbyState(ctx, c.cluster, reader, node, nodeClaim)
+	return updateStandbyState(ctx, c.cluster, c.apiReader, node, nodeClaim)
 }
 
 func (c *Controller) ensureStandbyTaints(ctx context.Context, nodes ...*state.StateNode) error {
@@ -148,11 +131,7 @@ func (c *Controller) ensureStandbyTaints(ctx context.Context, nodes ...*state.St
 }
 
 func (c *Controller) ensureStandbyTaint(ctx context.Context, stateNode *state.StateNode) error {
-	reader := c.apiReader
-	if reader == nil {
-		reader = c.kubeClient
-	}
-	return standby.NewLifecycle(reader, c.kubeClient).EnsureStandbyTaintForClaim(ctx, stateNode.Node, stateNode.NodeClaim)
+	return c.queue.standbyCoordinator.EnsureStandbyTaintForClaim(ctx, stateNode.Node, stateNode.NodeClaim)
 }
 
 func (c *Controller) refreshEmptyReclamationInventory(ctx context.Context, disruption Method) error {

@@ -301,7 +301,7 @@ func newReclamationDeleteRaceHarness(t *testing.T, deleting bool, interference f
 	stateNode.Node = storedNode
 	stateNode.NodeClaim = storedClaim
 	candidate := &Candidate{StateNode: stateNode, NodePool: nodePool}
-	queue := NewQueue(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cluster, clk, nil)
+	queue := NewTestQueue(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cluster, clk, nil)
 	consolidationMethod := MakeConsolidation(clk, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), queue, nil)
 	reclamation := NewReclamation(consolidationMethod)
 	h := &reclamationDeleteRaceHarness{ctx: ctx, claim: storedClaim, queue: queue, client: kubeClient}

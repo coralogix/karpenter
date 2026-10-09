@@ -72,6 +72,7 @@ type ControllerOptions struct {
 	methods          []Method
 	disruptionPacing *DisruptionPacing
 	nodePoolReader   client.Reader
+	apiReader        client.Reader
 }
 
 func WithMethods(methods ...Method) option.Function[ControllerOptions] {
@@ -86,6 +87,10 @@ func WithDisruptionPacing(pace *DisruptionPacing) option.Function[ControllerOpti
 
 func WithNodePoolReader(reader client.Reader) option.Function[ControllerOptions] {
 	return func(o *ControllerOptions) { o.nodePoolReader = reader }
+}
+
+func WithAPIReader(reader client.Reader) option.Function[ControllerOptions] {
+	return func(o *ControllerOptions) { o.apiReader = reader }
 }
 
 func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
@@ -104,10 +109,15 @@ func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provi
 	if nodePoolReader == nil {
 		nodePoolReader = kubeClient
 	}
+	apiReader := o.apiReader
+	if apiReader == nil {
+		apiReader = kubeClient
+	}
 	return &Controller{
 		queue:            queue,
 		clock:            clk,
 		kubeClient:       kubeClient,
+		apiReader:        apiReader,
 		nodePoolReader:   nodePoolReader,
 		cluster:          cluster,
 		provisioner:      provisioner,
@@ -151,9 +161,6 @@ func (c *Controller) Name() string {
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {
-	c.apiReader = m.GetAPIReader()
-	c.queue.SetAPIReader(c.apiReader)
-	c.provisioner.SetAPIReader(c.apiReader)
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(c.Name()).
 		WatchesRawSource(singleton.Source()).

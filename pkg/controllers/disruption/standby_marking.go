@@ -23,15 +23,16 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	"sigs.k8s.io/karpenter/pkg/controllers/disruption/standbymetrics"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	standbypkg "sigs.k8s.io/karpenter/pkg/standby"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
@@ -100,7 +101,7 @@ func (s *StandbyMarking) ConsolidationType() string {
 }
 
 func (s *StandbyMarking) apiReader() client.Reader {
-	if s.queue != nil && s.queue.apiReader != nil {
+	if s.queue != nil {
 		return s.queue.apiReader
 	}
 	return s.kubeClient
@@ -114,8 +115,7 @@ func (s *StandbyMarking) standbyCandidateMatchesLiveObjects(ctx context.Context,
 	if candidate == nil || candidate.Node == nil || candidate.NodeClaim == nil || candidate.NodePool == nil {
 		return nil, nil, false, fmt.Errorf("standby candidate is missing its Node, NodeClaim, or NodePool")
 	}
-	lifecycle := standby.NewLifecycle(s.apiReader(), s.kubeClient)
-	node, nodeClaim, matches, err := lifecycle.ReadLivePair(ctx, candidate.Node, candidate.NodeClaim, candidate.ProviderID())
+	node, nodeClaim, matches, err := s.queue.standbyCoordinator.ReadLivePair(ctx, candidate.Node, candidate.NodeClaim, candidate.ProviderID())
 	if err != nil || !matches {
 		return nil, nil, false, err
 	}
@@ -204,7 +204,7 @@ func (q *Queue) startStandbyCommand(ctx context.Context, cmd *Command) error {
 	if len(transitioned) > 0 {
 		standbyNodePoolsMarked := map[string]int{}
 		for _, candidate := range transitioned {
-			StandbyNodesMarkedTotal.Inc(map[string]string{metrics.NodePoolLabel: candidate.NodePool.Name})
+			standbymetrics.StandbyNodesMarkedTotal.Inc(map[string]string{metrics.NodePoolLabel: candidate.NodePool.Name})
 			standbyNodePoolsMarked[candidate.NodePool.Name]++
 			q.recorder.Publish(disruptionevents.StandbyMarked(candidate.Node, candidate.NodeClaim)...)
 		}
@@ -216,149 +216,41 @@ func (q *Queue) startStandbyCommand(ctx context.Context, cmd *Command) error {
 	return multierr.Combine(errs...)
 }
 
-//nolint:gocyclo // This transition keeps its live rechecks, optimistic patches, and rollback steps together.
 func (q *Queue) markEmptyNodeStandby(ctx context.Context, method *StandbyMarking, candidate *Candidate) (bool, error) {
-	node, _, eligible, err := method.standbyCandidateMatchesLiveObjects(ctx, candidate)
-	if err != nil || !eligible {
-		return false, err
+	eligibility := func(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
+		_, _, eligible, err := method.standbyCandidateMatchesLiveObjects(ctx, &Candidate{
+			StateNode: &state.StateNode{Node: node, NodeClaim: nodeClaim},
+			NodePool:  candidate.NodePool,
+		})
+		return eligible, err
 	}
-	if err := q.patchDisruptionTaint(ctx, node, true); err != nil {
-		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
-			return false, nil
-		}
-		return false, err
-	}
-
-	// Tainting prevents new scheduling in the steady state. Refresh every object and repeat the
-	// emptiness check after the taint write to catch pods bound during candidate preparation.
-	var nodeClaim *v1.NodeClaim
-	_, nodeClaim, eligible, err = method.standbyCandidateMatchesLiveObjects(ctx, candidate)
-	if err != nil || !eligible {
-		rollbackErr := q.removeDisruptionTaint(ctx, candidate.Node.Name)
-		return false, multierr.Combine(err, rollbackErr)
-	}
-	if err := standby.NewLifecycle(method.apiReader(), q.kubeClient).PatchNodeClaimStandby(ctx, nodeClaim, true, method.clock.Now()); err != nil {
-		rollbackErr := q.removeDisruptionTaint(ctx, candidate.Node.Name)
-		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
-			return false, rollbackErr
-		}
-		return false, multierr.Combine(err, rollbackErr)
-	}
-
-	// Read the Node and NodeClaim after reserving the NodeClaim. The resourceVersion makes this
-	// taint patch race with activation's Node marker patch; a conflict leaves the temporary
-	// disruption taint in place for stale-state cleanup to resolve safely.
-	node = &corev1.Node{}
-	if err := method.apiReader().Get(ctx, client.ObjectKeyFromObject(candidate.Node), node); err != nil {
-		return false, err
-	}
-	nodeClaim = &v1.NodeClaim{}
-	if err := method.apiReader().Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
-		return false, err
-	}
-	if nodeClaim.UID != candidate.NodeClaim.UID {
-		return false, nil
-	}
-	if !standby.IsNodeClaimStandby(nodeClaim) || standby.IsNodeClaimActivating(nodeClaim) || node.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" {
-		if err := q.removeDisruptionTaint(ctx, node.Name); err != nil {
-			return false, err
-		}
-		return false, nil
-	}
-	if err := standby.NewLifecycle(method.apiReader(), q.kubeClient).PatchNodeStandbyTaint(ctx, node, true); err != nil {
-		return false, err
-	}
-	if err := q.removeDisruptionTaint(ctx, node.Name); err != nil {
-		return false, err
-	}
-	node = &corev1.Node{}
-	if err := method.apiReader().Get(ctx, client.ObjectKeyFromObject(candidate.Node), node); err != nil {
-		return false, err
-	}
-	nodeClaim = &v1.NodeClaim{}
-	if err := method.apiReader().Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
-		return false, err
-	}
-
-	// A pod may bind after the last emptiness read while the scheduler still has an older Node
-	// snapshot. Use the normal activation reservation path to restore such capacity immediately.
-	recovered, err := q.recoverOccupiedStandbyNode(ctx, method, node, nodeClaim)
+	result, err := q.standbyCoordinator.EnterStandby(ctx, standbypkg.EnterStandbyRequest{
+		NodeRef:      candidate.Node,
+		NodeClaimRef: candidate.NodeClaim,
+		ProviderID:   candidate.ProviderID(),
+	}, standbypkg.EnterStandbyOptions{
+		Since:       method.clock.Now(),
+		Eligibility: eligibility,
+	})
 	if err != nil {
 		return false, err
 	}
-	if err := updateStandbyState(ctx, q.cluster, method.apiReader(), node, nodeClaim); err != nil {
-		return false, err
-	}
-	if recovered || !standby.IsNodeClaimStandby(nodeClaim) || standby.IsNodeClaimActivating(nodeClaim) || !standby.HasNodeTaint(node) {
-		return false, nil
-	}
-	candidate.Node = node
-	candidate.NodeClaim = nodeClaim
-	return true, nil
-}
-
-func (q *Queue) patchDisruptionTaint(ctx context.Context, node *corev1.Node, add bool) error {
-	if node == nil {
-		return fmt.Errorf("cannot taint a missing Node")
-	}
-	stored := node.DeepCopy()
-	hasTaint := false
-	for _, taint := range node.Spec.Taints {
-		if taint.MatchTaint(&v1.DisruptedNoScheduleTaint) {
-			hasTaint = true
-			break
+	switch result.Outcome {
+	case standbypkg.OutcomeCompleted:
+		if err := updateStandbyState(ctx, q.cluster, method.apiReader(), result.Node, result.NodeClaim); err != nil {
+			return false, err
 		}
+		candidate.Node = result.Node
+		candidate.NodeClaim = result.NodeClaim
+		return true, nil
+	case standbypkg.OutcomeRecovered, standbypkg.OutcomeSkipped, standbypkg.OutcomeUnchanged:
+		if result.Node != nil && result.NodeClaim != nil {
+			if err := updateStandbyState(ctx, q.cluster, method.apiReader(), result.Node, result.NodeClaim); err != nil {
+				return false, err
+			}
+		}
+		return false, nil
+	default:
+		return false, fmt.Errorf("unexpected standby entry outcome %q", result.Outcome)
 	}
-	if add && !hasTaint {
-		node.Spec.Taints = append(node.Spec.Taints, v1.DisruptedNoScheduleTaint)
-	}
-	if !add && hasTaint {
-		node.Spec.Taints = lo.Reject(node.Spec.Taints, func(taint corev1.Taint, _ int) bool {
-			return taint.MatchTaint(&v1.DisruptedNoScheduleTaint)
-		})
-	}
-	if equality.Semantic.DeepEqual(stored, node) {
-		return nil
-	}
-	return q.kubeClient.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
-}
-
-func (q *Queue) removeDisruptionTaint(ctx context.Context, nodeName string) error {
-	node := &corev1.Node{}
-	if err := q.apiReader.Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	return q.patchDisruptionTaint(ctx, node, false)
-}
-
-//nolint:gocyclo // Recovery applies activation, removes the temporary taint, and refreshes both live objects.
-func (q *Queue) recoverOccupiedStandbyNode(ctx context.Context, method *StandbyMarking, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
-	empty, err := nodeEmpty(ctx, method.apiReader(), node)
-	if err != nil || empty {
-		return false, err
-	}
-	stateNode := &state.StateNode{Node: node.DeepCopy(), NodeClaim: nodeClaim.DeepCopy()}
-	if err := q.provisioner.ActivateStandbyNodes(ctx, standby.ActivationSourceRecovery, stateNode); err != nil {
-		return false, fmt.Errorf("restoring occupied standby capacity, %w", err)
-	}
-	refreshedNode := &corev1.Node{}
-	if err := method.apiReader().Get(ctx, client.ObjectKeyFromObject(node), refreshedNode); err != nil {
-		return false, err
-	}
-	refreshedNodeClaim := &v1.NodeClaim{}
-	if err := method.apiReader().Get(ctx, client.ObjectKeyFromObject(nodeClaim), refreshedNodeClaim); err != nil {
-		return false, err
-	}
-	if standby.IsNodeClaimStandby(refreshedNodeClaim) || standby.IsNodeClaimActivating(refreshedNodeClaim) || standby.HasNodeTaint(refreshedNode) {
-		return false, fmt.Errorf("occupied standby NodeClaim %q has not completed activation", nodeClaim.Name)
-	}
-	if err := q.removeDisruptionTaint(ctx, refreshedNode.Name); err != nil {
-		return false, err
-	}
-	refreshedNode = &corev1.Node{}
-	if err := method.apiReader().Get(ctx, client.ObjectKeyFromObject(node), refreshedNode); err != nil {
-		return false, err
-	}
-	*node, *nodeClaim = *refreshedNode, *refreshedNodeClaim
-	return true, nil
 }

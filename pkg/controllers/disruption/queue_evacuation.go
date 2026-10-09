@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	standbypkg "sigs.k8s.io/karpenter/pkg/standby"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
@@ -131,7 +132,7 @@ func (q *Queue) evacuationPods(cmd *Command) []*corev1.Pod {
 
 func (q *Queue) completeEvacuation(ctx context.Context, cmd *Command) error {
 	for _, candidate := range cmd.Candidates {
-		if err := q.persistStandby(ctx, candidate); err != nil {
+		if err := q.enterStandbyAfterEvacuation(ctx, candidate); err != nil {
 			return fmt.Errorf("persisting standby state, %w", err)
 		}
 	}
@@ -159,7 +160,7 @@ func (q *Queue) rollbackEvacuation(ctx context.Context, candidates []*Candidate)
 			continue
 		}
 		if standby.IsNodeClaimStandby(current) {
-			if err := q.ensureStandbyTaint(ctx, candidate.Node); err != nil {
+			if err := q.standbyCoordinator.EnsureStandbyTaintForClaim(ctx, candidate.Node, current); err != nil {
 				// Keep the disruption taint until standby state is safe to preserve.
 				errs = append(errs, fmt.Errorf("restoring standby taint before evacuation rollback, %w", err))
 				continue
@@ -173,29 +174,25 @@ func (q *Queue) rollbackEvacuation(ctx context.Context, candidates []*Candidate)
 	return multierr.Combine(append(errs, uncordonErr, conditionErr)...)
 }
 
-// persistStandby writes the NodeClaim marker and standby taint before removing the temporary disruption taint.
-func (q *Queue) persistStandby(ctx context.Context, candidate *Candidate) error {
-	if err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
-		nodeClaim := &v1.NodeClaim{}
-		if err := q.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
+func (q *Queue) enterStandbyAfterEvacuation(ctx context.Context, candidate *Candidate) error {
+	return retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
+		result, err := q.standbyCoordinator.EnterStandby(ctx, standbypkg.EnterStandbyRequest{
+			NodeRef:      candidate.Node,
+			NodeClaimRef: candidate.NodeClaim,
+			ProviderID:   candidate.ProviderID(),
+		}, standbypkg.EnterStandbyOptions{
+			BarrierTaintPresent: true,
+			Since:               q.clock.Now(),
+		})
+		if err != nil {
 			return err
 		}
-		if standby.IsNodeClaimStandby(nodeClaim) {
+		switch result.Outcome {
+		case standbypkg.OutcomeCompleted, standbypkg.OutcomeUnchanged, standbypkg.OutcomeSkipped:
 			return nil
+		default:
+			return fmt.Errorf("unexpected evacuation standby outcome %q", result.Outcome)
 		}
-		return standby.NewLifecycle(q.kubeClient, q.kubeClient).PatchNodeClaimStandby(ctx, nodeClaim, true, q.clock.Now())
-	}); err != nil {
-		return err
-	}
-	return q.ensureStandbyTaint(ctx, candidate.Node)
-}
-
-func (q *Queue) ensureStandbyTaint(ctx context.Context, sourceNode *corev1.Node) error {
-	if sourceNode == nil {
-		return fmt.Errorf("cannot restore standby taint without a Node")
-	}
-	return retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
-		return standby.NewLifecycle(q.kubeClient, q.kubeClient).EnsureNodeStandbyTaint(ctx, sourceNode)
 	})
 }
 

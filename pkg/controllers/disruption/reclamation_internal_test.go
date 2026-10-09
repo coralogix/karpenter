@@ -61,16 +61,7 @@ func TestReclamationEmptyNodeMetricsIncludeAllConfiguredPools(t *testing.T) {
 	markerOnlyClaim, markerOnlyNode := reclamationTestNode("other-pool", "marker-only-node", true, false, false)
 	terminatingClaim, terminatingNode := reclamationTestNode("due-pool", "terminating-node", false, false, true)
 	workload := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "bound", Namespace: "default"}, Spec: corev1.PodSpec{NodeName: otherNode.Name}}
-	kubeClient := fake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithObjects(duePool, otherPool, zeroPool, unconfiguredPool, standbyClaim, standbyNode, otherClaim, otherNode, emptyOtherClaim, emptyOtherNode, markerOnlyClaim, markerOnlyNode, terminatingClaim, terminatingNode, workload).
-		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
-			pod := obj.(*corev1.Pod)
-			if pod.Spec.NodeName == "" {
-				return nil
-			}
-			return []string{pod.Spec.NodeName}
-		}).Build()
+	kubeClient := reclamationTestClient(duePool, otherPool, zeroPool, unconfiguredPool, standbyClaim, standbyNode, otherClaim, otherNode, emptyOtherClaim, emptyOtherNode, markerOnlyClaim, markerOnlyNode, terminatingClaim, terminatingNode, workload)
 	cluster := state.NewCluster(clock, kubeClient, nil)
 	for _, nodeClaim := range []*v1.NodeClaim{standbyClaim, otherClaim, emptyOtherClaim, markerOnlyClaim, terminatingClaim} {
 		cluster.UpdateNodeClaim(nodeClaim)
@@ -103,16 +94,7 @@ func TestReclamationEmptyNodeMetricsKeepLastCompleteScanAndRemoveOutOfScopePools
 	clock := clocktesting.NewFakeClock(time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC))
 	oldPool := reclamationTestPool("old-pool")
 	oldClaim, oldNode := reclamationTestNode("old-pool", "old-node", false, false, false)
-	kubeClient := fake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithObjects(oldPool, oldClaim, oldNode).
-		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
-			pod := obj.(*corev1.Pod)
-			if pod.Spec.NodeName == "" {
-				return nil
-			}
-			return []string{pod.Spec.NodeName}
-		}).Build()
+	kubeClient := reclamationTestClient(oldPool, oldClaim, oldNode)
 	cluster := state.NewCluster(clock, kubeClient, nil)
 	cluster.UpdateNodeClaim(oldClaim)
 	if err := cluster.UpdateNode(ctx, oldNode); err != nil {
@@ -169,6 +151,22 @@ func (c errorOnPodListClient) List(ctx context.Context, list client.ObjectList, 
 		return c.err
 	}
 	return c.Client.List(ctx, list, opts...)
+}
+
+func reclamationTestClient(objects ...client.Object) client.Client {
+	return fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(objects...).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", reclamationPodNodeIndex).
+		Build()
+}
+
+func reclamationPodNodeIndex(obj client.Object) []string {
+	pod := obj.(*corev1.Pod)
+	if pod.Spec.NodeName == "" {
+		return nil
+	}
+	return []string{pod.Spec.NodeName}
 }
 
 func reclamationTestPool(name string) *v1.NodePool {
@@ -258,54 +256,56 @@ func resetScoreBasedEmptyNodeMetricForTest() {
 	reclamationEmptyNodeMetricState.pools = map[string]struct{}{}
 }
 
-func TestReclamationRequiresEligibleConsolidationPolicy(t *testing.T) {
-	for name, disruption := range map[string]v1.Disruption{
-		"when-empty policy": {
-			ConsolidationPolicy: v1.ConsolidationPolicyWhenEmpty,
-			ConsolidateAfter:    v1.MustParseNillableDuration("0s"),
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			nodePool := &v1.NodePool{
+func TestStandbyLifecycleEnabledForReclamation(t *testing.T) {
+	tests := []struct {
+		name    string
+		pool    *v1.NodePool
+		enabled bool
+	}{
+		{
+			name: "when-empty policy on annotated pool",
+			pool: &v1.NodePool{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:        "score-pool",
 					Annotations: map[string]string{v1.ScoreBasedConsolidationAnnotationKey: ""},
 				},
-				Spec: v1.NodePoolSpec{Disruption: disruption},
-			}
-			if standbyLifecycleEnabled(nodePool) {
-				t.Fatal("reclamation should be disabled when the consolidation policy does not allow it")
+				Spec: v1.NodePoolSpec{Disruption: v1.Disruption{
+					ConsolidationPolicy: v1.ConsolidationPolicyWhenEmpty,
+					ConsolidateAfter:    v1.MustParseNillableDuration("0s"),
+				}},
+			},
+		},
+		{
+			name: "unannotated pool",
+			pool: &v1.NodePool{
+				ObjectMeta: metav1.ObjectMeta{Name: "score-pool"},
+				Spec: v1.NodePoolSpec{Disruption: v1.Disruption{
+					ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
+					ConsolidateAfter:    v1.MustParseNillableDuration(v1.Never),
+				}},
+			},
+		},
+		{
+			name: "annotated pool ignores consolidateAfter never",
+			pool: &v1.NodePool{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "score-pool",
+					Annotations: map[string]string{v1.ScoreBasedConsolidationAnnotationKey: ""},
+				},
+				Spec: v1.NodePoolSpec{Disruption: v1.Disruption{
+					ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
+					ConsolidateAfter:    v1.MustParseNillableDuration(v1.Never),
+				}},
+			},
+			enabled: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := standbyLifecycleEnabled(tc.pool); got != tc.enabled {
+				t.Fatalf("standbyLifecycleEnabled() = %v, want %v", got, tc.enabled)
 			}
 		})
-	}
-
-	t.Run("unannotated pool", func(t *testing.T) {
-		nodePool := &v1.NodePool{
-			ObjectMeta: metav1.ObjectMeta{Name: "score-pool"},
-			Spec: v1.NodePoolSpec{Disruption: v1.Disruption{
-				ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
-				ConsolidateAfter:    v1.MustParseNillableDuration(v1.Never),
-			}},
-		}
-		if standbyLifecycleEnabled(nodePool) {
-			t.Fatal("reclamation should remain disabled for an unannotated pool")
-		}
-	})
-}
-
-func TestReclamationIgnoresConsolidateAfter(t *testing.T) {
-	nodePool := &v1.NodePool{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        "score-pool",
-			Annotations: map[string]string{v1.ScoreBasedConsolidationAnnotationKey: ""},
-		},
-		Spec: v1.NodePoolSpec{Disruption: v1.Disruption{
-			ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
-			ConsolidateAfter:    v1.MustParseNillableDuration(v1.Never),
-		}},
-	}
-	if !standbyLifecycleEnabled(nodePool) {
-		t.Fatal("annotated reclamation must remain eligible when consolidateAfter is Never")
 	}
 }
 
@@ -347,16 +347,7 @@ func TestReclamationSkipsStandbyInsideSoak(t *testing.T) {
 	youngSince := now.Add(-5 * time.Second)
 	youngClaim, youngNode := reclamationTestNode("due-pool", "young-standby", true, true, false)
 	standby.SetNodeClaimStandby(youngClaim, true, youngSince)
-	kubeClient := fake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithObjects(pool, youngClaim, youngNode).
-		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
-			pod := obj.(*corev1.Pod)
-			if pod.Spec.NodeName == "" {
-				return nil
-			}
-			return []string{pod.Spec.NodeName}
-		}).Build()
+	kubeClient := reclamationTestClient(pool, youngClaim, youngNode)
 	cluster := state.NewCluster(clock, kubeClient, nil)
 	cluster.UpdateNodeClaim(youngClaim)
 	if err := cluster.UpdateNode(ctx, youngNode); err != nil {
@@ -390,90 +381,73 @@ func TestSelectReclamationCandidatesSelectsAllEligiblePerPool(t *testing.T) {
 	}
 }
 
-func TestScoreBasedNodeEmptyIgnoresCompletedAndNodeOwnedPods(t *testing.T) {
+func TestNodeEmptyForReclamation(t *testing.T) {
 	ctx := context.Background()
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}
-	daemon := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            "daemon",
-			Namespace:       "default",
-			OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "daemon"}},
-		},
-		Spec: corev1.PodSpec{NodeName: node.Name},
-	}
-	terminating := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "terminating",
-			Namespace:         "default",
-			DeletionTimestamp: &metav1.Time{Time: time.Now()},
-			Finalizers:        []string{"test.finalizer"},
-		},
-		Spec: corev1.PodSpec{NodeName: node.Name},
-	}
-	terminal := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "terminal", Namespace: "default", Finalizers: []string{"test.finalizer"}},
-		Spec:       corev1.PodSpec{NodeName: node.Name},
-		Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
-	}
-	mirror := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            "mirror",
-			Namespace:       "default",
-			OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: node.Name}},
-		},
-		Spec: corev1.PodSpec{NodeName: node.Name},
-	}
-	kubeClient := fake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithObjects(node, daemon, terminating, terminal, mirror).
-		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
-			pod := obj.(*corev1.Pod)
-			if pod.Spec.NodeName == "" {
-				return nil
-			}
-			return []string{pod.Spec.NodeName}
-		}).Build()
+	t.Run("ignores daemonset terminal mirror and terminating workload", func(t *testing.T) {
+		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}
+		daemon := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "daemon",
+				Namespace:       "default",
+				OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "DaemonSet", Name: "daemon"}},
+			},
+			Spec: corev1.PodSpec{NodeName: node.Name},
+		}
+		terminating := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "terminating",
+				Namespace:         "default",
+				DeletionTimestamp: &metav1.Time{Time: time.Now()},
+				Finalizers:        []string{"test.finalizer"},
+			},
+			Spec: corev1.PodSpec{NodeName: node.Name},
+		}
+		terminal := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "terminal", Namespace: "default", Finalizers: []string{"test.finalizer"}},
+			Spec:       corev1.PodSpec{NodeName: node.Name},
+			Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+		}
+		mirror := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "mirror",
+				Namespace:       "default",
+				OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: node.Name}},
+			},
+			Spec: corev1.PodSpec{NodeName: node.Name},
+		}
+		kubeClient := reclamationTestClient(node, daemon, terminating, terminal, mirror)
 
-	if empty, err := nodeEmpty(ctx, kubeClient, node); err != nil || empty {
-		t.Fatalf("nodeEmpty() = (%v, %v), want (false, nil) while a nonterminal workload pod is terminating", empty, err)
-	}
-	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(terminating), terminating); err != nil {
-		t.Fatal(err)
-	}
-	terminating.Finalizers = nil
-	if err := kubeClient.Update(ctx, terminating); err != nil {
-		t.Fatal(err)
-	}
-	if empty, err := nodeEmpty(ctx, kubeClient, node); err != nil || !empty {
-		t.Fatalf("nodeEmpty() = (%v, %v), want (true, nil) with only DaemonSet, terminal, and mirror pods bound", empty, err)
-	}
-}
+		if empty, err := nodeEmpty(ctx, kubeClient, node); err != nil || empty {
+			t.Fatalf("nodeEmpty() = (%v, %v), want (false, nil) while a nonterminal workload pod is terminating", empty, err)
+		}
+		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(terminating), terminating); err != nil {
+			t.Fatal(err)
+		}
+		terminating.Finalizers = nil
+		if err := kubeClient.Update(ctx, terminating); err != nil {
+			t.Fatal(err)
+		}
+		if empty, err := nodeEmpty(ctx, kubeClient, node); err != nil || !empty {
+			t.Fatalf("nodeEmpty() = (%v, %v), want (true, nil) with only DaemonSet, terminal, and mirror pods bound", empty, err)
+		}
+	})
 
-func TestReclamationEmptyDoesNotUseResourceRequests(t *testing.T) {
-	ctx := context.Background()
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}
-	zeroRequestPod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "zero-request", Namespace: "default"},
-		Spec: corev1.PodSpec{
-			NodeName: node.Name,
-			Containers: []corev1.Container{{
-				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")}},
-			}},
-		},
-	}
-	kubeClient := fake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithObjects(node, zeroRequestPod).
-		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
-			pod := obj.(*corev1.Pod)
-			if pod.Spec.NodeName == "" {
-				return nil
-			}
-			return []string{pod.Spec.NodeName}
-		}).Build()
-	if empty, err := nodeEmpty(ctx, kubeClient, node); err != nil || empty {
-		t.Fatalf("nodeEmpty() = (%v, %v), want (false, nil) for a bound zero-request workload pod", empty, err)
-	}
+	t.Run("treats zero-request bound pod as occupied", func(t *testing.T) {
+		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-2"}}
+		zeroRequestPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "zero-request", Namespace: "default"},
+			Spec: corev1.PodSpec{
+				NodeName: node.Name,
+				Containers: []corev1.Container{{
+					Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("0")}},
+				}},
+			},
+		}
+		kubeClient := reclamationTestClient(node, zeroRequestPod)
+		if empty, err := nodeEmpty(ctx, kubeClient, node); err != nil || empty {
+			t.Fatalf("nodeEmpty() = (%v, %v), want (false, nil) for a bound zero-request workload pod", empty, err)
+		}
+	})
 }
 
 func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
@@ -499,16 +473,7 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 		},
 	}, Spec: corev1.NodeSpec{ProviderID: nodeClaim.Status.ProviderID}}
 	standby.SetNodeTaint(node, true)
-	kubeClient := fake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithObjects(nodePool, nodeClaim, node).
-		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
-			pod := obj.(*corev1.Pod)
-			if pod.Spec.NodeName == "" {
-				return nil
-			}
-			return []string{pod.Spec.NodeName}
-		}).Build()
+	kubeClient := reclamationTestClient(nodePool, nodeClaim, node)
 	clk := clocktesting.NewFakeClock(now)
 	cluster := state.NewCluster(clk, kubeClient, nil)
 	consolidator := MakeConsolidation(clk, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
@@ -661,23 +626,14 @@ func newReclamationValidationFixture(t *testing.T, extraPoolNames ...string) *re
 	objects = append(objects, nodeClaim, node)
 	provider := &reclamationValidationCloudProvider{CloudProvider: fakeprovider.NewCloudProvider()}
 	provider.InstanceTypesForNodePool[pool.Name] = []*cloudprovider.InstanceType{fakeprovider.NewInstanceType("m6i.large")}
-	kubeClient := fake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithObjects(objects...).
-		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
-			pod := obj.(*corev1.Pod)
-			if pod.Spec.NodeName == "" {
-				return nil
-			}
-			return []string{pod.Spec.NodeName}
-		}).Build()
+	kubeClient := reclamationTestClient(objects...)
 	cluster := state.NewCluster(clock, kubeClient, provider)
 	cluster.UpdateNodeClaim(nodeClaim)
 	if err := cluster.UpdateNode(ctx, node); err != nil {
 		t.Fatal(err)
 	}
 	recorder := events.NewRecorder(record.NewFakeRecorder(20))
-	queue := NewQueue(kubeClient, recorder, cluster, clock, nil)
+	queue := NewTestQueue(kubeClient, recorder, cluster, clock, nil)
 	reclamation := NewReclamation(MakeConsolidation(clock, cluster, kubeClient, nil, provider, recorder, queue, nil))
 	candidate := &Candidate{StateNode: cluster.DeepCopyNodes()[0], NodePool: pool}
 	return &reclamationValidationFixture{

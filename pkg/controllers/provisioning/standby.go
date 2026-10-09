@@ -18,32 +18,22 @@ package provisioning
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/samber/lo"
-	"go.uber.org/multierr"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/klog/v2"
 
-	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
-	karpenterMetrics "sigs.k8s.io/karpenter/pkg/metrics"
+	standbypkg "sigs.k8s.io/karpenter/pkg/standby"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
-
-	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 func (p *Provisioner) resumeStandbyActivations(ctx context.Context, nodes state.StateNodes) error {
-	activating := lo.Filter(nodes, func(node *state.StateNode, _ int) bool {
-		return node != nil && !node.MarkedForDeletion() &&
-			(standby.IsNodeClaimActivating(node.NodeClaim) || standby.HasNodeActivationMarker(node.Node))
-	})
+	activating := standbypkg.FilterActivating(nodes)
 	if len(activating) == 0 {
 		return nil
 	}
-	if err := p.ActivateStandbyNodes(ctx, standby.ActivationSourceRecovery, activating...); err != nil {
+	if err := p.standbyCoordinator.Activate(ctx, standby.ActivationSourceRecovery, activating...); err != nil {
 		return err
 	}
 	for _, node := range activating {
@@ -64,50 +54,5 @@ func (p *Provisioner) activateScheduledStandbyNodes(ctx context.Context, results
 		}
 		return node.StateNode, true
 	})
-	return p.ActivateStandbyNodes(ctx, standby.ActivationSourceProvisioning, selected...)
-}
-
-// ActivateStandbyNodes activates retained nodes selected as scheduling
-// destinations. The NodeClaim marker is used as a persistent reservation so
-// reclamation cannot remove a node while its taint is being changed. The source
-// is persisted with that reservation so an interrupted activation keeps its origin.
-func (p *Provisioner) ActivateStandbyNodes(ctx context.Context, source standby.ActivationSource, nodes ...*state.StateNode) error {
-	var errs []error
-	for _, node := range nodes {
-		if node == nil || node.NodeClaim == nil ||
-			(!standby.IsNodeClaimStandby(node.NodeClaim) && !standby.IsNodeClaimActivating(node.NodeClaim) && !standby.HasNodeActivationMarker(node.Node)) {
-			continue
-		}
-		if err := p.activateStandbyNode(ctx, source, node); err != nil {
-			errs = append(errs, fmt.Errorf("activating node %q, %w", node.Name(), err))
-		}
-	}
-	return multierr.Combine(errs...)
-}
-
-func (p *Provisioner) activateStandbyNode(ctx context.Context, source standby.ActivationSource, stateNode *state.StateNode) error {
-	return standby.NewLifecycle(p.apiObjectReader(), p.kubeClient).Activate(ctx, stateNode.Node, stateNode.NodeClaim, source, func(resolvedSource standby.ActivationSource) {
-		recordStandbyActivation(ctx, stateNode, resolvedSource)
-	})
-}
-
-func recordStandbyActivation(ctx context.Context, stateNode *state.StateNode, source standby.ActivationSource) {
-	nodePool := stateNode.NodeClaim.Labels[v1.NodePoolLabelKey]
-	if nodePool == "" {
-		nodePool = "unknown"
-	}
-	instanceType := stateNode.NodeClaim.Labels[corev1.LabelInstanceTypeStable]
-	if instanceType == "" {
-		instanceType = "unknown"
-	}
-	StandbyNodesActivatedTotal.Inc(map[string]string{
-		karpenterMetrics.NodePoolLabel:     nodePool,
-		standbyActivationInstanceTypeLabel: instanceType,
-		standbyActivationSourceLabel:       string(source),
-	})
-	log.FromContext(ctx).WithValues(
-		"Node", klog.KObj(stateNode.Node),
-		"NodeClaim", klog.KObj(stateNode.NodeClaim),
-		"NodePool", klog.KRef("", nodePool),
-	).Info("activated standby node")
+	return p.standbyCoordinator.Activate(ctx, standby.ActivationSourceProvisioning, selected...)
 }

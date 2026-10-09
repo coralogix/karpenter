@@ -403,7 +403,7 @@ func (s *Reclamation) reclamationDeleteSucceeded(_ context.Context, candidate *C
 }
 
 func (s *Reclamation) apiReader() client.Reader {
-	if s.queue != nil && s.queue.apiReader != nil {
+	if s.queue != nil {
 		return s.queue.apiReader
 	}
 	return s.kubeClient

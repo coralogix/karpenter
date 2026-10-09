@@ -86,7 +86,7 @@ func (s *ScoreBasedConsolidation) validateLiveCompactionCommand(ctx context.Cont
 }
 
 func (s *ScoreBasedConsolidation) apiReader() client.Reader {
-	if s.queue != nil && s.queue.apiReader != nil {
+	if s.queue != nil {
 		return s.queue.apiReader
 	}
 	return s.kubeClient

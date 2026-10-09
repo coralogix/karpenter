@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/standby"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -136,7 +137,7 @@ var _ = Describe("Dynamic Resource Allocation", func() {
 		// allocated-device tracking state. The controller must be reconciled (hydrated) before a provisioning round
 		// that relies on the in-cluster allocated-device set — see provisionDRA.
 		draController = deviceallocation.NewController(env.Client)
-		draProvisioner = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client))
+		draProvisioner = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), standby.TestCoordinator(env.Client, env.Clock))
 	})
 
 	// provisionDRA reconciles the deviceallocation controller (so the allocator sees the current in-cluster allocated

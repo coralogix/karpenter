@@ -61,6 +61,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	pscheduling "sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/standby"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -102,7 +103,7 @@ var _ = BeforeSuite(func() {
 	nodeStateController = informer.NewNodeController(env.Client, cluster)
 	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
 	podStateController = informer.NewPodController(env.Client, cluster)
-	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client))
+	prov = provisioning.NewProvisioner(env.Client, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client), standby.TestCoordinator(env.Client, env.Clock))
 	podController = provisioning.NewPodController(env.Client, prov, cluster)
 })
 
@@ -2045,7 +2046,7 @@ var _ = Context("Scheduling", func() {
 						return []string{o.(*corev1.Pod).Spec.NodeName}
 					},
 				).Build()
-				provisioner := provisioning.NewProvisioner(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(kubeClient), virtualpods.NewVirtualPodCache(kubeClient))
+				provisioner := provisioning.NewProvisioner(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cloudProvider, cluster, env.Clock, deviceallocation.NewController(kubeClient), virtualpods.NewVirtualPodCache(kubeClient), standby.TestCoordinator(kubeClient, env.Clock))
 				controller := informer.NewNodeController(kubeClient, cluster)
 				// We try to provision a node for an initial unschedulable pod that will create nodeClaim and node bindings
 				ExpectApplied(ctx, kubeClient, nodePool)

@@ -58,6 +58,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
+	"sigs.k8s.io/karpenter/pkg/standby"
 	"sigs.k8s.io/karpenter/pkg/utils/daemonset"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
@@ -84,7 +85,7 @@ func WithReason(reason string) func(*LaunchOptions) {
 type Provisioner struct {
 	cloudProvider              cloudprovider.CloudProvider
 	kubeClient                 client.Client
-	apiReader                  client.Reader
+	standbyCoordinator         *standby.Coordinator
 	batcher                    *Batcher[types.UID]
 	volumeTopology             *scheduler.VolumeTopology
 	cluster                    *state.Cluster
@@ -98,12 +99,13 @@ type Provisioner struct {
 func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 	cloudProvider cloudprovider.CloudProvider, cluster *state.Cluster,
 	clock clock.Clock, deviceAllocationController *deviceallocation.Controller, virtualPodCache *virtualpods.Cache,
+	standbyCoordinator *standby.Coordinator,
 ) *Provisioner {
 	p := &Provisioner{
 		batcher:                    NewBatcher[types.UID](clock),
 		cloudProvider:              cloudProvider,
 		kubeClient:                 kubeClient,
-		apiReader:                  kubeClient,
+		standbyCoordinator:         standbyCoordinator,
 		volumeTopology:             scheduler.NewVolumeTopology(kubeClient),
 		cluster:                    cluster,
 		recorder:                   recorder,
@@ -124,24 +126,10 @@ func (p *Provisioner) Name() string {
 }
 
 func (p *Provisioner) Register(_ context.Context, m manager.Manager) error {
-	p.SetAPIReader(m.GetAPIReader())
 	return controllerruntime.NewControllerManagedBy(m).
 		Named(p.Name()).
 		WatchesRawSource(singleton.Source()).
 		Complete(singleton.AsReconciler(p))
-}
-
-func (p *Provisioner) SetAPIReader(reader client.Reader) {
-	if reader != nil {
-		p.apiReader = reader
-	}
-}
-
-func (p *Provisioner) apiObjectReader() client.Reader {
-	if p.apiReader != nil {
-		return p.apiReader
-	}
-	return p.kubeClient
 }
 
 func (p *Provisioner) Reconcile(ctx context.Context) (result reconciler.Result, err error) {

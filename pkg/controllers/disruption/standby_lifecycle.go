@@ -18,7 +18,6 @@ package disruption
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -26,7 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
+	standbypkg "sigs.k8s.io/karpenter/pkg/standby"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
@@ -76,33 +75,10 @@ func standbyReclamationSoakElapsed(nodePool *v1.NodePool, nodeClaim *v1.NodeClai
 	return now.Sub(since) > delay
 }
 
-// nodeOccupyingPods returns bound workload pods that must leave before a node can enter standby,
-// be reclaimed, or complete evacuation. DaemonSet pods are managed by their DaemonSet, terminal
-// pods have completed, and Node-owned mirror pods are managed by the kubelet. A nonterminal
-// terminating pod still occupies the node until it leaves or becomes terminal.
 func nodeOccupyingPods(ctx context.Context, reader client.Reader, node *corev1.Node) ([]*corev1.Pod, error) {
-	if node == nil {
-		return nil, fmt.Errorf("checking node occupancy without a Node")
-	}
-	if reader == nil {
-		return nil, fmt.Errorf("checking node occupancy without an API reader")
-	}
-	var podList corev1.PodList
-	if err := reader.List(ctx, &podList, client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
-		return nil, fmt.Errorf("listing pods, %w", err)
-	}
-	occupying := make([]*corev1.Pod, 0, len(podList.Items))
-	for i := range podList.Items {
-		pod := &podList.Items[i]
-		if podutils.IsOwnedByDaemonSet(pod) || podutils.IsTerminal(pod) || podutils.IsOwnedByNode(pod) {
-			continue
-		}
-		occupying = append(occupying, pod)
-	}
-	return occupying, nil
+	return standbypkg.NodeOccupyingPods(ctx, reader, node)
 }
 
 func nodeEmpty(ctx context.Context, reader client.Reader, node *corev1.Node) (bool, error) {
-	pods, err := nodeOccupyingPods(ctx, reader, node)
-	return len(pods) == 0, err
+	return standbypkg.NodeEmpty(ctx, reader, node)
 }

@@ -132,7 +132,7 @@ var _ = Describe("Non-empty node disruption pacing", func() {
 		ExpectSingletonReconciled(ctx, disruptionController)
 		Expect(queue.GetCommands()).To(HaveLen(1))
 
-		*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov))
+		*queue = lo.FromPtr(disruption.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov))
 		nodeClaims, nodes = paceConsolidatableNodes(nodePool, 2)
 		pods = paceReplicaSetPods(rs, 3)
 		ExpectApplied(ctx, env.Client, pods[0], pods[1], pods[2], nodeClaims[0], nodes[0], nodeClaims[1], nodes[1], nodePool)
@@ -173,7 +173,7 @@ var _ = Describe("Non-empty node disruption pacing", func() {
 		Expect(cmds[0].ConsolidationType()).To(Equal(disruption.MultiNodeConsolidationType))
 		Expect(cmds[0].Candidates).To(HaveLen(2))
 
-		*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov))
+		*queue = lo.FromPtr(disruption.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov))
 		nodeClaims, nodes = paceConsolidatableNodes(nodePool, 3)
 		pods = paceReplicaSetPods(rs, 4)
 		ExpectApplied(ctx, env.Client, pods[0], pods[1], pods[2], pods[3])

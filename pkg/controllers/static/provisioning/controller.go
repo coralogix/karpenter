@@ -44,6 +44,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/standby"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
@@ -63,7 +64,7 @@ func NewController(kubeClient client.Client, cluster *state.Cluster, recorder ev
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
 		cluster:       cluster,
-		provisioner:   provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache),
+		provisioner:   provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache, standby.NewCoordinator(kubeClient, kubeClient, clock)),
 	}
 }
 

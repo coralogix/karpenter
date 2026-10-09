@@ -22,7 +22,7 @@ Compaction completes by handing over an empty, tainted node. It does not decide 
 
 **Reclamation** decides only whether to keep empty standby nodes or remove them. `Reclamation` accepts nodes with both the persistent standby marker and matching node taint; naturally empty active nodes are handled by standby marking first. Reclamation reports reason `Empty`, is exempt from NodePool disruption budgets, and rechecks the live marker, taint, activation state, and pod list immediately before deleting. It does not wait for the consolidation TTL. The delete is conditional on the validated NodeClaim UID and resource version so an activation update and deletion cannot both win.
 
-**Provisioning and compaction** own activation. When they need capacity, they can untaint suitable standby nodes instead of launching new instances. Provisioning's scheduling simulation should consider standby capacity so activation and new capacity creation form one coordinated decision. Compatibility with pod requirements still matters.
+**Provisioning and compaction** decide *when* to activate standby capacity; the shared standby coordinator (see [Standby coordinator design](standby-coordinator-design.md)) executes the activation protocol and metrics. When they need capacity, they can untaint suitable standby nodes instead of launching new instances. Provisioning's scheduling simulation should consider standby capacity so activation and new capacity creation form one coordinated decision. Compatibility with pod requirements still matters.
 
 ## Reclamation policy
 
