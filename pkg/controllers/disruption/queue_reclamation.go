@@ -24,8 +24,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
@@ -121,4 +123,19 @@ func (q *Queue) reclamationNodePoolStillManaged(ctx context.Context, nodePoolNam
 		return NewUnrecoverableError(fmt.Errorf("reclamation NodePool %q is no longer eligible for reclamation", nodePool.Name))
 	}
 	return nil
+}
+
+func (q *Queue) reportReclamationCandidateDeleted(candidate *Candidate) error {
+	if candidate == nil || candidate.NodePool == nil {
+		return fmt.Errorf("reclamation candidate is missing its NodePool")
+	}
+	ReclamationNodeRemovalsTotal.Inc(map[string]string{metrics.NodePoolLabel: candidate.NodePool.Name})
+	return nil
+}
+
+func (q *Queue) reportReclamationBatchSucceeded(ctx context.Context, candidates []*Candidate) {
+	log.FromContext(ctx).Info("reclamation batch completed",
+		"removedNodes", len(candidates),
+		"nodePoolCounts", reclamationCandidateCounts(candidates),
+	)
 }

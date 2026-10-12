@@ -52,10 +52,6 @@ func (s *reclamationValidator) Validate(ctx context.Context, cmd Command, valida
 	if err != nil {
 		return Command{}, err
 	}
-	validatedCandidates, err = s.validateCandidates(ctx, validatedCandidates...)
-	if err != nil {
-		return Command{}, err
-	}
 	cmd.Candidates = validatedCandidates
 	return cmd, nil
 }

@@ -528,8 +528,8 @@ func TestReclamationValidationRefreshesOnlySelectedPools(t *testing.T) {
 	if len(validated.Candidates) != 1 {
 		t.Fatalf("validated candidate count = %d, want 1", len(validated.Candidates))
 	}
-	if got := fixture.provider.instanceTypePoolNames; len(got) != 2 || got[0] != fixture.pool.Name || got[1] != fixture.pool.Name {
-		t.Fatalf("GetInstanceTypes pools = %v, want only the selected pool on both selected-candidate refreshes", got)
+	if got := fixture.provider.instanceTypePoolNames; len(got) != 1 || got[0] != fixture.pool.Name {
+		t.Fatalf("GetInstanceTypes pools = %v, want only the selected pool on the selected-candidate refresh", got)
 	}
 }
 

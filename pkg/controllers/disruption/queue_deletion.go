@@ -40,6 +40,8 @@ const (
 	deletionPending deletionCandidatePhase = iota
 	deletionCallbackPending
 	deletionComplete
+
+	maxConcurrentCandidateDeletes = 16
 )
 
 type deletionExecutionState struct {
@@ -57,14 +59,22 @@ func (q *Queue) deleteCandidates(ctx, callbackCtx context.Context, cmd *Command)
 	}
 	q.Unlock()
 
+	workers := len(cmd.Candidates)
+	if workers > maxConcurrentCandidateDeletes {
+		workers = maxConcurrentCandidateDeletes
+	}
 	errs := make([]error, len(cmd.Candidates))
-	workqueue.ParallelizeUntil(ctx, len(cmd.Candidates), len(cmd.Candidates), func(i int) {
+	workqueue.ParallelizeUntil(ctx, workers, len(cmd.Candidates), func(i int) {
 		if err := q.deleteCandidate(ctx, cmd, progress, cmd.Candidates[i]); err != nil {
 			errs[i] = err
 		}
 	})
 	if err := multierr.Combine(errs...); err != nil {
 		return err
+	}
+	if _, ok := cmd.Method.(*Reclamation); ok {
+		q.reportReclamationBatchSucceeded(callbackCtx, cmd.Candidates)
+		return nil
 	}
 	if cmd.OnSuccess != nil {
 		return cmd.OnSuccess(callbackCtx)
@@ -104,6 +114,11 @@ func (q *Queue) deleteCandidate(ctx context.Context, cmd *Command, progress *del
 		metrics.NodePoolLabel:     candidate.NodeClaim.Labels[v1.NodePoolLabelKey],
 		metrics.CapacityTypeLabel: candidate.NodeClaim.Labels[v1.CapacityTypeLabelKey],
 	})
+	if _, ok := cmd.Method.(*Reclamation); ok {
+		if err := q.reportReclamationCandidateDeleted(candidate); err != nil {
+			return err
+		}
+	}
 	return q.runDeleteSuccessCallback(ctx, cmd, progress, candidate, providerID)
 }
 

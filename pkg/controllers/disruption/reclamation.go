@@ -29,7 +29,6 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
-	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
@@ -111,29 +110,17 @@ func (s *Reclamation) computeReclamationCommand(ctx context.Context, candidates 
 	}
 
 	cmd := Command{
-		Method:          s,
-		Action:          DeleteAction,
-		Candidates:      selected,
-		OnDeleteSuccess: s.reclamationDeleteSucceeded,
+		Method:     s,
+		Action:     DeleteAction,
+		Candidates: selected,
 	}
 
 	validated, err := s.validateReclamationCommand(ctx, cmd)
 	if err != nil || validated == nil {
 		return validated, err
 	}
-	validated.OnSuccess = reclamationBatchSucceeded(validated.Candidates)
 	logReclamationBatchSelected(ctx, validated.Candidates)
 	return validated, nil
-}
-
-func reclamationBatchSucceeded(candidates []*Candidate) func(context.Context) error {
-	return func(ctx context.Context) error {
-		log.FromContext(ctx).Info("reclamation batch completed",
-			"removedNodes", len(candidates),
-			"nodePoolCounts", reclamationCandidateCounts(candidates),
-		)
-		return nil
-	}
 }
 
 func logReclamationBatchSelected(ctx context.Context, candidates []*Candidate) {
@@ -279,14 +266,6 @@ func (s *Reclamation) reclamationCandidateNodeClaim(ctx context.Context, candida
 		return nil, false, nil
 	}
 	return nodeClaim, true, nil
-}
-
-func (s *Reclamation) reclamationDeleteSucceeded(_ context.Context, candidate *Candidate) error {
-	if candidate == nil || candidate.NodePool == nil {
-		return fmt.Errorf("reclamation candidate is missing its NodePool")
-	}
-	ReclamationNodeRemovalsTotal.Inc(map[string]string{metrics.NodePoolLabel: candidate.NodePool.Name})
-	return nil
 }
 
 //nolint:gocyclo // Keep the candidate's live NodeClaim, Node, and pod safety checks in one predicate.
