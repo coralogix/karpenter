@@ -39,11 +39,25 @@ func TestReclamationExecutionRefusesStalePlanning(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd)
-	if !IsUnrecoverableError(err) {
-		t.Fatalf("deleteCandidates() error = %v, want unrecoverable emptiness rejection", err)
+	if err != nil {
+		t.Fatalf("deleteCandidates() error = %v, want skip without failing the batch", err)
 	}
 	if h.tracker.deleteCallCount() != 0 {
 		t.Fatalf("delete attempts = %d, want 0", h.tracker.deleteCallCount())
+	}
+}
+
+func TestReclamationExecutionSkipsInvalidCandidateInBatch(t *testing.T) {
+	h := newReclamationExecutionHarness(t, 2)
+	workload := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "late-pod", Namespace: "default"}, Spec: corev1.PodSpec{NodeName: h.candidates[0].Node.Name}}
+	if err := h.kubeClient.Create(h.ctx, workload); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd); err != nil {
+		t.Fatalf("deleteCandidates() error = %v", err)
+	}
+	if h.tracker.deleteCallCount() != 1 {
+		t.Fatalf("delete attempts = %d, want 1 for the still-eligible candidate", h.tracker.deleteCallCount())
 	}
 }
 

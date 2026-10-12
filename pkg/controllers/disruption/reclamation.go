@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/awslabs/operatorpkg/option"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,36 +36,14 @@ const ReclamationType = "reclamation"
 
 type Reclamation struct {
 	consolidation
-	validator Validator
 }
 
 type reclamationInventory struct {
 	emptyNodeCounts map[string]emptyNodeCounts
 }
 
-func NewReclamation(c consolidation, opts ...option.Function[MethodOptions]) *Reclamation {
-	o := option.Resolve(append([]option.Function[MethodOptions]{WithValidator(NewReclamationValidator(c))}, opts...)...)
-	return &Reclamation{
-		consolidation: c,
-		validator:     o.validator,
-	}
-}
-
-func NewReclamationValidator(c consolidation) *reclamationValidator {
-	s := &Reclamation{consolidation: c}
-	return &reclamationValidator{
-		validation: validation{
-			clock:         c.clock,
-			cluster:       c.cluster,
-			kubeClient:    c.kubeClient,
-			provisioner:   c.provisioner,
-			cloudProvider: c.cloudProvider,
-			recorder:      c.recorder,
-			queue:         c.queue,
-			reason:        v1.DisruptionReasonEmpty,
-		},
-		reclamation: s,
-	}
+func NewReclamation(c consolidation) *Reclamation {
+	return &Reclamation{consolidation: c}
 }
 
 func (s *Reclamation) ShouldDisrupt(ctx context.Context, candidate *Candidate) bool {
@@ -108,18 +85,12 @@ func (s *Reclamation) computeReclamationCommand(ctx context.Context, candidates 
 		return nil, nil
 	}
 
-	cmd := Command{
+	logReclamationBatchSelected(ctx, selected)
+	return &Command{
 		Method:     s,
 		Action:     DeleteAction,
 		Candidates: selected,
-	}
-
-	validated, err := s.validateReclamationCommand(ctx, cmd)
-	if err != nil || validated == nil {
-		return validated, err
-	}
-	logReclamationBatchSelected(ctx, validated.Candidates)
-	return validated, nil
+	}, nil
 }
 
 func logReclamationBatchSelected(ctx context.Context, candidates []*Candidate) {
@@ -160,20 +131,8 @@ func selectReclamationCandidates(candidates []*Candidate) []*Candidate {
 	return selected
 }
 
-func (s *Reclamation) validateReclamationCommand(ctx context.Context, cmd Command) (*Command, error) {
-	validated, err := s.validator.Validate(ctx, cmd, 0)
-	if err != nil {
-		if IsValidationError(err) {
-			reason := getValidationFailureReason(err)
-			cmd.EmitRejectedEvents(s.recorder, reason)
-			return nil, nil
-		}
-		return nil, fmt.Errorf("validating reclamation, %w", err)
-	}
-	if len(validated.Candidates) == 0 {
-		return nil, nil
-	}
-	return &validated, nil
+func reclamationCandidateHasIdentity(candidate *Candidate) bool {
+	return candidate != nil && candidate.StateNode != nil && candidate.Node != nil && candidate.NodeClaim != nil && candidate.NodePool != nil
 }
 
 func (s *Reclamation) refreshReclamationInventory(ctx context.Context) error {

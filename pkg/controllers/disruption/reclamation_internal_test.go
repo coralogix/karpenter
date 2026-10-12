@@ -25,7 +25,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -34,8 +33,6 @@ import (
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	fakeprovider "sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
@@ -366,13 +363,10 @@ func TestReclamationComputeCommandSelectsEligibleCandidatesAcrossPools(t *testin
 	ctx := context.Background()
 	now := time.Date(2026, time.October, 10, 12, 0, 0, 0, time.UTC)
 	clock := clocktesting.NewFakeClock(now)
-	poolA := reclamationTestManagedPool("pool-a")
-	poolB := reclamationTestManagedPool("pool-b")
+	poolA := reclamationTestPool("pool-a")
+	poolB := reclamationTestPool("pool-b")
 	disabledPool := reclamationTestPool("disabled-pool")
 	disabledPool.Annotations = nil
-	provider := &reclamationValidationCloudProvider{CloudProvider: fakeprovider.NewCloudProvider()}
-	provider.InstanceTypesForNodePool[poolA.Name] = []*cloudprovider.InstanceType{fakeprovider.NewInstanceType("m6i.large")}
-	provider.InstanceTypesForNodePool[poolB.Name] = []*cloudprovider.InstanceType{fakeprovider.NewInstanceType("m6i.large")}
 	standbySince := now.Add(-30 * time.Second)
 	claimA, nodeA := reclamationTestNode("pool-a", "ready-a", true, true, false)
 	standby.SetNodeClaimStandby(claimA, true, standbySince)
@@ -386,7 +380,7 @@ func TestReclamationComputeCommandSelectsEligibleCandidatesAcrossPools(t *testin
 	disabledClaim, disabledNode := reclamationTestNode("disabled-pool", "disabled", true, true, false)
 	standby.SetNodeClaimStandby(disabledClaim, true, standbySince)
 	kubeClient := reclamationTestClient(poolA, poolB, disabledPool, claimA, nodeA, claimB, nodeB, youngClaim, youngNode, activatingClaim, activatingNode, disabledClaim, disabledNode)
-	cluster := state.NewCluster(clock, kubeClient, provider)
+	cluster := state.NewCluster(clock, kubeClient, nil)
 	for _, nodeClaim := range []*v1.NodeClaim{claimA, claimB, youngClaim, activatingClaim, disabledClaim} {
 		cluster.UpdateNodeClaim(nodeClaim)
 	}
@@ -397,7 +391,7 @@ func TestReclamationComputeCommandSelectsEligibleCandidatesAcrossPools(t *testin
 	}
 	recorder := events.NewRecorder(&record.FakeRecorder{})
 	queue := NewTestQueue(kubeClient, recorder, cluster, clock, nil)
-	reclamation := NewReclamation(MakeConsolidation(clock, cluster, kubeClient, nil, provider, recorder, queue, nil))
+	reclamation := NewReclamation(MakeConsolidation(clock, cluster, kubeClient, nil, nil, recorder, queue, nil))
 	cmd, err := reclamation.computeReclamationCommand(ctx, []*Candidate{
 		reclamationCandidate(poolA, claimA, nodeA),
 		reclamationCandidate(poolB, claimB, nodeB),
@@ -556,158 +550,4 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 	if err := queue.reclamationCandidateBeforeDelete(ctx, candidate); !IsUnrecoverableError(err) {
 		t.Fatalf("reclamationCandidateBeforeDelete() error for an activating node = %v, want unrecoverable", err)
 	}
-}
-
-func TestReclamationValidationRefreshesOnlySelectedPools(t *testing.T) {
-	fixture := newReclamationValidationFixture(t, "unrelated-pool")
-	fixture.provider.ErrorsForNodePool["unrelated-pool"] = errors.New("unrelated pool instance types unavailable")
-
-	validated, err := fixture.reclamation.validator.Validate(fixture.ctx, fixture.command(), 0)
-	if err != nil {
-		t.Fatalf("Validate() error = %v", err)
-	}
-	if len(validated.Candidates) != 1 {
-		t.Fatalf("validated candidate count = %d, want 1", len(validated.Candidates))
-	}
-	if got := fixture.provider.instanceTypePoolNames; len(got) != 1 || got[0] != fixture.pool.Name {
-		t.Fatalf("GetInstanceTypes pools = %v, want only the selected pool on the selected-candidate refresh", got)
-	}
-}
-
-func TestReclamationValidationRejectsSelectedCandidateSafetyChanges(t *testing.T) {
-	tests := []struct {
-		name   string
-		change func(*testing.T, *reclamationValidationFixture)
-	}{
-		{
-			name: "cluster deletion mark",
-			change: func(_ *testing.T, fixture *reclamationValidationFixture) {
-				fixture.cluster.MarkForDeletion(fixture.candidate.ProviderID())
-			},
-		},
-		{
-			name: "same-name replacement",
-			change: func(t *testing.T, fixture *reclamationValidationFixture) {
-				claim := fixture.candidate.NodeClaim.DeepCopy()
-				node := fixture.candidate.Node.DeepCopy()
-				if err := fixture.kubeClient.Delete(fixture.ctx, claim); err != nil {
-					t.Fatal(err)
-				}
-				if err := fixture.kubeClient.Delete(fixture.ctx, node); err != nil {
-					t.Fatal(err)
-				}
-				claim.UID = types.UID("replacement-claim-uid")
-				claim.ResourceVersion = ""
-				node.UID = types.UID("replacement-node-uid")
-				node.ResourceVersion = ""
-				if err := fixture.kubeClient.Create(fixture.ctx, claim); err != nil {
-					t.Fatal(err)
-				}
-				if err := fixture.kubeClient.Create(fixture.ctx, node); err != nil {
-					t.Fatal(err)
-				}
-			},
-		},
-		{
-			name: "daemonset pod do-not-disrupt",
-			change: func(t *testing.T, fixture *reclamationValidationFixture) {
-				pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-					Name:      "protected-daemon",
-					Namespace: "default",
-					Annotations: map[string]string{
-						v1.DoNotDisruptAnnotationKey: "true",
-					},
-					OwnerReferences: []metav1.OwnerReference{{Kind: "DaemonSet", Name: "system-daemon"}},
-				}, Spec: corev1.PodSpec{NodeName: fixture.candidate.Node.Name}}
-				pod.Status.Phase = corev1.PodRunning
-				if err := fixture.kubeClient.Create(fixture.ctx, pod); err != nil {
-					t.Fatal(err)
-				}
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			fixture := newReclamationValidationFixture(t)
-			tt.change(t, fixture)
-			_, err := fixture.reclamation.validator.Validate(fixture.ctx, fixture.command(), 0)
-			var churnErr *ChurnValidationError
-			if !errors.As(err, &churnErr) {
-				t.Fatalf("Validate() error = %v, want churn rejection", err)
-			}
-		})
-	}
-}
-
-type reclamationValidationFixture struct {
-	ctx         context.Context
-	kubeClient  client.Client
-	cluster     *state.Cluster
-	provider    *reclamationValidationCloudProvider
-	pool        *v1.NodePool
-	candidate   *Candidate
-	reclamation *Reclamation
-}
-
-func newReclamationValidationFixture(t *testing.T, extraPoolNames ...string) *reclamationValidationFixture {
-	t.Helper()
-	ctx := context.Background()
-	clock := clocktesting.NewFakeClock(time.Date(2026, time.September, 25, 13, 0, 0, 0, time.UTC))
-	pool := reclamationTestManagedPool("selected-pool")
-	objects := []client.Object{pool}
-	for _, name := range extraPoolNames {
-		objects = append(objects, reclamationTestManagedPool(name))
-	}
-	nodeClaim, node := reclamationTestNode(pool.Name, "selected-node", true, true, false)
-	nodeClaim.UID = types.UID("selected-claim-uid")
-	node.UID = types.UID("selected-node-uid")
-	node.Labels[v1.NodeRegisteredLabelKey] = "true"
-	objects = append(objects, nodeClaim, node)
-	provider := &reclamationValidationCloudProvider{CloudProvider: fakeprovider.NewCloudProvider()}
-	provider.InstanceTypesForNodePool[pool.Name] = []*cloudprovider.InstanceType{fakeprovider.NewInstanceType("m6i.large")}
-	kubeClient := reclamationTestClient(objects...)
-	cluster := state.NewCluster(clock, kubeClient, provider)
-	cluster.UpdateNodeClaim(nodeClaim)
-	if err := cluster.UpdateNode(ctx, node); err != nil {
-		t.Fatal(err)
-	}
-	recorder := events.NewRecorder(record.NewFakeRecorder(20))
-	queue := NewTestQueue(kubeClient, recorder, cluster, clock, nil)
-	reclamation := NewReclamation(MakeConsolidation(clock, cluster, kubeClient, nil, provider, recorder, queue, nil))
-	candidate := &Candidate{StateNode: cluster.DeepCopyNodes()[0], NodePool: pool}
-	return &reclamationValidationFixture{
-		ctx: ctx, kubeClient: kubeClient, cluster: cluster, provider: provider,
-		pool: pool, candidate: candidate, reclamation: reclamation,
-	}
-}
-
-func (f *reclamationValidationFixture) command() Command {
-	return Command{Method: f.reclamation, Candidates: []*Candidate{f.candidate}}
-}
-
-type reclamationValidationCloudProvider struct {
-	*fakeprovider.CloudProvider
-	instanceTypePoolNames []string
-}
-
-func (p *reclamationValidationCloudProvider) GetInstanceTypes(ctx context.Context, pool *v1.NodePool) ([]*cloudprovider.InstanceType, error) {
-	if pool != nil {
-		p.instanceTypePoolNames = append(p.instanceTypePoolNames, pool.Name)
-	}
-	return p.CloudProvider.GetInstanceTypes(ctx, pool)
-}
-
-func reclamationTestManagedPool(name string) *v1.NodePool {
-	return test.NodePool(v1.NodePool{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-			Annotations: map[string]string{
-				v1.ScoreBasedConsolidationAnnotationKey: "",
-			},
-		},
-		Spec: v1.NodePoolSpec{Disruption: v1.Disruption{
-			ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
-			ConsolidateAfter:    v1.MustParseNillableDuration("0s"),
-		}},
-	})
 }

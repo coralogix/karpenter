@@ -74,13 +74,13 @@ Standby ──provisioning or compaction activate──► Active (schedulable)
 
 - **Compaction** simulates placement, may activate existing standby nodes as destinations, taints sources, evicts non-daemon workloads, waits until occupying pods are gone, then persists standby on the evacuated node. It does **not** delete the NodeClaim.
 - **Standby marking** applies the same standby persistence to nodes that are **already** empty, without eviction.
-- **Reclamation** selects **all** standby candidates past reclamation delay in each pool on a pass (stable sort by node name within the pool), validates cached state for planning, then performs live Node/NodeClaim/pod checks immediately before deletion with a UID/resourceVersion precondition so activation and deletion cannot both succeed.
+- **Reclamation** selects **all** standby candidates past reclamation delay in each pool on a pass (stable sort by node name within the pool), using the same cached candidate admission as other disruption methods. At execution, each candidate is checked independently (identity, standby/activation, nomination, occupancy) and deleted with a UID/resourceVersion precondition so activation and deletion cannot both succeed. Candidates that become ineligible after selection are skipped without blocking unrelated deletions in the same batch.
 
 Reclamation delay: standby time must be **strictly greater than** the configured delay. Legacy marker value `true` skips reclamation delay. Nodes with an in-progress activation marker are not reclaimable.
 
 ## Consistency and API reads
 
-Disruption planning (candidate filtering, inventory, command validation, score-based compaction revalidation, and NodePool policy including pacing) uses the controller **cache** (`kubeClient`), matching upstream’s consistency model. Configuration and deleted NodePools take effect when the cache observes them; there is no fallback to uncached reads when the cache is stale or returns `NotFound`.
+Disruption planning (candidate filtering, inventory, score-based compaction revalidation, and NodePool policy including pacing) uses the controller **cache** (`kubeClient`), matching upstream’s consistency model. Reclamation does not rebuild consolidation candidates between selection and deletion. Configuration and deleted NodePools take effect when the cache observes them; there is no fallback to uncached reads when the cache is stale or returns `NotFound`.
 
 **Live reads** remain at execution boundaries: standby coordinator transitions (including occupancy before completing empty marking), evacuation pod polling, and the final reclamation delete safety checks (Node, NodeClaim, and pod occupancy immediately before conditional delete).
 

@@ -39,6 +39,7 @@ const maxConcurrentCandidateDeletes = 16
 
 type deletionExecutionState struct {
 	completed map[string]struct{}
+	deleted   []*Candidate
 }
 
 func (q *Queue) deleteCandidates(ctx, callbackCtx context.Context, cmd *Command) error {
@@ -65,8 +66,8 @@ func (q *Queue) deleteCandidates(ctx, callbackCtx context.Context, cmd *Command)
 	if err := multierr.Combine(errs...); err != nil {
 		return err
 	}
-	if _, ok := cmd.Method.(*Reclamation); ok {
-		q.reportReclamationBatchSucceeded(callbackCtx, cmd.Candidates)
+	if _, ok := cmd.Method.(*Reclamation); ok && len(progress.deleted) > 0 {
+		q.reportReclamationBatchSucceeded(callbackCtx, progress.deleted)
 	}
 	return nil
 }
@@ -81,6 +82,11 @@ func (q *Queue) deleteCandidate(ctx context.Context, cmd *Command, progress *del
 	}
 	if _, ok := cmd.Method.(*Reclamation); ok {
 		if err := q.reclamationCandidateBeforeDelete(ctx, candidate); err != nil {
+			if IsUnrecoverableError(err) {
+				q.cleanupSkippedReclamationCandidate(ctx, candidate)
+				q.markDeletionComplete(progress, providerID)
+				return nil
+			}
 			return fmt.Errorf("validating node before deletion, %w", err)
 		}
 	}
@@ -103,6 +109,7 @@ func (q *Queue) deleteCandidate(ctx context.Context, cmd *Command, progress *del
 		}
 	}
 	q.markDeletionComplete(progress, providerID)
+	q.markDeletionDeleted(progress, candidate)
 	return nil
 }
 
@@ -110,6 +117,19 @@ func (q *Queue) markDeletionComplete(progress *deletionExecutionState, providerI
 	q.Lock()
 	progress.completed[providerID] = struct{}{}
 	q.Unlock()
+}
+
+func (q *Queue) markDeletionDeleted(progress *deletionExecutionState, candidate *Candidate) {
+	q.Lock()
+	progress.deleted = append(progress.deleted, candidate)
+	q.Unlock()
+}
+
+func (q *Queue) cleanupSkippedReclamationCandidate(ctx context.Context, candidate *Candidate) {
+	q.cluster.UnmarkForDeletion(candidate.ProviderID())
+	stateNodes := []*state.StateNode{candidate.StateNode}
+	_ = state.RequireNoScheduleTaint(ctx, q.kubeClient, false, stateNodes...)
+	_ = state.ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, stateNodes...)
 }
 
 func (q *Queue) deleteNodeClaim(ctx context.Context, cmd *Command, candidate *Candidate) error {

@@ -51,7 +51,7 @@ func newReclamationQueueHarness(t *testing.T, candidateCount int, kubeClient cli
 	ctx := options.ToContext(context.Background(), test.Options())
 	now := time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC)
 	clk := clocktesting.NewFakeClock(now)
-	pool := reclamationTestManagedPool("reclamation-queue-pool")
+	pool := reclamationTestPool("reclamation-queue-pool")
 	objects := []client.Object{pool}
 	candidates := make([]*Candidate, 0, candidateCount)
 	for i := range candidateCount {
