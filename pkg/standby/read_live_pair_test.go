@@ -33,6 +33,7 @@ func TestReadLivePairRejectsStaleIdentity(t *testing.T) {
 	ctx := context.Background()
 	currentNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node", UID: types.UID("current-node")}, Spec: corev1.NodeSpec{ProviderID: "provider"}}
 	currentClaim := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "claim", UID: types.UID("current-claim")}}
+	currentClaim.Status.ProviderID = "provider"
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(currentNode, currentClaim).Build()
 	coordinator := TestCoordinator(kubeClient, nil)
 
@@ -57,4 +58,17 @@ func TestReadLivePairRejectsStaleIdentity(t *testing.T) {
 			}
 		})
 	}
+	t.Run("NodeClaim Status provider ID", func(t *testing.T) {
+		claim := currentClaim.DeepCopy()
+		claim.Status.ProviderID = "other-provider"
+		kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(currentNode, claim).Build()
+		coordinator := TestCoordinator(kubeClient, nil)
+		_, _, matches, err := coordinator.readLivePair(ctx, currentNode, currentClaim, "provider")
+		if err != nil {
+			t.Fatalf("reading live pair: %v", err)
+		}
+		if matches {
+			t.Fatal("mismatched NodeClaim provider ID matched the live pair")
+		}
+	})
 }

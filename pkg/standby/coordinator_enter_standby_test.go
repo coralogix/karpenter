@@ -33,13 +33,19 @@ import (
 
 type patchHookClient struct {
 	client.Client
-	afterPatch      func(context.Context, client.Object) error
-	beforeNodePatch func(*corev1.Node) error
+	afterPatch           func(context.Context, client.Object) error
+	beforeNodePatch      func(*corev1.Node) error
+	beforeNodeClaimPatch func(*karpv1.NodeClaim) error
 }
 
 func (c *patchHookClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
 	if node, ok := object.(*corev1.Node); ok && c.beforeNodePatch != nil {
 		if err := c.beforeNodePatch(node); err != nil {
+			return err
+		}
+	}
+	if claim, ok := object.(*karpv1.NodeClaim); ok && c.beforeNodeClaimPatch != nil {
+		if err := c.beforeNodeClaimPatch(claim); err != nil {
 			return err
 		}
 	}

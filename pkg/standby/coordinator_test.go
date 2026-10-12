@@ -39,18 +39,24 @@ import (
 
 func TestActivateStandbyNode(t *testing.T) {
 	ctx := context.Background()
+	providerID := "provider://standby-node"
 	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{Name: "standby-node"},
-		Spec:       corev1.NodeSpec{Taints: []corev1.Taint{utilstandby.NodeTaint()}},
+		ObjectMeta: metav1.ObjectMeta{Name: "standby-node", UID: types.UID("standby-node-uid")},
+		Spec: corev1.NodeSpec{
+			ProviderID: providerID,
+			Taints:     []corev1.Taint{utilstandby.NodeTaint()},
+		},
 	}
 	nodeClaim := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
 		Name: "standby-node",
+		UID:  types.UID("standby-node-claim-uid"),
 		Labels: map[string]string{
 			karpv1.NodePoolLabelKey:        "standby-observability-test",
 			corev1.LabelInstanceTypeStable: "m6i.large",
 		},
 		Annotations: map[string]string{utilstandby.NodeClaimAnnotationKey: "true"},
 	}}
+	nodeClaim.Status.ProviderID = providerID
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(node, nodeClaim).Build()
 	coordinator := TestCoordinator(kubeClient, nil)
 	stateNode := &state.StateNode{Node: node.DeepCopy(), NodeClaim: nodeClaim.DeepCopy()}
@@ -180,15 +186,21 @@ func TestActivateRecordsStandbyMetricsForRecoveryPaths(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			providerID := "provider://" + tc.nodeName
 			node := &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{Name: tc.nodeName},
-				Spec:       corev1.NodeSpec{Taints: []corev1.Taint{utilstandby.NodeTaint()}},
+				ObjectMeta: metav1.ObjectMeta{Name: tc.nodeName, UID: types.UID(tc.nodeName + "-node-uid")},
+				Spec: corev1.NodeSpec{
+					ProviderID: providerID,
+					Taints:     []corev1.Taint{utilstandby.NodeTaint()},
+				},
 			}
 			nodeClaim := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
 				Name:        tc.nodeName,
+				UID:         types.UID(tc.nodeName + "-claim-uid"),
 				Labels:      map[string]string{karpv1.NodePoolLabelKey: tc.nodePool},
 				Annotations: tc.annotations,
 			}}
+			nodeClaim.Status.ProviderID = providerID
 			kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(node, nodeClaim).Build()
 			coordinator := TestCoordinator(kubeClient, nil)
 			stateNode := &state.StateNode{Node: node.DeepCopy(), NodeClaim: nodeClaim.DeepCopy()}
