@@ -109,13 +109,9 @@ type Queue struct {
 	evictionQueue       *terminator.Queue
 }
 
-func (q *Queue) SetEvictionQueue(evictionQueue *terminator.Queue) {
-	q.evictionQueue = evictionQueue
-}
-
 // NewQueue creates a queue that will asynchronously orchestrate disruption commands
 func NewQueue(kubeClient client.Client, apiReader client.Reader, recorder events.Recorder, cluster *state.Cluster, clock clock.Clock,
-	provisioner *provisioning.Provisioner, standbyCoordinator *standby.Coordinator,
+	provisioner *provisioning.Provisioner, standbyCoordinator *standby.Coordinator, evictionQueue *terminator.Queue,
 ) *Queue {
 	queue := &Queue{
 		// nolint:staticcheck
@@ -129,13 +125,14 @@ func NewQueue(kubeClient client.Client, apiReader client.Reader, recorder events
 		clock:               clock,
 		provisioner:         provisioner,
 		standbyCoordinator:  standbyCoordinator,
+		evictionQueue:       evictionQueue,
 	}
 	return queue
 }
 
-func NewTestQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clk clock.Clock, provisioner *provisioning.Provisioner) *Queue {
+func NewTestQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clk clock.Clock, provisioner *provisioning.Provisioner, evictionQueue *terminator.Queue) *Queue {
 	coordinator := standby.TestCoordinator(kubeClient, clk)
-	return NewQueue(kubeClient, kubeClient, recorder, cluster, clk, provisioner, coordinator)
+	return NewQueue(kubeClient, kubeClient, recorder, cluster, clk, provisioner, coordinator, evictionQueue)
 }
 
 func (q *Queue) Name() string {

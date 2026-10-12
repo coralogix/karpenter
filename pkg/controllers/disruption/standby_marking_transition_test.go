@@ -127,8 +127,7 @@ func newEvacuationBarrierHarness(t *testing.T) *evacuationBarrierHarness {
 		t.Fatalf("initializing cluster state: %v", err)
 	}
 	recorder := events.NewRecorder(record.NewFakeRecorder(1))
-	queue := NewQueue(wrapped, base, recorder, cluster, clk, nil, coordinator)
-	queue.SetEvictionQueue(terminator.NewQueue(base, recorder))
+	queue := NewQueue(wrapped, base, recorder, cluster, clk, nil, coordinator, terminator.NewQueue(base, recorder))
 	cmd := &Command{
 		Method: NewDrift(wrapped, cluster, nil, recorder, clk), Action: EvacuateAction, CreationTimestamp: clk.Now(),
 		Candidates: []*Candidate{{StateNode: &state.StateNode{Node: node.DeepCopy(), NodeClaim: nodeClaim.DeepCopy()}, NodePool: nodePool}},
@@ -194,7 +193,7 @@ func TestCleanupRecoversOccupiedStandbyNodeWithDoNotDisruptPod(t *testing.T) {
 	ctx := context.Background()
 	kubeClient, cluster, clk, storedNode, storedClaim := occupiedStandbyRecoveryFixture(t, ctx)
 	coordinator := standbypkg.NewCoordinator(kubeClient, kubeClient, clk)
-	queue := NewQueue(kubeClient, kubeClient, events.NewRecorder(record.NewFakeRecorder(1)), cluster, clk, nil, coordinator)
+	queue := NewQueue(kubeClient, kubeClient, events.NewRecorder(record.NewFakeRecorder(1)), cluster, clk, nil, coordinator, nil)
 	if err := queue.cleanupStaleDisruptionState(ctx); err != nil {
 		t.Fatalf("recovering occupied standby node: %v", err)
 	}
@@ -338,7 +337,7 @@ func newStandbyQueueHarness(t *testing.T) *standbyQueueHarness {
 		t.Fatalf("initializing cluster state: %v", err)
 	}
 	coordinator := standbypkg.NewCoordinator(base, wrapped, clk)
-	queue := NewQueue(wrapped, base, ctxRecorder, cluster, clk, nil, coordinator)
+	queue := NewQueue(wrapped, base, ctxRecorder, cluster, clk, nil, coordinator, nil)
 	method := NewStandbyMarking(MakeConsolidation(clk, cluster, wrapped, nil, nil, ctxRecorder, queue, nil))
 	return &standbyQueueHarness{
 		ctx: ctx, client: wrapped, apiReader: base, node: node.DeepCopy(), nodeClaim: nodeClaim.DeepCopy(),

@@ -492,7 +492,7 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 	kubeClient := reclamationTestClient(nodePool, nodeClaim, node)
 	clk := clocktesting.NewFakeClock(now)
 	cluster := state.NewCluster(clk, kubeClient, nil)
-	queue := NewTestQueue(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cluster, clk, nil)
+	queue := NewTestQueue(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cluster, clk, nil, nil)
 	stateNode := state.NewNode()
 	stateNode.Node = node
 	stateNode.NodeClaim = nodeClaim
@@ -554,7 +554,7 @@ func TestReclamationRejectsBufferReservedNode(t *testing.T) {
 	if reclamation.ShouldDisrupt(ctx, candidate) {
 		t.Fatal("ShouldDisrupt() = true, want false for buffer-reserved standby node")
 	}
-	queue := NewTestQueue(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cluster, clk, nil)
+	queue := NewTestQueue(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cluster, clk, nil, nil)
 	if err := queue.reclamationCandidateBeforeDelete(ctx, candidate); !IsUnrecoverableError(err) {
 		t.Fatalf("reclamationCandidateBeforeDelete() error = %v, want unrecoverable for buffer reservation", err)
 	}

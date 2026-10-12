@@ -93,7 +93,7 @@ func newReclamationQueueHarness(t *testing.T, candidateCount int, kubeClient cli
 		candidate.Node = storedNode
 		candidate.NodeClaim = storedClaim
 	}
-	queue := NewTestQueue(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cluster, clk, nil)
+	queue := NewTestQueue(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cluster, clk, nil, nil)
 	consolidationMethod := MakeConsolidation(clk, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), queue, nil)
 	reclamation := NewReclamation(consolidationMethod)
 	cmd := &Command{
