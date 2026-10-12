@@ -52,8 +52,13 @@ func TestPlanningTaintsRemovesStandbyTaintForEligibleNode(t *testing.T) {
 	if len(planning) != 1 || planning[0] != other {
 		t.Fatalf("planning taints = %v, want only unrelated taint %v", planning, other)
 	}
-	if len(original) != 2 {
-		t.Fatalf("original taints changed: %v", node.Spec.Taints)
+	if len(node.Spec.Taints) != len(original) {
+		t.Fatalf("node taints mutated: got %v, want %v", node.Spec.Taints, original)
+	}
+	for i := range original {
+		if node.Spec.Taints[i] != original[i] {
+			t.Fatalf("node taints mutated: got %v, want %v", node.Spec.Taints, original)
+		}
 	}
 }
 

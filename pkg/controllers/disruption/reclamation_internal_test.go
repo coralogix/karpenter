@@ -362,18 +362,62 @@ func TestReclamationSkipsStandbyWithinReclamationDelay(t *testing.T) {
 	}
 }
 
-func TestSelectReclamationCandidatesSelectsAllEligiblePerPool(t *testing.T) {
-	pool := reclamationTestPool("due-pool")
-	claimA, nodeA := reclamationTestNode("due-pool", "standby-a", true, true, false)
-	claimB, nodeB := reclamationTestNode("due-pool", "standby-b", true, true, false)
-	claimC, nodeC := reclamationTestNode("due-pool", "standby-c", true, true, false)
-	selected := selectReclamationCandidates([]*Candidate{
-		reclamationCandidate(pool, claimA, nodeA),
-		reclamationCandidate(pool, claimB, nodeB),
-		reclamationCandidate(pool, claimC, nodeC),
+func TestReclamationComputeCommandSelectsEligibleCandidatesAcrossPools(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, time.October, 10, 12, 0, 0, 0, time.UTC)
+	clock := clocktesting.NewFakeClock(now)
+	poolA := reclamationTestManagedPool("pool-a")
+	poolB := reclamationTestManagedPool("pool-b")
+	disabledPool := reclamationTestPool("disabled-pool")
+	disabledPool.Annotations = nil
+	provider := &reclamationValidationCloudProvider{CloudProvider: fakeprovider.NewCloudProvider()}
+	provider.InstanceTypesForNodePool[poolA.Name] = []*cloudprovider.InstanceType{fakeprovider.NewInstanceType("m6i.large")}
+	provider.InstanceTypesForNodePool[poolB.Name] = []*cloudprovider.InstanceType{fakeprovider.NewInstanceType("m6i.large")}
+	standbySince := now.Add(-30 * time.Second)
+	claimA, nodeA := reclamationTestNode("pool-a", "ready-a", true, true, false)
+	standby.SetNodeClaimStandby(claimA, true, standbySince)
+	claimB, nodeB := reclamationTestNode("pool-b", "ready-b", true, true, false)
+	standby.SetNodeClaimStandby(claimB, true, standbySince)
+	youngClaim, youngNode := reclamationTestNode("pool-a", "young", true, true, false)
+	standby.SetNodeClaimStandby(youngClaim, true, now.Add(-5*time.Second))
+	activatingClaim, activatingNode := reclamationTestNode("pool-a", "activating", true, true, false)
+	standby.SetNodeClaimStandby(activatingClaim, true, standbySince)
+	standby.SetNodeClaimActivating(activatingClaim, true)
+	disabledClaim, disabledNode := reclamationTestNode("disabled-pool", "disabled", true, true, false)
+	standby.SetNodeClaimStandby(disabledClaim, true, standbySince)
+	kubeClient := reclamationTestClient(poolA, poolB, disabledPool, claimA, nodeA, claimB, nodeB, youngClaim, youngNode, activatingClaim, activatingNode, disabledClaim, disabledNode)
+	cluster := state.NewCluster(clock, kubeClient, provider)
+	for _, nodeClaim := range []*v1.NodeClaim{claimA, claimB, youngClaim, activatingClaim, disabledClaim} {
+		cluster.UpdateNodeClaim(nodeClaim)
+	}
+	for _, node := range []*corev1.Node{nodeA, nodeB, youngNode, activatingNode, disabledNode} {
+		if err := cluster.UpdateNode(ctx, node); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recorder := events.NewRecorder(&record.FakeRecorder{})
+	queue := NewTestQueue(kubeClient, recorder, cluster, clock, nil)
+	reclamation := NewReclamation(MakeConsolidation(clock, cluster, kubeClient, nil, provider, recorder, queue, nil))
+	cmd, err := reclamation.computeReclamationCommand(ctx, []*Candidate{
+		reclamationCandidate(poolA, claimA, nodeA),
+		reclamationCandidate(poolB, claimB, nodeB),
+		reclamationCandidate(poolA, youngClaim, youngNode),
+		reclamationCandidate(poolA, activatingClaim, activatingNode),
+		reclamationCandidate(disabledPool, disabledClaim, disabledNode),
 	})
-	if len(selected) != 3 {
-		t.Fatalf("selected candidate count = %d, want 3", len(selected))
+	if err != nil {
+		t.Fatalf("computeReclamationCommand() error = %v", err)
+	}
+	if cmd == nil {
+		t.Fatal("expected reclamation command for eligible standby nodes")
+	}
+	if len(cmd.Candidates) != 2 {
+		t.Fatalf("selected candidate count = %d, want 2 eligible nodes across pools", len(cmd.Candidates))
+	}
+	got := []string{cmd.Candidates[0].Node.Name, cmd.Candidates[1].Node.Name}
+	want := []string{"ready-a", "ready-b"}
+	if got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("selected candidates = %v, want ordered %v", got, want)
 	}
 }
 

@@ -24,10 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes/scheme"
-	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -56,54 +53,18 @@ func (c *patchHookClient) Patch(ctx context.Context, object client.Object, patch
 }
 
 type enterStandbyTestHarness struct {
-	ctx         context.Context
-	client      *patchHookClient
-	coordinator *Coordinator
-	node        *corev1.Node
-	nodeClaim   *karpv1.NodeClaim
+	*coordinatorTestFixture
 }
 
 func newEnterStandbyTestHarness(t *testing.T) *enterStandbyTestHarness {
 	t.Helper()
-	ctx := context.Background()
-	nodeClaim := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
-		Name: "standby-claim",
-		UID:  types.UID("standby-claim-uid"),
-		Labels: map[string]string{
-			karpv1.NodePoolLabelKey:        "standby-pool",
-			karpv1.CapacityTypeLabelKey:    karpv1.CapacityTypeOnDemand,
-			corev1.LabelInstanceTypeStable: "m5.large",
-		},
-	}}
-	nodeClaim.Status.ProviderID = "provider-id"
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
-		Name: "standby-node",
-		UID:  types.UID("standby-node-uid"),
-		Labels: map[string]string{
-			karpv1.NodePoolLabelKey:        "standby-pool",
-			karpv1.NodeInitializedLabelKey: "true",
-		},
-	}, Spec: corev1.NodeSpec{ProviderID: nodeClaim.Status.ProviderID}}
-	base := fake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithObjects(nodeClaim, node).
-		WithIndex(&corev1.Pod{}, "spec.nodeName", podNodeNameIndex).
-		Build()
-	wrapped := &patchHookClient{Client: base}
-	clk := clocktesting.NewFakeClock(time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC))
-	coordinator := NewCoordinator(base, wrapped, clk)
-	return &enterStandbyTestHarness{
-		ctx: ctx, client: wrapped, coordinator: coordinator,
-		node: node.DeepCopy(), nodeClaim: nodeClaim.DeepCopy(),
-	}
+	return &enterStandbyTestHarness{coordinatorTestFixture: newCoordinatorTestFixture(
+		t, "standby-node", "standby-claim", time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC),
+	)}
 }
 
 func (h *enterStandbyTestHarness) request() EnterStandbyRequest {
-	return EnterStandbyRequest{
-		NodeRef:      h.node,
-		NodeClaimRef: h.nodeClaim,
-		ProviderID:   h.nodeClaim.Status.ProviderID,
-	}
+	return h.enterStandbyRequest()
 }
 
 func (h *enterStandbyTestHarness) options() EnterStandbyOptions {

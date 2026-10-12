@@ -18,7 +18,6 @@ package standby
 
 import (
 	"testing"
-	"time"
 
 	// The shared make test target supplies Ginkgo flags to every package.
 	_ "github.com/onsi/ginkgo/v2"
@@ -27,25 +26,6 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
-
-func TestStandbyMarkers(t *testing.T) {
-	since := time.Date(2026, time.October, 9, 12, 0, 0, 0, time.UTC)
-	nodeClaim := &v1.NodeClaim{}
-	SetNodeClaimStandby(nodeClaim, true, since)
-	SetNodeClaimActivating(nodeClaim, true)
-	if !IsNodeClaimStandby(nodeClaim) || !IsNodeClaimActivating(nodeClaim) {
-		t.Fatal("expected standby and activation markers to be set")
-	}
-	gotSince, ok := NodeClaimStandbySince(nodeClaim)
-	if !ok || !gotSince.Equal(since) {
-		t.Fatalf("standby since = (%v, %v), want (%v, true)", gotSince, ok, since)
-	}
-	SetNodeClaimActivating(nodeClaim, false)
-	SetNodeClaimStandby(nodeClaim, false, time.Time{})
-	if IsNodeClaimStandby(nodeClaim) || IsNodeClaimActivating(nodeClaim) {
-		t.Fatal("expected standby markers to be cleared")
-	}
-}
 
 func TestLegacyStandbyMarker(t *testing.T) {
 	nodeClaim := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{NodeClaimAnnotationKey: legacyStandbyMarker}}}

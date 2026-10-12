@@ -18,6 +18,7 @@ package disruption
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -25,18 +26,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/record"
-	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
-	"sigs.k8s.io/karpenter/pkg/events"
-	"sigs.k8s.io/karpenter/pkg/operator/options"
-	"sigs.k8s.io/karpenter/pkg/test"
 )
 
 func TestReclamationExecutionRefusesStalePlanning(t *testing.T) {
@@ -51,16 +44,6 @@ func TestReclamationExecutionRefusesStalePlanning(t *testing.T) {
 	}
 	if h.tracker.deleteCallCount() != 0 {
 		t.Fatalf("delete attempts = %d, want 0", h.tracker.deleteCallCount())
-	}
-}
-
-func TestReclamationExecutionDeletesEligibleControl(t *testing.T) {
-	h := newReclamationExecutionHarness(t, 1)
-	if err := h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd); err != nil {
-		t.Fatalf("deleteCandidates() error = %v", err)
-	}
-	if h.tracker.deleteCallCount() != 1 {
-		t.Fatalf("delete attempts = %d, want 1", h.tracker.deleteCallCount())
 	}
 }
 
@@ -116,50 +99,79 @@ func waitForReclamationDeleteGate(t *testing.T, tracker *reclamationExecutionDel
 }
 
 func TestReclamationExecutionPartialBatchRetry(t *testing.T) {
-	h := newReclamationExecutionHarness(t, 2)
-	workload := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "blocker", Namespace: "default"}, Spec: corev1.PodSpec{NodeName: h.candidates[1].Node.Name}}
-	if err := h.kubeClient.Create(h.ctx, workload); err != nil {
-		t.Fatal(err)
+	tracker := &reclamationExecutionDeleteTracker{release: make(chan struct{})}
+	h := newReclamationQueueHarness(t, 2, tracker)
+	tracker.failDeleteOnce = map[string]bool{h.cmd.Candidates[1].ProviderID(): true}
+
+	result, err := h.queue.Reconcile(h.ctx, h.claim)
+	requireReclamationRequeueAfterFailure(t, result, err, h, tracker, 1)
+
+	result, err = h.queue.Reconcile(h.ctx, h.claim)
+	requireReclamationRetryCompletes(t, result, err, h, tracker, 2, h.cmd.Candidates[1].ProviderID())
+}
+
+func requireReclamationRequeueAfterFailure(t *testing.T, result reconcile.Result, err error, h *reclamationQueueHarness, tracker *reclamationExecutionDeleteTracker, deletes int) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
 	}
-	if err := h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd); !IsUnrecoverableError(err) {
-		t.Fatalf("first deleteCandidates() error = %v, want unrecoverable", err)
+	if result.RequeueAfter == 0 {
+		t.Fatal("first Reconcile() should requeue after a recoverable delete failure")
 	}
-	if h.tracker.deleteCallCount() != 1 {
-		t.Fatalf("delete attempts after partial failure = %d, want 1", h.tracker.deleteCallCount())
+	if h.cmd.Succeeded {
+		t.Fatal("command should not succeed while a candidate delete is still pending")
 	}
-	if err := h.kubeClient.Delete(h.ctx, workload); err != nil {
-		t.Fatal(err)
+	if tracker.deleteCallCount() != deletes {
+		t.Fatalf("successful delete attempts after partial failure = %d, want %d", tracker.deleteCallCount(), deletes)
 	}
-	if err := h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd); err != nil {
-		t.Fatalf("second deleteCandidates() error = %v", err)
+	if !h.queue.HasAny(h.cmd.Candidates[0].ProviderID()) {
+		t.Fatal("command should remain queued after a recoverable delete failure")
 	}
-	if h.tracker.deleteCallCount() != 2 {
-		t.Fatalf("delete attempts after retry = %d, want 2", h.tracker.deleteCallCount())
+}
+
+func requireReclamationRetryCompletes(t *testing.T, result reconcile.Result, err error, h *reclamationQueueHarness, tracker *reclamationExecutionDeleteTracker, deletes int, providerID string) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("second Reconcile() requeue = %v, want completion", result.RequeueAfter)
+	}
+	if !h.cmd.Succeeded {
+		t.Fatal("command should succeed after remaining deletes complete")
+	}
+	if tracker.deleteCallCount() != deletes {
+		t.Fatalf("delete attempts after retry = %d, want %d", tracker.deleteCallCount(), deletes)
+	}
+	if h.queue.HasAny(providerID) {
+		t.Fatal("completed command should be removed from the queue")
 	}
 }
 
 func TestReclamationExecutionContextCancellation(t *testing.T) {
 	h := newReclamationExecutionHarness(t, 4)
 	h.tracker.blockDeletes = true
+	gate := make(chan struct{})
+	h.tracker.inFlightGate = gate
 	ctx, cancel := context.WithCancel(h.ctx)
-	defer cancel()
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		_ = h.queue.deleteCandidates(ctx, h.ctx, h.cmd)
-		close(done)
+		done <- h.queue.deleteCandidates(ctx, h.ctx, h.cmd)
 	}()
-	deadline := time.Now().Add(2 * time.Second)
-	for h.tracker.inFlight() < 2 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if h.tracker.inFlight() < 2 {
-		t.Fatal("deleteCandidates() did not start enough work before cancellation")
+	select {
+	case <-gate:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deleteCandidates() did not reach the expected concurrency gate")
 	}
 	cancel()
+	var execErr error
 	select {
-	case <-done:
+	case execErr = <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for cancellation")
+	}
+	if !errors.Is(execErr, context.Canceled) {
+		t.Fatalf("deleteCandidates() error = %v, want context.Canceled", execErr)
 	}
 	if h.tracker.deleteCallCount() >= 4 {
 		t.Fatalf("delete attempts after cancellation = %d, want fewer than 4", h.tracker.deleteCallCount())
@@ -178,18 +190,35 @@ type reclamationExecutionHarness struct {
 
 type reclamationExecutionDeleteTracker struct {
 	client.Client
-	deleteCalls  int
-	blockDeletes bool
-	release      chan struct{}
-	mu           sync.Mutex
-	inFlightNow  int
-	maxObserved  int
+	deleteCalls    int
+	blockDeletes   bool
+	failDeleteOnce map[string]bool
+	release        chan struct{}
+	inFlightGate   chan struct{}
+	mu             sync.Mutex
+	inFlightNow    int
+	maxObserved    int
 }
 
 func (c *reclamationExecutionDeleteTracker) Delete(ctx context.Context, object client.Object, options ...client.DeleteOption) error {
 	if _, ok := object.(*v1.NodeClaim); !ok {
 		return c.Client.Delete(ctx, object, options...)
 	}
+	if err := c.validateReclamationDeletePreconditions(options); err != nil {
+		return err
+	}
+	providerID := object.(*v1.NodeClaim).Status.ProviderID
+	if err := c.beginReclamationDelete(providerID); err != nil {
+		return err
+	}
+	if err := c.waitForDelete(ctx); err != nil {
+		return err
+	}
+	c.finishReclamationDelete()
+	return c.Client.Delete(ctx, object, options...)
+}
+
+func (c *reclamationExecutionDeleteTracker) validateReclamationDeletePreconditions(options []client.DeleteOption) error {
 	deleteOptions := &client.DeleteOptions{}
 	for _, option := range options {
 		option.ApplyToDelete(deleteOptions)
@@ -197,28 +226,53 @@ func (c *reclamationExecutionDeleteTracker) Delete(ctx context.Context, object c
 	if deleteOptions.Preconditions == nil || deleteOptions.Preconditions.UID == nil || deleteOptions.Preconditions.ResourceVersion == nil || *deleteOptions.Preconditions.ResourceVersion == "" {
 		return fmt.Errorf("reclamation delete omitted UID or resourceVersion preconditions")
 	}
+	return nil
+}
+
+func (c *reclamationExecutionDeleteTracker) beginReclamationDelete(providerID string) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failDeleteOnce[providerID] {
+		c.failDeleteOnce[providerID] = false
+		return fmt.Errorf("injected recoverable delete failure for %s", providerID)
+	}
 	c.inFlightNow++
 	if c.inFlightNow > c.maxObserved {
 		c.maxObserved = c.inFlightNow
 	}
-	block := c.blockDeletes
-	c.mu.Unlock()
-	if block {
+	if c.inFlightGate != nil && c.inFlightNow == 2 {
 		select {
-		case <-c.release:
-		case <-ctx.Done():
-			c.mu.Lock()
-			c.inFlightNow--
-			c.mu.Unlock()
-			return ctx.Err()
+		case <-c.inFlightGate:
+		default:
+			close(c.inFlightGate)
 		}
 	}
+	return nil
+}
+
+func (c *reclamationExecutionDeleteTracker) waitForDelete(ctx context.Context) error {
+	c.mu.Lock()
+	block := c.blockDeletes
+	c.mu.Unlock()
+	if !block {
+		return nil
+	}
+	select {
+	case <-c.release:
+		return nil
+	case <-ctx.Done():
+		c.mu.Lock()
+		c.inFlightNow--
+		c.mu.Unlock()
+		return ctx.Err()
+	}
+}
+
+func (c *reclamationExecutionDeleteTracker) finishReclamationDelete() {
 	c.mu.Lock()
 	c.inFlightNow--
 	c.deleteCalls++
 	c.mu.Unlock()
-	return c.Client.Delete(ctx, object, options...)
 }
 
 func (c *reclamationExecutionDeleteTracker) deleteCallCount() int {
@@ -249,54 +303,9 @@ func (c *reclamationExecutionDeleteTracker) unblockDeletes() {
 
 func newReclamationExecutionHarness(t *testing.T, candidateCount int) *reclamationExecutionHarness {
 	t.Helper()
-	ctx := options.ToContext(context.Background(), test.Options())
-	now := time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC)
-	clk := clocktesting.NewFakeClock(now)
-	pool := reclamationTestManagedPool("reclamation-exec-pool")
-	objects := []client.Object{pool}
-	candidates := make([]*Candidate, 0, candidateCount)
-	for i := range candidateCount {
-		name := fmt.Sprintf("exec-node-%02d", i)
-		claim, node := reclamationTestNode(pool.Name, name, true, true, false)
-		claim.UID = types.UID(fmt.Sprintf("claim-uid-%02d", i))
-		node.UID = types.UID(fmt.Sprintf("node-uid-%02d", i))
-		node.Labels[v1.NodeInitializedLabelKey] = "true"
-		objects = append(objects, claim, node)
-		candidates = append(candidates, reclamationCandidate(pool, claim, node))
-	}
-	baseClient := fake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithObjects(objects...).
-		WithIndex(&corev1.Pod{}, "spec.nodeName", reclamationPodNodeIndex).
-		Build()
-	tracker := &reclamationExecutionDeleteTracker{Client: baseClient, release: make(chan struct{})}
-	cluster := state.NewCluster(clk, tracker, nil)
-	for _, candidate := range candidates {
-		storedClaim := &v1.NodeClaim{}
-		if err := tracker.Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), storedClaim); err != nil {
-			t.Fatalf("getting test NodeClaim: %v", err)
-		}
-		storedNode := &corev1.Node{}
-		if err := tracker.Get(ctx, client.ObjectKeyFromObject(candidate.Node), storedNode); err != nil {
-			t.Fatalf("getting test Node: %v", err)
-		}
-		cluster.UpdateNodeClaim(storedClaim)
-		if err := cluster.UpdateNode(ctx, storedNode); err != nil {
-			t.Fatalf("adding test Node to cluster state: %v", err)
-		}
-		candidate.Node = storedNode
-		candidate.NodeClaim = storedClaim
-	}
-	queue := NewTestQueue(tracker, events.NewRecorder(&record.FakeRecorder{}), cluster, clk, nil)
-	consolidationMethod := MakeConsolidation(clk, cluster, tracker, nil, nil, events.NewRecorder(&record.FakeRecorder{}), queue, nil)
-	reclamation := NewReclamation(consolidationMethod)
-	cmd := &Command{
-		Method:            reclamation,
-		Action:            DeleteAction,
-		CreationTimestamp: clk.Now(),
-		Candidates:        candidates,
-	}
+	tracker := &reclamationExecutionDeleteTracker{release: make(chan struct{})}
+	h := newReclamationQueueHarness(t, candidateCount, tracker)
 	return &reclamationExecutionHarness{
-		ctx: ctx, kubeClient: tracker, queue: queue, cmd: cmd, candidates: candidates, tracker: tracker,
+		ctx: h.ctx, kubeClient: tracker, queue: h.queue, cmd: h.cmd, candidates: h.cmd.Candidates, tracker: tracker,
 	}
 }

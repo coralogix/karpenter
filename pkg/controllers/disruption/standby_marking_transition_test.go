@@ -18,6 +18,7 @@ package disruption
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -31,8 +32,10 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	standbypkg "sigs.k8s.io/karpenter/pkg/standby"
@@ -60,6 +63,130 @@ func TestStandbyMarkingQueueRecoversWhenPodBindsDuringTransition(t *testing.T) {
 	h.assertWorkloadPresent(t, "late-workload")
 	if h.eventCount() != 0 {
 		t.Fatal("a transition recovered to active capacity must not emit a standby-marked event")
+	}
+}
+
+func TestEvacuationQueueRetainsBarrierUntilStandbyPersistenceCompletes(t *testing.T) {
+	h := newEvacuationBarrierHarness(t)
+	result, err := h.queue.Reconcile(h.ctx, h.nodeClaim)
+	h.assertEvacuationRetrying(t, result, err)
+
+	h.allowStandbyPersistence()
+	result, err = h.queue.Reconcile(h.ctx, h.nodeClaim)
+	h.assertEvacuationCompleted(t, result, err)
+}
+
+type evacuationBarrierHarness struct {
+	ctx       context.Context
+	base      client.Client
+	queue     *Queue
+	cmd       *Command
+	node      *corev1.Node
+	nodeClaim *v1.NodeClaim
+	allow     func()
+}
+
+func newEvacuationBarrierHarness(t *testing.T) *evacuationBarrierHarness {
+	t.Helper()
+	ctx := context.Background()
+	clk := clocktesting.NewFakeClock(time.Date(2026, time.October, 5, 10, 0, 0, 0, time.UTC))
+	nodePool := &v1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "standby-pool", Annotations: map[string]string{v1.ScoreBasedConsolidationAnnotationKey: ""}},
+		Spec:       v1.NodePoolSpec{Disruption: v1.Disruption{ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized}},
+	}
+	nodeClaim := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "evac-claim", UID: types.UID("evac-claim-uid"),
+		Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelInstanceTypeStable: "m5.large"},
+	}}
+	nodeClaim.Status.ProviderID = "provider-evac"
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: "evac-node", UID: types.UID("evac-node-uid"),
+		Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.NodeInitializedLabelKey: "true"},
+	}, Spec: corev1.NodeSpec{ProviderID: nodeClaim.Status.ProviderID, Taints: []corev1.Taint{v1.DisruptedNoScheduleTaint}}}
+	base := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(nodePool, nodeClaim, node).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", standbyMarkingPodNodeIndex).Build()
+	wrapped := &standbyTransitionClient{Client: base}
+	blockTaintWrites := true
+	wrapped.beforeNodePatch = func(node *corev1.Node) error {
+		if !blockTaintWrites {
+			return nil
+		}
+		claim := &v1.NodeClaim{}
+		if err := wrapped.Get(ctx, client.ObjectKeyFromObject(nodeClaim), claim); err != nil {
+			return err
+		}
+		if standby.IsNodeClaimStandby(claim) && standby.HasNodeTaint(node) {
+			return errors.New("injected transient standby persistence failure")
+		}
+		return nil
+	}
+	coordinator := standbypkg.NewCoordinator(base, wrapped, clk)
+	cluster := state.NewCluster(clk, wrapped, nil)
+	cluster.UpdateNodeClaim(nodeClaim.DeepCopy())
+	if err := cluster.UpdateNode(ctx, node.DeepCopy()); err != nil {
+		t.Fatalf("initializing cluster state: %v", err)
+	}
+	recorder := events.NewRecorder(record.NewFakeRecorder(1))
+	queue := NewQueue(wrapped, base, recorder, cluster, clk, nil, coordinator)
+	queue.SetEvictionQueue(terminator.NewQueue(base, recorder))
+	cmd := &Command{
+		Method: NewDrift(wrapped, cluster, nil, recorder, clk), Action: EvacuateAction, CreationTimestamp: clk.Now(),
+		Candidates: []*Candidate{{StateNode: &state.StateNode{Node: node.DeepCopy(), NodeClaim: nodeClaim.DeepCopy()}, NodePool: nodePool}},
+	}
+	queue.ProviderIDToCommand[nodeClaim.Status.ProviderID] = cmd
+	return &evacuationBarrierHarness{
+		ctx: ctx, base: base, queue: queue, cmd: cmd, node: node, nodeClaim: nodeClaim,
+		allow: func() { blockTaintWrites = false },
+	}
+}
+
+func (h *evacuationBarrierHarness) allowStandbyPersistence() { h.allow() }
+
+func (h *evacuationBarrierHarness) assertEvacuationRetrying(t *testing.T, result reconcile.Result, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter == 0 {
+		t.Fatal("first Reconcile() should requeue while standby persistence is incomplete")
+	}
+	if h.cmd.Succeeded {
+		t.Fatal("evacuation command must not succeed before standby persistence completes")
+	}
+	liveNode := &corev1.Node{}
+	if err := h.base.Get(h.ctx, client.ObjectKeyFromObject(h.node), liveNode); err != nil {
+		t.Fatalf("getting Node: %v", err)
+	}
+	if !hasDisruptionNoScheduleTaint(liveNode) {
+		t.Fatal("disruption barrier taint must remain until evacuation completes")
+	}
+	liveClaim := &v1.NodeClaim{}
+	if err := h.base.Get(h.ctx, client.ObjectKeyFromObject(h.nodeClaim), liveClaim); err != nil {
+		t.Fatalf("getting NodeClaim: %v", err)
+	}
+	if standbypkg.StandbyEntryComplete(liveNode, liveClaim) {
+		t.Fatal("standby entry must remain incomplete while persistence is failing")
+	}
+}
+
+func (h *evacuationBarrierHarness) assertEvacuationCompleted(t *testing.T, result reconcile.Result, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != 0 || !h.cmd.Succeeded {
+		t.Fatalf("second Reconcile() = (%v, succeeded=%v), want completion", result.RequeueAfter, h.cmd.Succeeded)
+	}
+	liveNode := &corev1.Node{}
+	if err := h.base.Get(h.ctx, client.ObjectKeyFromObject(h.node), liveNode); err != nil {
+		t.Fatalf("getting Node after success: %v", err)
+	}
+	liveClaim := &v1.NodeClaim{}
+	if err := h.base.Get(h.ctx, client.ObjectKeyFromObject(h.nodeClaim), liveClaim); err != nil {
+		t.Fatalf("getting NodeClaim after success: %v", err)
+	}
+	if hasDisruptionNoScheduleTaint(liveNode) || !standbypkg.StandbyEntryComplete(liveNode, liveClaim) {
+		t.Fatalf("evacuation should release the barrier and finish standby entry: node=%v claim=%v", liveNode.Spec.Taints, liveClaim.Annotations)
 	}
 }
 

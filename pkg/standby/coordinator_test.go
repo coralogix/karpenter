@@ -18,18 +18,22 @@ package standby
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	clocktesting "k8s.io/utils/clock/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	utilstandby "sigs.k8s.io/karpenter/pkg/utils/standby"
 
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
@@ -51,10 +55,32 @@ func TestActivateStandbyNode(t *testing.T) {
 	coordinator := TestCoordinator(kubeClient, nil)
 	stateNode := &state.StateNode{Node: node.DeepCopy(), NodeClaim: nodeClaim.DeepCopy()}
 
-	if _, err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode); err != nil {
+	actResult, err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode)
+	if err != nil {
 		t.Fatalf("activating standby node: %v", err)
 	}
+	if len(actResult.Activated) != 1 {
+		t.Fatalf("activated pair count = %d, want 1", len(actResult.Activated))
+	}
+	pair := actResult.Activated[0]
+	if pair.ProviderID != nodeClaim.Status.ProviderID || pair.NodeClaim.Name != nodeClaim.Name || !ActivationComplete(pair.Node, pair.NodeClaim) {
+		t.Fatalf("unexpected activation result: %+v", pair)
+	}
 
+	assertActivatedStandbyNode(t, ctx, kubeClient, node, nodeClaim)
+	if got := standbyActivationCount(t, "standby-observability-test", "m6i.large", string(utilstandby.ActivationSourceProvisioning)); got != 1 {
+		t.Fatalf("expected one standby activation, got %v", got)
+	}
+	if _, err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode); err != nil {
+		t.Fatalf("retrying activation: %v", err)
+	}
+	if got := standbyActivationCount(t, "standby-observability-test", "m6i.large", string(utilstandby.ActivationSourceProvisioning)); got != 1 {
+		t.Fatalf("expected idempotent retry not to increment activations, got %v", got)
+	}
+}
+
+func assertActivatedStandbyNode(t *testing.T, ctx context.Context, kubeClient client.Client, node *corev1.Node, nodeClaim *karpv1.NodeClaim) {
+	t.Helper()
 	storedNode := &corev1.Node{}
 	if err := kubeClient.Get(ctx, client.ObjectKey{Name: node.Name}, storedNode); err != nil {
 		t.Fatalf("getting activated node: %v", err)
@@ -69,14 +95,53 @@ func TestActivateStandbyNode(t *testing.T) {
 	if utilstandby.IsNodeClaimStandby(storedNodeClaim) || utilstandby.IsNodeClaimActivating(storedNodeClaim) {
 		t.Fatal("standby or activation marker remained after activation")
 	}
-	if got := standbyActivationCount(t, "standby-observability-test", "m6i.large", string(utilstandby.ActivationSourceProvisioning)); got != 1 {
-		t.Fatalf("expected one standby activation, got %v", got)
+}
+
+func TestActivatePartialSuccessSurvivesLaterFailure(t *testing.T) {
+	ctx := context.Background()
+	clk := clocktesting.NewFakeClock(time.Date(2026, time.October, 12, 12, 0, 0, 0, time.UTC))
+	since := clk.Now()
+	claimA := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "claim-a", UID: types.UID("claim-a-uid"), Labels: map[string]string{karpv1.NodePoolLabelKey: "pool"}}}
+	claimB := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "claim-b", UID: types.UID("claim-b-uid"), Labels: map[string]string{karpv1.NodePoolLabelKey: "pool"}}}
+	utilstandby.SetNodeClaimStandby(claimA, true, since)
+	utilstandby.SetNodeClaimStandby(claimB, true, since)
+	claimA.Status.ProviderID = "provider-a"
+	claimB.Status.ProviderID = "provider-b"
+	nodeA := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a", UID: types.UID("node-a-uid")}, Spec: corev1.NodeSpec{ProviderID: "provider-a", Taints: []corev1.Taint{utilstandby.NodeTaint()}}}
+	nodeB := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-b", UID: types.UID("node-b-uid")}, Spec: corev1.NodeSpec{ProviderID: "provider-b", Taints: []corev1.Taint{utilstandby.NodeTaint()}}}
+	base := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(claimA, nodeA, claimB, nodeB).Build()
+	wrapped := &patchHookClient{Client: base}
+	failSecond := true
+	wrapped.beforeNodePatch = func(node *corev1.Node) error {
+		if node.Name == nodeB.Name && failSecond {
+			failSecond = false
+			return errors.New("injected activation failure")
+		}
+		return nil
 	}
-	if _, err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode); err != nil {
-		t.Fatalf("retrying activation: %v", err)
+	coordinator := NewCoordinator(base, wrapped, clk)
+	stateA := &state.StateNode{Node: nodeA.DeepCopy(), NodeClaim: claimA.DeepCopy()}
+	stateB := &state.StateNode{Node: nodeB.DeepCopy(), NodeClaim: claimB.DeepCopy()}
+	actResult, err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateA, stateB)
+	if err == nil {
+		t.Fatal("expected activation to fail after partial success")
 	}
-	if got := standbyActivationCount(t, "standby-observability-test", "m6i.large", string(utilstandby.ActivationSourceProvisioning)); got != 1 {
-		t.Fatalf("expected idempotent retry not to increment activations, got %v", got)
+	if len(actResult.Activated) != 1 || actResult.Activated[0].NodeClaim.Name != claimA.Name {
+		t.Fatalf("partial activation result = %+v, want only the first node activated", actResult)
+	}
+	storedA := &karpv1.NodeClaim{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(claimA), storedA); err != nil {
+		t.Fatalf("getting first NodeClaim: %v", err)
+	}
+	if utilstandby.IsNodeClaimStandby(storedA) {
+		t.Fatal("successful activation should clear standby markers on the first NodeClaim")
+	}
+	storedB := &karpv1.NodeClaim{}
+	if err := base.Get(ctx, client.ObjectKeyFromObject(claimB), storedB); err != nil {
+		t.Fatalf("getting second NodeClaim: %v", err)
+	}
+	if !utilstandby.IsNodeClaimStandby(storedB) {
+		t.Fatal("failed activation should leave the second NodeClaim in standby")
 	}
 }
 

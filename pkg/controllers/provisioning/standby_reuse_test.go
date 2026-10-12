@@ -58,13 +58,13 @@ var _ = Describe("Provisioning", func() {
 			Expect(results.NewNodeClaims).To(BeEmpty())
 			Expect(results.ExistingNodeToPodMapping()[nodeClaim.Name]).To(ConsistOf(pod))
 
-			storedNode := &corev1.Node{}
-			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(node), storedNode)).To(Succeed())
-
+			storedNode := ExpectNodeExists(ctx, env.Client, node.Name)
 			storedClaim := &v1.NodeClaim{}
 			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), storedClaim)).To(Succeed())
 			Expect(standby.IsNodeClaimStandby(storedClaim)).To(BeFalse())
+			Expect(standby.IsNodeClaimActivating(storedClaim)).To(BeFalse())
 			Expect(standby.HasNodeTaint(storedNode)).To(BeFalse())
+			Expect(storedNode.Spec.ProviderID).To(Equal(node.Spec.ProviderID))
 
 			nodeClaims := &v1.NodeClaimList{}
 			Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
