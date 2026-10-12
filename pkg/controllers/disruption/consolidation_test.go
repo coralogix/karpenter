@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	"sigs.k8s.io/karpenter/pkg/controllers/disruption/testsupport"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
@@ -3103,7 +3104,7 @@ var _ = Describe("Consolidation", func() {
 				ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nc))
 			}
 			// Reset the disruption controller so consolidation methods are not cached as consolidated
-			*queue = lo.FromPtr(disruption.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov, nil))
+			*queue = lo.FromPtr(testsupport.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov, nil))
 			disruptionController = disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
 				disruption.WithMethods(NewMethodsWithNopValidator()...))
 			ExpectSingletonReconciled(ctx, disruptionController)

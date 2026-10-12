@@ -52,6 +52,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	"sigs.k8s.io/karpenter/pkg/controllers/disruption/testsupport"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -107,7 +108,7 @@ var _ = BeforeSuite(func() {
 	recorder = test.NewEventRecorder()
 	draController = deviceallocation.NewController(env.Client)
 	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), standby.TestCoordinator(env.Client, env.Clock))
-	queue = disruption.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov, nil)
+	queue = testsupport.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov, nil)
 })
 
 var _ = AfterSuite(func() {
@@ -134,7 +135,7 @@ var _ = BeforeEach(func() {
 		disruption.WithMethods(NewMethodsWithNopValidator(disruptionPacing)...), disruption.WithDisruptionPacing(disruptionPacing))
 	env.Clock.SetTime(time.Now())
 	cluster.Reset()
-	*queue = lo.FromPtr(disruption.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov, nil))
+	*queue = lo.FromPtr(testsupport.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov, nil))
 	cluster.MarkUnconsolidated()
 
 	// Reset Feature Flags to test defaults
@@ -479,7 +480,7 @@ var _ = Describe("Simulate Scheduling", func() {
 		defer hangCreateClient.Stop()
 
 		p := provisioning.NewProvisioner(hangCreateClient, recorder, cloudProvider, cluster, env.Clock, deviceallocation.NewController(hangCreateClient), virtualpods.NewVirtualPodCache(hangCreateClient), standby.TestCoordinator(hangCreateClient, env.Clock))
-		q := disruption.NewTestQueue(hangCreateClient, recorder, cluster, env.Clock, p, nil)
+		q := testsupport.NewTestQueue(hangCreateClient, recorder, cluster, env.Clock, p, nil)
 		dc := disruption.NewController(env.Clock, hangCreateClient, p, cloudProvider, recorder, cluster, q, clusterCost)
 
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{

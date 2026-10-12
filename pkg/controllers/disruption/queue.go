@@ -130,11 +130,6 @@ func NewQueue(kubeClient client.Client, apiReader client.Reader, recorder events
 	return queue
 }
 
-func NewTestQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clk clock.Clock, provisioner *provisioning.Provisioner, evictionQueue *terminator.Queue) *Queue {
-	coordinator := standby.TestCoordinator(kubeClient, clk)
-	return NewQueue(kubeClient, kubeClient, recorder, cluster, clk, provisioner, coordinator, evictionQueue)
-}
-
 func (q *Queue) Name() string {
 	return "disruption.queue"
 }

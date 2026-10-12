@@ -39,6 +39,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	"sigs.k8s.io/karpenter/pkg/controllers/disruption/testsupport"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -346,7 +347,7 @@ var _ = Describe("Queue", func() {
 		})
 		It("should wait for non-daemon pods to disappear before retaining an evacuated node", func() {
 			evictionQueue := terminator.NewQueue(env.Client, recorder)
-			*queue = lo.FromPtr(disruption.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov, evictionQueue))
+			*queue = lo.FromPtr(testsupport.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov, evictionQueue))
 			pod := test.Pod(test.PodOptions{NodeName: node1.Name})
 			terminalPod := test.Pod(test.PodOptions{NodeName: node1.Name})
 			terminalPod.Finalizers = []string{"testing/terminal-finalizer"}
@@ -415,7 +416,7 @@ var _ = Describe("Queue", func() {
 		})
 		It("should count each source NodeClaim evacuated by one completed command", func() {
 			evictionQueue := terminator.NewQueue(env.Client, recorder)
-			*queue = lo.FromPtr(disruption.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov, evictionQueue))
+			*queue = lo.FromPtr(testsupport.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov, evictionQueue))
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1, nodeClaim2, node2)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
 			stateNode1 := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
@@ -559,7 +560,7 @@ var _ = Describe("Queue", func() {
 		Context("CalculateRetryDuration", func() {
 			DescribeTable("should calculate correct timeout based on queue length",
 				func(numCommands int, expectedDuration time.Duration) {
-					q := disruption.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov, nil)
+					q := testsupport.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov, nil)
 					q.Lock()
 					for i := range numCommands {
 						q.ProviderIDToCommand[strconv.Itoa(i)] = &disruption.Command{}
