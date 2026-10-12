@@ -22,8 +22,6 @@ import (
 
 	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/samber/lo"
-	corev1 "k8s.io/api/core/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -53,7 +51,7 @@ func (q *Queue) cleanupStaleDisruptionState(ctx context.Context) error {
 	return nil
 }
 
-//nolint:gocyclo // This recovery pass intentionally keeps each live-state check beside the mutation it gates.
+//nolint:gocyclo // Each cluster node keeps its eligibility checks beside the repair call.
 func (q *Queue) recoverOccupiedStandbyNodes(ctx context.Context) error {
 	coordinator := q.standbyCoordinator
 	for _, stateNode := range q.cluster.DeepCopyNodes() {
@@ -64,59 +62,22 @@ func (q *Queue) recoverOccupiedStandbyNodes(ctx context.Context) error {
 			!standby.HasNodeTaint(stateNode.Node) && stateNode.Node.Annotations[standby.NodeClaimActivatingAnnotationKey] != "true" {
 			continue
 		}
-		node, nodeClaim, matches, err := coordinator.ReadLivePair(ctx, stateNode.Node, stateNode.NodeClaim, stateNode.ProviderID())
-		if err != nil {
-			return fmt.Errorf("getting live standby objects for Node %q, %w", stateNode.Name(), err)
-		}
-		if !matches ||
-			!node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() ||
-			nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
-			continue
-		}
-		repaired, err := coordinator.RepairOrphanStandbyTaint(ctx, node, nodeClaim)
-		if err != nil {
-			return err
-		}
-		if repaired {
-			if err := q.updateStandbyState(ctx, node, nodeClaim); err != nil {
-				return fmt.Errorf("refreshing Node %q after removing orphan standby taint, %w", node.Name, err)
-			}
-			continue
-		}
-		empty, err := nodeEmpty(ctx, q.apiReader, node)
-		if err != nil {
-			return fmt.Errorf("checking standby Node %q for bound workloads, %w", node.Name, err)
-		}
-		if empty {
-			continue
-		}
-		if err := coordinator.RepairOccupied(ctx, standbypkg.RepairRequest{
+		result, err := coordinator.RepairStandbyNode(ctx, standbypkg.RepairRequest{
 			NodeRef:      stateNode.Node,
 			NodeClaimRef: stateNode.NodeClaim,
 			ProviderID:   stateNode.ProviderID(),
-		}); err != nil {
-			return err
+		})
+		if err != nil {
+			return fmt.Errorf("repairing standby Node %q, %w", stateNode.Name(), err)
 		}
-		if err := q.refreshStandbyState(ctx, node.Name, nodeClaim.Name); err != nil {
-			return err
+		if result.Outcome != standbypkg.OutcomeRecovered || result.Node == nil || result.NodeClaim == nil {
+			continue
+		}
+		if err := q.updateStandbyState(ctx, result.Node, result.NodeClaim); err != nil {
+			return fmt.Errorf("refreshing Node %q after standby repair, %w", result.Node.Name, err)
 		}
 	}
 	return nil
-}
-
-func (q *Queue) refreshStandbyState(ctx context.Context, nodeName, nodeClaimName string) error {
-	node := &corev1.Node{}
-	if err := q.apiReader.Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
-		return fmt.Errorf("refreshing standby Node %q, %w", nodeName, err)
-	}
-	nodeClaim := &v1.NodeClaim{}
-	if err := q.apiReader.Get(ctx, client.ObjectKey{Name: nodeClaimName}, nodeClaim); err != nil {
-		return fmt.Errorf("refreshing standby NodeClaim %q, %w", nodeClaimName, err)
-	}
-	if !standbypkg.ActivationComplete(node, nodeClaim) {
-		return fmt.Errorf("standby activation for NodeClaim %q has not completed", nodeClaimName)
-	}
-	return q.updateStandbyState(ctx, node, nodeClaim)
 }
 
 func (q *Queue) ensureStandbyTaints(ctx context.Context, nodes ...*state.StateNode) error {

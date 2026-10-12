@@ -78,8 +78,6 @@ var _ = Describe("Reclamation execution", func() {
 		cmds, err := reclamation.ComputeCommands(ctx, map[string]int{}, &disruption.Candidate{StateNode: stateNode, NodePool: reclamationPool})
 		Expect(err).ToNot(HaveOccurred())
 		Expect(cmds).To(HaveLen(1))
-		Expect(cmds[0].OnDeleteSuccess).To(BeNil())
-		Expect(cmds[0].OnSuccess).To(BeNil())
 		cmds[0].CreationTimestamp = env.Clock.Now()
 		cmds[0].ID = uuid.New()
 

@@ -227,10 +227,8 @@ func replacementsFromNodeClaims(newNodeClaims ...*pscheduling.NodeClaim) []*Repl
 type Command struct {
 	Method
 
-	Succeeded       bool
-	Action          CommandAction
-	OnSuccess       func(context.Context) error
-	OnDeleteSuccess func(context.Context, *Candidate) error
+	Succeeded bool
+	Action    CommandAction
 
 	deletionExecution   *deletionExecutionState
 	evacuationExecution *evacuationExecutionState

@@ -367,14 +367,11 @@ func TestSelectReclamationCandidatesSelectsAllEligiblePerPool(t *testing.T) {
 	claimA, nodeA := reclamationTestNode("due-pool", "standby-a", true, true, false)
 	claimB, nodeB := reclamationTestNode("due-pool", "standby-b", true, true, false)
 	claimC, nodeC := reclamationTestNode("due-pool", "standby-c", true, true, false)
-	byPool := map[string][]*Candidate{
-		"due-pool": {
-			reclamationCandidate(pool, claimA, nodeA),
-			reclamationCandidate(pool, claimB, nodeB),
-			reclamationCandidate(pool, claimC, nodeC),
-		},
-	}
-	selected := selectReclamationCandidates(byPool)
+	selected := selectReclamationCandidates([]*Candidate{
+		reclamationCandidate(pool, claimA, nodeA),
+		reclamationCandidate(pool, claimB, nodeB),
+		reclamationCandidate(pool, claimC, nodeC),
+	})
 	if len(selected) != 3 {
 		t.Fatalf("selected candidate count = %d, want 3", len(selected))
 	}

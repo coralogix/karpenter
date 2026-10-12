@@ -29,7 +29,6 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/multierr"
 	"golang.org/x/time/rate"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -334,36 +333,11 @@ func (q *Queue) activateStandbyDestinations(ctx context.Context, cmd *Command) e
 	if len(stateNodes) == 0 {
 		return nil
 	}
-	if err := q.standbyCoordinator.Activate(ctx, utilstandby.ActivationSourceCompaction, stateNodes...); err != nil {
-		return err
+	actResult, err := q.standbyCoordinator.Activate(ctx, utilstandby.ActivationSourceCompaction, stateNodes...)
+	if applyErr := standby.ApplyActivationResult(ctx, q.cluster, stateNodes, actResult); applyErr != nil && err == nil {
+		return applyErr
 	}
-	return q.refreshActivatedStandbyNodes(ctx, stateNodes)
-}
-
-func (q *Queue) refreshActivatedStandbyNodes(ctx context.Context, nodes []*state.StateNode) error {
-	for _, stateNode := range nodes {
-		if stateNode == nil || stateNode.NodeClaim == nil || !standby.ActivationComplete(stateNode.Node, stateNode.NodeClaim) {
-			continue
-		}
-		nodeClaim := &v1.NodeClaim{}
-		if err := q.kubeClient.Get(ctx, client.ObjectKeyFromObject(stateNode.NodeClaim), nodeClaim); err != nil {
-			return fmt.Errorf("refreshing activated nodeclaim %q, %w", stateNode.NodeClaim.Name, err)
-		}
-		q.cluster.UpdateNodeClaim(nodeClaim)
-		stateNode.NodeClaim = nodeClaim
-		if stateNode.Node == nil {
-			continue
-		}
-		node := &corev1.Node{}
-		if err := q.kubeClient.Get(ctx, client.ObjectKeyFromObject(stateNode.Node), node); err != nil {
-			return fmt.Errorf("refreshing activated node %q, %w", stateNode.Node.Name, err)
-		}
-		if err := q.cluster.UpdateNode(ctx, node); err != nil {
-			return fmt.Errorf("updating cluster state for activated node %q, %w", node.Name, err)
-		}
-		stateNode.Node = node
-	}
-	return nil
+	return err
 }
 
 func (q *Queue) rollbackStart(ctx context.Context, cmd *Command, candidates []*Candidate, cause error) error {

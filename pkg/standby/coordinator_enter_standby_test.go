@@ -242,7 +242,8 @@ func TestEnterStandbyEmptyMarkingDoesNotRetaintAfterConcurrentActivation(t *test
 			return err
 		}
 		stateNode := &state.StateNode{Node: node, NodeClaim: claim.DeepCopy()}
-		return h.coordinator.Activate(ctx, utilstandby.ActivationSourceRecovery, stateNode)
+		_, err := h.coordinator.Activate(ctx, utilstandby.ActivationSourceRecovery, stateNode)
+		return err
 	}
 	result, err := h.coordinator.EnterStandby(ctx, h.request(), h.options())
 	if err != nil {

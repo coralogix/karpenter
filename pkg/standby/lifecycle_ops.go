@@ -28,55 +28,105 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/controllers/disruption/standbymetrics"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	utilstandby "sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-type lifecycle struct {
-	reader client.Reader
-	writer client.Client
+// readLivePair reads the Node before its NodeClaim, then verifies that both still identify the
+// objects from the caller's snapshot. The ordering lets an optimistic Node patch protect a
+// concurrent activation marker written before the NodeClaim check.
+func (c *Coordinator) readLivePair(ctx context.Context, nodeRef *corev1.Node, nodeClaimRef *v1.NodeClaim, providerID string) (*corev1.Node, *v1.NodeClaim, bool, error) {
+	if nodeRef == nil || nodeClaimRef == nil {
+		return nil, nil, false, fmt.Errorf("standby transition requires a Node and NodeClaim")
+	}
+	node := &corev1.Node{}
+	if err := c.reader.Get(ctx, client.ObjectKeyFromObject(nodeRef), node); err != nil {
+		return nil, nil, false, client.IgnoreNotFound(err)
+	}
+	nodeClaim := &v1.NodeClaim{}
+	if err := c.reader.Get(ctx, client.ObjectKeyFromObject(nodeClaimRef), nodeClaim); err != nil {
+		return nil, nil, false, client.IgnoreNotFound(err)
+	}
+	if node.UID != nodeRef.UID || nodeClaim.UID != nodeClaimRef.UID || node.Spec.ProviderID != providerID {
+		return nil, nil, false, nil
+	}
+	return node, nodeClaim, true, nil
 }
 
-func (l lifecycle) readLivePair(ctx context.Context, nodeRef *corev1.Node, nodeClaimRef *v1.NodeClaim, providerID string) (*corev1.Node, *v1.NodeClaim, bool, error) {
-	return utilstandby.NewLifecycle(l.reader, l.writer).ReadLivePair(ctx, nodeRef, nodeClaimRef, providerID)
-}
-
-func (l lifecycle) ensureNodeStandbyTaint(ctx context.Context, nodeRef *corev1.Node) error {
+func (c *Coordinator) ensureNodeStandbyTaint(ctx context.Context, nodeRef *corev1.Node) error {
 	if nodeRef == nil {
 		return fmt.Errorf("cannot restore standby taint without a Node")
 	}
 	node := &corev1.Node{}
-	if err := l.reader.Get(ctx, client.ObjectKeyFromObject(nodeRef), node); err != nil {
+	if err := c.reader.Get(ctx, client.ObjectKeyFromObject(nodeRef), node); err != nil {
 		return err
 	}
-	return l.applyNodeStandbyTaint(ctx, node)
+	return c.applyNodeStandbyTaint(ctx, node)
 }
 
-func (l lifecycle) ensureStandbyTaintForClaim(ctx context.Context, nodeRef *corev1.Node, nodeClaimRef *v1.NodeClaim) error {
+func (c *Coordinator) ensureStandbyTaintForClaim(ctx context.Context, nodeRef *corev1.Node, nodeClaimRef *v1.NodeClaim) error {
 	if nodeRef == nil || nodeClaimRef == nil {
 		return nil
 	}
 	node := &corev1.Node{}
-	if err := l.reader.Get(ctx, client.ObjectKeyFromObject(nodeRef), node); err != nil {
+	if err := c.reader.Get(ctx, client.ObjectKeyFromObject(nodeRef), node); err != nil {
 		return client.IgnoreNotFound(err)
 	}
 	if utilstandby.HasNodeActivationMarker(node) {
 		return nil
 	}
 	nodeClaim := &v1.NodeClaim{}
-	if err := l.reader.Get(ctx, client.ObjectKeyFromObject(nodeClaimRef), nodeClaim); err != nil {
+	if err := c.reader.Get(ctx, client.ObjectKeyFromObject(nodeClaimRef), nodeClaim); err != nil {
 		return client.IgnoreNotFound(err)
 	}
 	if !utilstandby.IsNodeClaimStandby(nodeClaim) || utilstandby.IsNodeClaimActivating(nodeClaim) {
 		return nil
 	}
-	return l.applyNodeStandbyTaint(ctx, node)
+	return c.applyNodeStandbyTaint(ctx, node)
 }
 
-func (l lifecycle) activate(ctx context.Context, nodeSnapshot *corev1.Node, nodeClaimSnapshot *v1.NodeClaim, requestedSource utilstandby.ActivationSource, onActivated func(utilstandby.ActivationSource)) error {
+func (c *Coordinator) activateNode(ctx context.Context, source utilstandby.ActivationSource, stateNode *state.StateNode) (*ActivationPair, error) {
+	if stateNode == nil || stateNode.NodeClaim == nil {
+		return nil, nil
+	}
+	if !utilstandby.IsNodeClaimStandby(stateNode.NodeClaim) && !utilstandby.IsNodeClaimActivating(stateNode.NodeClaim) &&
+		!utilstandby.HasNodeActivationMarker(stateNode.Node) {
+		return nil, nil
+	}
+	nodeSnapshot := stateNode.Node
+	nodeClaimSnapshot := stateNode.NodeClaim
+	providerID := stateNode.ProviderID()
+	if err := c.runActivation(ctx, nodeSnapshot, nodeClaimSnapshot, source, func(resolvedSource utilstandby.ActivationSource) {
+		standbymetrics.RecordActivation(ctx, stateNode, resolvedSource)
+	}); err != nil {
+		return nil, err
+	}
+	return c.confirmedActivationPair(ctx, nodeSnapshot, nodeClaimSnapshot, providerID)
+}
+
+func (c *Coordinator) confirmedActivationPair(ctx context.Context, nodeRef *corev1.Node, nodeClaimRef *v1.NodeClaim, providerID string) (*ActivationPair, error) {
+	node, nodeClaim, matches, err := c.readLivePair(ctx, nodeRef, nodeClaimRef, providerID)
+	if err != nil {
+		return nil, err
+	}
+	if !matches {
+		return nil, fmt.Errorf("activated standby destination %q was replaced", nodeClaimRef.Name)
+	}
+	if !node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() {
+		return nil, fmt.Errorf("activated standby destination %q is deleting", nodeClaimRef.Name)
+	}
+	if !ActivationComplete(node, nodeClaim) {
+		return nil, fmt.Errorf("standby activation for NodeClaim %q has not completed", nodeClaimRef.Name)
+	}
+	return &ActivationPair{ProviderID: providerID, Node: node, NodeClaim: nodeClaim}, nil
+}
+
+func (c *Coordinator) runActivation(ctx context.Context, nodeSnapshot *corev1.Node, nodeClaimSnapshot *v1.NodeClaim, requestedSource utilstandby.ActivationSource, onActivated func(utilstandby.ActivationSource)) error {
 	if nodeClaimSnapshot == nil {
 		return fmt.Errorf("reserving nodeclaim activation, missing NodeClaim")
 	}
-	started, source, err := l.reserveActivation(ctx, nodeClaimSnapshot, requestedSource)
+	started, source, err := c.reserveActivation(ctx, nodeClaimSnapshot, requestedSource)
 	if err != nil {
 		return fmt.Errorf("reserving nodeclaim activation, %w", err)
 	}
@@ -86,52 +136,52 @@ func (l lifecycle) activate(ctx context.Context, nodeSnapshot *corev1.Node, node
 	if nodeSnapshot == nil {
 		return fmt.Errorf("nodeclaim has no registered node")
 	}
-	if err := l.setNodeActivationMarker(ctx, nodeSnapshot.Name, true); err != nil {
+	if err := c.setNodeActivationMarker(ctx, nodeSnapshot.Name, true); err != nil {
 		return fmt.Errorf("marking node activation, %w", err)
 	}
-	activated, err := l.removeNodeStandbyTaint(ctx, nodeSnapshot.Name)
+	activated, err := c.removeNodeStandbyTaint(ctx, nodeSnapshot.Name)
 	if err != nil {
 		return fmt.Errorf("removing standby taint, %w", err)
 	}
 	if activated && onActivated != nil {
 		onActivated(source)
 	}
-	return l.completeActivation(ctx, nodeSnapshot.Name, nodeClaimSnapshot)
+	return c.completeActivation(ctx, nodeSnapshot.Name, nodeClaimSnapshot)
 }
 
-func (l lifecycle) patchNodeClaimStandby(ctx context.Context, nodeClaim *v1.NodeClaim, standby bool, since time.Time) error {
+func (c *Coordinator) patchNodeClaimStandby(ctx context.Context, nodeClaim *v1.NodeClaim, standby bool, since time.Time) error {
 	if nodeClaim == nil {
 		return fmt.Errorf("cannot update standby marker on a missing NodeClaim")
 	}
 	stored := nodeClaim.DeepCopy()
 	utilstandby.SetNodeClaimStandby(nodeClaim, standby, since)
-	return l.writer.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
+	return c.writer.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
 }
 
-func (l lifecycle) patchNodeStandbyTaint(ctx context.Context, node *corev1.Node, standby bool) error {
+func (c *Coordinator) patchNodeStandbyTaint(ctx context.Context, node *corev1.Node, standby bool) error {
 	if node == nil {
 		return fmt.Errorf("cannot update standby taint on a missing Node")
 	}
 	stored := node.DeepCopy()
 	utilstandby.SetNodeTaint(node, standby)
-	return l.writer.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
+	return c.writer.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
 }
 
-func (l lifecycle) applyNodeStandbyTaint(ctx context.Context, node *corev1.Node) error {
+func (c *Coordinator) applyNodeStandbyTaint(ctx context.Context, node *corev1.Node) error {
 	stored := node.DeepCopy()
 	utilstandby.SetNodeTaint(node, true)
 	if equality.Semantic.DeepEqual(stored, node) {
 		return nil
 	}
-	return l.writer.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
+	return c.writer.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
 }
 
-func (l lifecycle) reserveActivation(ctx context.Context, nodeClaimRef *v1.NodeClaim, requestedSource utilstandby.ActivationSource) (bool, utilstandby.ActivationSource, error) {
+func (c *Coordinator) reserveActivation(ctx context.Context, nodeClaimRef *v1.NodeClaim, requestedSource utilstandby.ActivationSource) (bool, utilstandby.ActivationSource, error) {
 	var started bool
 	source := utilstandby.ActivationSourceRecovery
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		nodeClaim := &v1.NodeClaim{}
-		if err := l.reader.Get(ctx, client.ObjectKeyFromObject(nodeClaimRef), nodeClaim); err != nil {
+		if err := c.reader.Get(ctx, client.ObjectKeyFromObject(nodeClaimRef), nodeClaim); err != nil {
 			return err
 		}
 		if !nodeClaim.DeletionTimestamp.IsZero() {
@@ -149,7 +199,7 @@ func (l lifecycle) reserveActivation(ctx context.Context, nodeClaimRef *v1.NodeC
 		source = normalizeActivationSource(requestedSource)
 		utilstandby.SetNodeClaimActivating(nodeClaim, true)
 		utilstandby.SetNodeClaimActivationSource(nodeClaim, source)
-		if err := l.writer.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
+		if err := c.writer.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
 			return err
 		}
 		started = true
@@ -158,10 +208,10 @@ func (l lifecycle) reserveActivation(ctx context.Context, nodeClaimRef *v1.NodeC
 	return started, source, err
 }
 
-func (l lifecycle) setNodeActivationMarker(ctx context.Context, nodeName string, activating bool) error {
+func (c *Coordinator) setNodeActivationMarker(ctx context.Context, nodeName string, activating bool) error {
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		node := &corev1.Node{}
-		if err := l.reader.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+		if err := c.reader.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
 			return err
 		}
 		if activating == utilstandby.HasNodeActivationMarker(node) {
@@ -176,21 +226,21 @@ func (l lifecycle) setNodeActivationMarker(ctx context.Context, nodeName string,
 		} else if node.Annotations != nil {
 			delete(node.Annotations, utilstandby.NodeClaimActivatingAnnotationKey)
 		}
-		return l.writer.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
+		return c.writer.Patch(ctx, node, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
 	})
 }
 
-func (l lifecycle) removeNodeStandbyTaint(ctx context.Context, nodeName string) (bool, error) {
+func (c *Coordinator) removeNodeStandbyTaint(ctx context.Context, nodeName string) (bool, error) {
 	var removed bool
 	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		node := &corev1.Node{}
-		if err := l.reader.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
+		if err := c.reader.Get(ctx, types.NamespacedName{Name: nodeName}, node); err != nil {
 			return err
 		}
 		if !utilstandby.HasNodeTaint(node) {
 			return nil
 		}
-		if err := l.patchNodeStandbyTaint(ctx, node, false); err != nil {
+		if err := c.patchNodeStandbyTaint(ctx, node, false); err != nil {
 			return err
 		}
 		removed = true
@@ -199,20 +249,20 @@ func (l lifecycle) removeNodeStandbyTaint(ctx context.Context, nodeName string) 
 	return removed, err
 }
 
-func (l lifecycle) completeActivation(ctx context.Context, nodeName string, nodeClaimRef *v1.NodeClaim) error {
-	if err := l.finishActivation(ctx, nodeClaimRef); err != nil {
+func (c *Coordinator) completeActivation(ctx context.Context, nodeName string, nodeClaimRef *v1.NodeClaim) error {
+	if err := c.finishActivation(ctx, nodeClaimRef); err != nil {
 		return fmt.Errorf("clearing activation markers, %w", err)
 	}
-	if err := l.setNodeActivationMarker(ctx, nodeName, false); err != nil {
+	if err := c.setNodeActivationMarker(ctx, nodeName, false); err != nil {
 		return fmt.Errorf("clearing node activation marker, %w", err)
 	}
 	return nil
 }
 
-func (l lifecycle) finishActivation(ctx context.Context, nodeClaimRef *v1.NodeClaim) error {
+func (c *Coordinator) finishActivation(ctx context.Context, nodeClaimRef *v1.NodeClaim) error {
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		nodeClaim := &v1.NodeClaim{}
-		if err := l.reader.Get(ctx, client.ObjectKeyFromObject(nodeClaimRef), nodeClaim); err != nil {
+		if err := c.reader.Get(ctx, client.ObjectKeyFromObject(nodeClaimRef), nodeClaim); err != nil {
 			return err
 		}
 		if !utilstandby.IsNodeClaimStandby(nodeClaim) && !utilstandby.IsNodeClaimActivating(nodeClaim) && utilstandby.NodeClaimActivationSource(nodeClaim) == "" {
@@ -222,7 +272,7 @@ func (l lifecycle) finishActivation(ctx context.Context, nodeClaimRef *v1.NodeCl
 		utilstandby.SetNodeClaimStandby(nodeClaim, false, time.Time{})
 		utilstandby.SetNodeClaimActivating(nodeClaim, false)
 		utilstandby.SetNodeClaimActivationSource(nodeClaim, "")
-		return l.writer.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
+		return c.writer.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
 	})
 }
 

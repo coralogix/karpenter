@@ -22,6 +22,7 @@ import (
 	"sort"
 
 	"github.com/awslabs/operatorpkg/option"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -99,12 +100,10 @@ func (s *Reclamation) computeReclamationCommand(ctx context.Context, candidates 
 	if err := s.refreshReclamationInventory(ctx); err != nil {
 		return nil, err
 	}
-	byPool := s.reclamationCandidatesByPool(ctx, candidates)
-	if len(byPool) == 0 {
-		return nil, nil
-	}
-
-	selected := selectReclamationCandidates(byPool)
+	eligible := lo.Filter(candidates, func(candidate *Candidate, _ int) bool {
+		return s.reclamationCandidateEligible(candidate)
+	})
+	selected := selectReclamationCandidates(eligible)
 	if len(selected) == 0 {
 		return nil, nil
 	}
@@ -141,35 +140,23 @@ func reclamationCandidateCounts(candidates []*Candidate) map[string]int {
 	return counts
 }
 
-func (s *Reclamation) reclamationCandidatesByPool(ctx context.Context, candidates []*Candidate) map[string][]*Candidate {
-	byPool := map[string][]*Candidate{}
+func selectReclamationCandidates(candidates []*Candidate) []*Candidate {
+	var selected []*Candidate
 	for _, candidate := range candidates {
 		if candidate == nil || candidate.NodePool == nil || !standbyLifecycleEnabled(candidate.NodePool) {
 			continue
 		}
-		if !s.isReclamationCandidateAvailable(ctx, candidate) {
+		if !reclamationCandidateHasIdentity(candidate) {
 			continue
 		}
-		name := candidate.NodePool.Name
-		byPool[name] = append(byPool[name], candidate)
+		selected = append(selected, candidate)
 	}
-	return byPool
-}
-
-func selectReclamationCandidates(byPool map[string][]*Candidate) []*Candidate {
-	poolNames := make([]string, 0, len(byPool))
-	for name := range byPool {
-		poolNames = append(poolNames, name)
-	}
-	sort.Strings(poolNames)
-	var selected []*Candidate
-	for _, name := range poolNames {
-		poolCandidates := append([]*Candidate(nil), byPool[name]...)
-		sort.Slice(poolCandidates, func(i, j int) bool {
-			return poolCandidates[i].Name() < poolCandidates[j].Name()
-		})
-		selected = append(selected, poolCandidates...)
-	}
+	sort.Slice(selected, func(i, j int) bool {
+		if selected[i].NodePool.Name != selected[j].NodePool.Name {
+			return selected[i].NodePool.Name < selected[j].NodePool.Name
+		}
+		return selected[i].Name() < selected[j].Name()
+	})
 	return selected
 }
 

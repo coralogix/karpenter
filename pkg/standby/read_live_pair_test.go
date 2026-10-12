@@ -29,12 +29,12 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
-func TestLifecycleReadLivePairRejectsStaleIdentity(t *testing.T) {
+func TestReadLivePairRejectsStaleIdentity(t *testing.T) {
 	ctx := context.Background()
 	currentNode := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node", UID: types.UID("current-node")}, Spec: corev1.NodeSpec{ProviderID: "provider"}}
 	currentClaim := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "claim", UID: types.UID("current-claim")}}
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(currentNode, currentClaim).Build()
-	lifecycle := NewLifecycle(kubeClient, kubeClient)
+	coordinator := TestCoordinator(kubeClient, nil)
 
 	tests := []struct {
 		name       string
@@ -48,7 +48,7 @@ func TestLifecycleReadLivePairRejectsStaleIdentity(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, _, matches, err := lifecycle.ReadLivePair(ctx, test.nodeRef, test.claimRef, test.providerID)
+			_, _, matches, err := coordinator.readLivePair(ctx, test.nodeRef, test.claimRef, test.providerID)
 			if err != nil {
 				t.Fatalf("reading live pair: %v", err)
 			}

@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	"go.uber.org/multierr"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
@@ -34,18 +35,10 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
 )
 
-type deletionCandidatePhase uint8
-
-const (
-	deletionPending deletionCandidatePhase = iota
-	deletionCallbackPending
-	deletionComplete
-
-	maxConcurrentCandidateDeletes = 16
-)
+const maxConcurrentCandidateDeletes = 16
 
 type deletionExecutionState struct {
-	candidates map[string]deletionCandidatePhase
+	completed map[string]struct{}
 }
 
 func (q *Queue) deleteCandidates(ctx, callbackCtx context.Context, cmd *Command) error {
@@ -54,8 +47,8 @@ func (q *Queue) deleteCandidates(ctx, callbackCtx context.Context, cmd *Command)
 		cmd.deletionExecution = &deletionExecutionState{}
 	}
 	progress := cmd.deletionExecution
-	if progress.candidates == nil {
-		progress.candidates = map[string]deletionCandidatePhase{}
+	if progress.completed == nil {
+		progress.completed = map[string]struct{}{}
 	}
 	q.Unlock()
 
@@ -74,10 +67,6 @@ func (q *Queue) deleteCandidates(ctx, callbackCtx context.Context, cmd *Command)
 	}
 	if _, ok := cmd.Method.(*Reclamation); ok {
 		q.reportReclamationBatchSucceeded(callbackCtx, cmd.Candidates)
-		return nil
-	}
-	if cmd.OnSuccess != nil {
-		return cmd.OnSuccess(callbackCtx)
 	}
 	return nil
 }
@@ -85,16 +74,10 @@ func (q *Queue) deleteCandidates(ctx, callbackCtx context.Context, cmd *Command)
 func (q *Queue) deleteCandidate(ctx context.Context, cmd *Command, progress *deletionExecutionState, candidate *Candidate) error {
 	providerID := candidate.ProviderID()
 	q.Lock()
-	phase := progress.candidates[providerID]
+	_, done := progress.completed[providerID]
 	q.Unlock()
-	switch phase {
-	case deletionComplete:
+	if done {
 		return nil
-	case deletionCallbackPending:
-		return q.runDeleteSuccessCallback(ctx, cmd, progress, candidate, providerID)
-	case deletionPending:
-	default:
-		return NewUnrecoverableError(fmt.Errorf("unknown deletion phase %d", phase))
 	}
 	if _, ok := cmd.Method.(*Reclamation); ok {
 		if err := q.reclamationCandidateBeforeDelete(ctx, candidate); err != nil {
@@ -102,12 +85,12 @@ func (q *Queue) deleteCandidate(ctx context.Context, cmd *Command, progress *del
 		}
 	}
 	if err := q.deleteNodeClaim(ctx, cmd, candidate); err != nil {
-		return client.IgnoreNotFound(err)
+		if apierrors.IsNotFound(err) {
+			q.markDeletionComplete(progress, providerID)
+			return nil
+		}
+		return err
 	}
-
-	q.Lock()
-	progress.candidates[providerID] = deletionCallbackPending
-	q.Unlock()
 	q.recorder.Publish(disruptionevents.Terminating(candidate.Node, candidate.NodeClaim, string(cmd.Reason()))...)
 	metrics.NodeClaimsDisruptedTotal.Inc(map[string]string{
 		metrics.ReasonLabel:       pretty.ToSnakeCase(string(cmd.Reason())),
@@ -119,7 +102,14 @@ func (q *Queue) deleteCandidate(ctx context.Context, cmd *Command, progress *del
 			return err
 		}
 	}
-	return q.runDeleteSuccessCallback(ctx, cmd, progress, candidate, providerID)
+	q.markDeletionComplete(progress, providerID)
+	return nil
+}
+
+func (q *Queue) markDeletionComplete(progress *deletionExecutionState, providerID string) {
+	q.Lock()
+	progress.completed[providerID] = struct{}{}
+	q.Unlock()
 }
 
 func (q *Queue) deleteNodeClaim(ctx context.Context, cmd *Command, candidate *Candidate) error {
@@ -136,22 +126,6 @@ func (q *Queue) deleteNodeClaim(ctx context.Context, cmd *Command, candidate *Ca
 	return retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
 		return q.kubeClient.Delete(ctx, candidate.NodeClaim)
 	})
-}
-
-func (q *Queue) runDeleteSuccessCallback(ctx context.Context, cmd *Command, progress *deletionExecutionState, candidate *Candidate, providerID string) error {
-	if cmd.OnDeleteSuccess == nil {
-		q.Lock()
-		progress.candidates[providerID] = deletionComplete
-		q.Unlock()
-		return nil
-	}
-	if err := cmd.OnDeleteSuccess(ctx, candidate); err != nil {
-		return err
-	}
-	q.Lock()
-	progress.candidates[providerID] = deletionComplete
-	q.Unlock()
-	return nil
 }
 
 func (q *Queue) handleDeletionFailure(ctx context.Context, cmd *Command, err error) {

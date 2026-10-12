@@ -17,8 +17,6 @@ limitations under the License.
 package disruption_test
 
 import (
-	"context"
-	"errors"
 	"strconv"
 	"time"
 
@@ -344,52 +342,6 @@ var _ = Describe("Queue", func() {
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim1)
 			// And expect the nodeClaim and node to be deleted
 			ExpectNotFound(ctx, env.Client, nodeClaim1, node1)
-		})
-		It("should retry a failed per-candidate callback without repeating a successful deletion", func() {
-			metricPoolName := "callback-retry-" + uuid.NewString()
-			nodePool.Name = metricPoolName
-			nodeClaim1.Labels[v1.NodePoolLabelKey] = metricPoolName
-			node1.Labels[v1.NodePoolLabelKey] = metricPoolName
-			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
-			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
-
-			callbackAttempts := 0
-			cmd := &disruption.Command{
-				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
-				CreationTimestamp: env.Clock.Now(),
-				ID:                uuid.New(),
-				Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
-				OnDeleteSuccess: func(context.Context, *disruption.Candidate) error {
-					callbackAttempts++
-					if callbackAttempts == 1 {
-						return errors.New("retry callback once")
-					}
-					return nil
-				},
-			}
-			Expect(queue.StartCommand(ctx, cmd)).To(Succeed())
-
-			result, err := queue.Reconcile(ctx, stateNode.NodeClaim)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(result.RequeueAfter).To(Equal(time.Second))
-			Expect(callbackAttempts).To(Equal(1))
-			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
-				metrics.ReasonLabel:       "drifted",
-				metrics.NodePoolLabel:     metricPoolName,
-				metrics.CapacityTypeLabel: stateNode.NodeClaim.Labels[v1.CapacityTypeLabelKey],
-			})
-
-			result, err = queue.Reconcile(ctx, stateNode.NodeClaim)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeZero())
-			Expect(callbackAttempts).To(Equal(2))
-			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
-				metrics.ReasonLabel:       "drifted",
-				metrics.NodePoolLabel:     metricPoolName,
-				metrics.CapacityTypeLabel: stateNode.NodeClaim.Labels[v1.CapacityTypeLabelKey],
-			})
-			Expect(queue.HasAny(stateNode.ProviderID())).To(BeFalse())
 		})
 		It("should wait for non-daemon pods to disappear before retaining an evacuated node", func() {
 			evictionQueue := terminator.NewQueue(env.Client, recorder)

@@ -51,7 +51,7 @@ func TestActivateStandbyNode(t *testing.T) {
 	coordinator := TestCoordinator(kubeClient, nil)
 	stateNode := &state.StateNode{Node: node.DeepCopy(), NodeClaim: nodeClaim.DeepCopy()}
 
-	if err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode); err != nil {
+	if _, err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode); err != nil {
 		t.Fatalf("activating standby node: %v", err)
 	}
 
@@ -72,7 +72,7 @@ func TestActivateStandbyNode(t *testing.T) {
 	if got := standbyActivationCount(t, "standby-observability-test", "m6i.large", string(utilstandby.ActivationSourceProvisioning)); got != 1 {
 		t.Fatalf("expected one standby activation, got %v", got)
 	}
-	if err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode); err != nil {
+	if _, err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode); err != nil {
 		t.Fatalf("retrying activation: %v", err)
 	}
 	if got := standbyActivationCount(t, "standby-observability-test", "m6i.large", string(utilstandby.ActivationSourceProvisioning)); got != 1 {
@@ -127,7 +127,7 @@ func TestActivateRecordsStandbyMetricsForRecoveryPaths(t *testing.T) {
 			kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(node, nodeClaim).Build()
 			coordinator := TestCoordinator(kubeClient, nil)
 			stateNode := &state.StateNode{Node: node.DeepCopy(), NodeClaim: nodeClaim.DeepCopy()}
-			if err := coordinator.Activate(ctx, tc.activateWith, stateNode); err != nil {
+			if _, err := coordinator.Activate(ctx, tc.activateWith, stateNode); err != nil {
 				t.Fatalf("activating standby node: %v", err)
 			}
 			if got := standbyActivationCount(t, tc.nodePool, "unknown", tc.wantSource); got != 1 {

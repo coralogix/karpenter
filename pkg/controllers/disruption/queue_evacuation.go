@@ -24,7 +24,6 @@ import (
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -172,23 +171,21 @@ func (q *Queue) rollbackEvacuation(ctx context.Context, candidates []*Candidate)
 }
 
 func (q *Queue) enterStandbyAfterEvacuation(ctx context.Context, candidate *Candidate) error {
-	return retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
-		result, err := q.standbyCoordinator.EnterStandby(ctx, standbypkg.EnterStandbyRequest{
-			NodeRef:      candidate.Node,
-			NodeClaimRef: candidate.NodeClaim,
-			ProviderID:   candidate.ProviderID(),
-		}, standbypkg.EnterStandbyOptions{
-			BarrierTaintPresent: true,
-			Since:               q.clock.Now(),
-		})
-		if err != nil {
-			return err
-		}
-		if !standbypkg.StandbyEntrySucceeded(result) {
-			return fmt.Errorf("evacuation standby entry did not complete: outcome %q", result.Outcome)
-		}
-		return nil
+	result, err := q.standbyCoordinator.EnterStandby(ctx, standbypkg.EnterStandbyRequest{
+		NodeRef:      candidate.Node,
+		NodeClaimRef: candidate.NodeClaim,
+		ProviderID:   candidate.ProviderID(),
+	}, standbypkg.EnterStandbyOptions{
+		BarrierTaintPresent: true,
+		Since:               q.clock.Now(),
 	})
+	if err != nil {
+		return err
+	}
+	if !standbypkg.StandbyEntrySucceeded(result) {
+		return fmt.Errorf("evacuation standby entry did not complete: outcome %q", result.Outcome)
+	}
+	return nil
 }
 
 func (q *Queue) recordEvacuationOutcome(ctx context.Context, cmd *Command, outcome string, err error) {

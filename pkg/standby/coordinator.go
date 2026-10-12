@@ -30,7 +30,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/controllers/disruption/standbymetrics"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	utilstandby "sigs.k8s.io/karpenter/pkg/utils/standby"
 )
@@ -53,28 +52,18 @@ func TestCoordinator(c client.Client, clk clock.Clock) *Coordinator {
 	return NewCoordinator(c, c, clk)
 }
 
-func (c *Coordinator) lifecycle() lifecycle {
-	return lifecycle{reader: c.reader, writer: c.writer}
-}
-
-func (c *Coordinator) Activate(ctx context.Context, source utilstandby.ActivationSource, nodes ...*state.StateNode) error {
-	var errs []error
+func (c *Coordinator) Activate(ctx context.Context, source utilstandby.ActivationSource, nodes ...*state.StateNode) (ActivationResult, error) {
+	var result ActivationResult
 	for _, node := range nodes {
-		if node == nil || node.NodeClaim == nil ||
-			(!utilstandby.IsNodeClaimStandby(node.NodeClaim) && !utilstandby.IsNodeClaimActivating(node.NodeClaim) && !utilstandby.HasNodeActivationMarker(node.Node)) {
-			continue
+		pair, err := c.activateNode(ctx, source, node)
+		if err != nil {
+			return result, fmt.Errorf("activating node %q, %w", node.Name(), err)
 		}
-		if err := c.activateNode(ctx, source, node); err != nil {
-			errs = append(errs, fmt.Errorf("activating node %q, %w", node.Name(), err))
+		if pair != nil {
+			result.Activated = append(result.Activated, *pair)
 		}
 	}
-	return multierr.Combine(errs...)
-}
-
-func (c *Coordinator) activateNode(ctx context.Context, source utilstandby.ActivationSource, stateNode *state.StateNode) error {
-	return c.lifecycle().activate(ctx, stateNode.Node, stateNode.NodeClaim, source, func(resolvedSource utilstandby.ActivationSource) {
-		standbymetrics.RecordActivation(ctx, stateNode, resolvedSource)
-	})
+	return result, nil
 }
 
 // EnterStandbyOptions configures empty marking versus post-evacuation persistence.
@@ -104,7 +93,6 @@ func (c *Coordinator) EnterStandby(ctx context.Context, req EnterStandbyRequest,
 
 //nolint:gocyclo // Post-evacuation persistence keeps marker and taint writes in one retry loop.
 func (c *Coordinator) enterStandbyPostEvacuation(ctx context.Context, req EnterStandbyRequest, opts EnterStandbyOptions) (TransitionResult, error) {
-	ops := c.lifecycle()
 	var result TransitionResult
 	err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
 		node := &corev1.Node{}
@@ -138,7 +126,7 @@ func (c *Coordinator) enterStandbyPostEvacuation(ctx context.Context, req EnterS
 			}
 		}
 		if !utilstandby.IsNodeClaimStandby(nodeClaim) {
-			if err := ops.patchNodeClaimStandby(ctx, nodeClaim, true, opts.Since); err != nil {
+			if err := c.patchNodeClaimStandby(ctx, nodeClaim, true, opts.Since); err != nil {
 				return err
 			}
 			if err := c.reader.Get(ctx, client.ObjectKeyFromObject(req.NodeClaimRef), nodeClaim); err != nil {
@@ -149,7 +137,7 @@ func (c *Coordinator) enterStandbyPostEvacuation(ctx context.Context, req EnterS
 			return err
 		}
 		if !utilstandby.HasNodeTaint(node) {
-			if err := ops.ensureNodeStandbyTaint(ctx, node); err != nil {
+			if err := c.ensureNodeStandbyTaint(ctx, node); err != nil {
 				return err
 			}
 		}
@@ -173,7 +161,6 @@ func (c *Coordinator) enterStandbyPostEvacuation(ctx context.Context, req EnterS
 
 //nolint:gocyclo // Empty marking keeps live rechecks, optimistic patches, and rollback steps together.
 func (c *Coordinator) enterStandbyEmptyMarking(ctx context.Context, req EnterStandbyRequest, opts EnterStandbyOptions) (TransitionResult, error) {
-	ops := c.lifecycle()
 	var nodeClaim *v1.NodeClaim
 	node, _, eligible, err := c.readEligiblePair(ctx, req, opts.Eligibility)
 	if err != nil || !eligible {
@@ -194,7 +181,7 @@ func (c *Coordinator) enterStandbyEmptyMarking(ctx context.Context, req EnterSta
 		rollbackErr := removeDisruptionTaint(ctx, c.reader, c.writer, req.NodeRef.Name)
 		return TransitionResult{Outcome: OutcomeSkipped}, multierr.Combine(err, rollbackErr)
 	}
-	if err := ops.patchNodeClaimStandby(ctx, nodeClaim, true, opts.Since); err != nil {
+	if err := c.patchNodeClaimStandby(ctx, nodeClaim, true, opts.Since); err != nil {
 		rollbackErr := removeDisruptionTaint(ctx, c.reader, c.writer, req.NodeRef.Name)
 		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
 			return TransitionResult{Outcome: OutcomeSkipped}, rollbackErr
@@ -218,7 +205,7 @@ func (c *Coordinator) enterStandbyEmptyMarking(ctx context.Context, req EnterSta
 		}
 		return TransitionResult{Outcome: OutcomeSkipped}, nil
 	}
-	if err := ops.patchNodeStandbyTaint(ctx, node, true); err != nil {
+	if err := c.patchNodeStandbyTaint(ctx, node, true); err != nil {
 		return TransitionResult{Outcome: OutcomeFailed}, err
 	}
 	if err := removeDisruptionTaint(ctx, c.reader, c.writer, node.Name); err != nil {
@@ -245,7 +232,7 @@ func (c *Coordinator) enterStandbyEmptyMarking(ctx context.Context, req EnterSta
 }
 
 func (c *Coordinator) readEligiblePair(ctx context.Context, req EnterStandbyRequest, eligibility func(context.Context, *corev1.Node, *v1.NodeClaim) (bool, error)) (*corev1.Node, *v1.NodeClaim, bool, error) {
-	node, nodeClaim, matches, err := c.lifecycle().readLivePair(ctx, req.NodeRef, req.NodeClaimRef, req.ProviderID)
+	node, nodeClaim, matches, err := c.readLivePair(ctx, req.NodeRef, req.NodeClaimRef, req.ProviderID)
 	if err != nil || !matches {
 		return nil, nil, false, err
 	}
@@ -261,28 +248,23 @@ func (c *Coordinator) recoverOccupiedStandby(ctx context.Context, node *corev1.N
 	if err != nil || empty {
 		return false, err
 	}
+	return c.recoverOccupiedStandbyPair(ctx, node, nodeClaim)
+}
+
+func (c *Coordinator) recoverOccupiedStandbyPair(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
 	stateNode := &state.StateNode{Node: node.DeepCopy(), NodeClaim: nodeClaim.DeepCopy()}
-	if err := c.Activate(ctx, utilstandby.ActivationSourceRecovery, stateNode); err != nil {
+	actResult, err := c.Activate(ctx, utilstandby.ActivationSourceRecovery, stateNode)
+	if err != nil {
 		return false, fmt.Errorf("restoring occupied standby capacity, %w", err)
 	}
-	refreshedNode := &corev1.Node{}
-	if err := c.reader.Get(ctx, client.ObjectKeyFromObject(node), refreshedNode); err != nil {
-		return false, err
-	}
-	refreshedNodeClaim := &v1.NodeClaim{}
-	if err := c.reader.Get(ctx, client.ObjectKeyFromObject(nodeClaim), refreshedNodeClaim); err != nil {
-		return false, err
-	}
-	if utilstandby.IsNodeClaimStandby(refreshedNodeClaim) || utilstandby.IsNodeClaimActivating(refreshedNodeClaim) || utilstandby.HasNodeTaint(refreshedNode) {
+	if len(actResult.Activated) == 0 {
 		return false, fmt.Errorf("occupied standby NodeClaim %q has not completed activation", nodeClaim.Name)
 	}
-	if err := removeDisruptionTaint(ctx, c.reader, c.writer, refreshedNode.Name); err != nil {
+	pair := actResult.Activated[0]
+	if err := removeDisruptionTaint(ctx, c.reader, c.writer, pair.Node.Name); err != nil {
 		return false, err
 	}
-	if err := c.reader.Get(ctx, client.ObjectKeyFromObject(node), refreshedNode); err != nil {
-		return false, err
-	}
-	*node, *nodeClaim = *refreshedNode, *refreshedNodeClaim
+	*node, *nodeClaim = *pair.Node, *pair.NodeClaim
 	return true, nil
 }
 
@@ -292,32 +274,42 @@ type RepairRequest struct {
 	ProviderID   string
 }
 
-func (c *Coordinator) RepairOccupied(ctx context.Context, req RepairRequest) error {
-	node, nodeClaim, matches, err := c.lifecycle().readLivePair(ctx, req.NodeRef, req.NodeClaimRef, req.ProviderID)
+//nolint:gocyclo // Repair keeps live identity, occupancy, and mutation steps in one operation.
+func (c *Coordinator) RepairStandbyNode(ctx context.Context, req RepairRequest) (TransitionResult, error) {
+	node, nodeClaim, matches, err := c.readLivePair(ctx, req.NodeRef, req.NodeClaimRef, req.ProviderID)
 	if err != nil {
-		return err
+		return TransitionResult{Outcome: OutcomeFailed}, err
 	}
-	if !matches {
-		return nil
+	if !matches ||
+		!node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() ||
+		nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
+		return TransitionResult{Outcome: OutcomeSkipped}, nil
+	}
+	repaired, err := c.repairOrphanStandbyTaint(ctx, node, nodeClaim)
+	if err != nil {
+		return TransitionResult{Outcome: OutcomeFailed}, err
+	}
+	if repaired {
+		return TransitionResult{Outcome: OutcomeRecovered, Node: node, NodeClaim: nodeClaim}, nil
 	}
 	empty, err := NodeEmpty(ctx, c.reader, node)
 	if err != nil {
-		return err
+		return TransitionResult{Outcome: OutcomeFailed}, err
 	}
 	if empty {
-		return nil
+		return TransitionResult{Outcome: OutcomeSkipped}, nil
 	}
-	activationNode := &state.StateNode{Node: node, NodeClaim: nodeClaim}
-	if err := c.Activate(ctx, utilstandby.ActivationSourceRecovery, activationNode); err != nil {
-		return fmt.Errorf("activating occupied standby Node %q, %w", node.Name, err)
+	recovered, err := c.recoverOccupiedStandbyPair(ctx, node, nodeClaim)
+	if err != nil {
+		return TransitionResult{Outcome: OutcomeFailed}, err
 	}
-	if err := removeDisruptionTaint(ctx, c.reader, c.writer, node.Name); err != nil {
-		return fmt.Errorf("removing temporary disruption taint from recovered Node %q, %w", node.Name, err)
+	if recovered {
+		return TransitionResult{Outcome: OutcomeRecovered, Node: node, NodeClaim: nodeClaim}, nil
 	}
-	return nil
+	return TransitionResult{Outcome: OutcomeSkipped, Node: node, NodeClaim: nodeClaim}, nil
 }
 
-func (c *Coordinator) RepairOrphanStandbyTaint(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
+func (c *Coordinator) repairOrphanStandbyTaint(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
 	if node == nil || nodeClaim == nil {
 		return false, nil
 	}
@@ -330,7 +322,7 @@ func (c *Coordinator) RepairOrphanStandbyTaint(ctx context.Context, node *corev1
 	if !utilstandby.HasNodeTaint(node) {
 		return false, nil
 	}
-	if err := c.lifecycle().patchNodeStandbyTaint(ctx, node, false); err != nil {
+	if err := c.patchNodeStandbyTaint(ctx, node, false); err != nil {
 		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
 			return false, nil
 		}
@@ -340,11 +332,7 @@ func (c *Coordinator) RepairOrphanStandbyTaint(ctx context.Context, node *corev1
 }
 
 func (c *Coordinator) EnsureStandbyTaintForClaim(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) error {
-	return c.lifecycle().ensureStandbyTaintForClaim(ctx, node, nodeClaim)
-}
-
-func (c *Coordinator) ReadLivePair(ctx context.Context, nodeRef *corev1.Node, nodeClaimRef *v1.NodeClaim, providerID string) (*corev1.Node, *v1.NodeClaim, bool, error) {
-	return c.lifecycle().readLivePair(ctx, nodeRef, nodeClaimRef, providerID)
+	return c.ensureStandbyTaintForClaim(ctx, node, nodeClaim)
 }
 
 func (c *Coordinator) RemoveDisruptionTaint(ctx context.Context, nodeName string) error {

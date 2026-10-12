@@ -49,8 +49,8 @@ func TestReclamationExecutionRefusesStalePlanning(t *testing.T) {
 	if !IsUnrecoverableError(err) {
 		t.Fatalf("deleteCandidates() error = %v, want unrecoverable emptiness rejection", err)
 	}
-	if h.tracker.deleteCalls != 0 {
-		t.Fatalf("delete attempts = %d, want 0", h.tracker.deleteCalls)
+	if h.tracker.deleteCallCount() != 0 {
+		t.Fatalf("delete attempts = %d, want 0", h.tracker.deleteCallCount())
 	}
 }
 
@@ -59,8 +59,8 @@ func TestReclamationExecutionDeletesEligibleControl(t *testing.T) {
 	if err := h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd); err != nil {
 		t.Fatalf("deleteCandidates() error = %v", err)
 	}
-	if h.tracker.deleteCalls != 1 {
-		t.Fatalf("delete attempts = %d, want 1", h.tracker.deleteCalls)
+	if h.tracker.deleteCallCount() != 1 {
+		t.Fatalf("delete attempts = %d, want 1", h.tracker.deleteCallCount())
 	}
 }
 
@@ -71,8 +71,8 @@ func TestReclamationExecutionBoundedConcurrency(t *testing.T) {
 	if execErr != nil {
 		t.Fatalf("deleteCandidates() error = %v", execErr)
 	}
-	if h.tracker.deleteCalls != candidateCount {
-		t.Fatalf("delete attempts = %d, want %d", h.tracker.deleteCalls, candidateCount)
+	if h.tracker.deleteCallCount() != candidateCount {
+		t.Fatalf("delete attempts = %d, want %d", h.tracker.deleteCallCount(), candidateCount)
 	}
 	if h.tracker.maxInFlight() > maxConcurrentCandidateDeletes {
 		t.Fatalf("max in-flight deletes = %d, want at most %d", h.tracker.maxInFlight(), maxConcurrentCandidateDeletes)
@@ -105,12 +105,12 @@ func waitForReclamationDeleteGate(t *testing.T, tracker *reclamationExecutionDel
 		if tracker.maxInFlight() > maxConcurrentCandidateDeletes {
 			t.Fatalf("max in-flight deletes = %d, want at most %d", tracker.maxInFlight(), maxConcurrentCandidateDeletes)
 		}
-		if tracker.inFlight() == maxConcurrentCandidateDeletes || tracker.deleteCalls == candidateCount {
+		if tracker.inFlight() == maxConcurrentCandidateDeletes || tracker.deleteCallCount() == candidateCount {
 			return
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if tracker.inFlight() < maxConcurrentCandidateDeletes && tracker.deleteCalls != candidateCount {
+	if tracker.inFlight() < maxConcurrentCandidateDeletes && tracker.deleteCallCount() != candidateCount {
 		t.Fatalf("in-flight deletes = %d, want %d before releasing the gate", tracker.inFlight(), maxConcurrentCandidateDeletes)
 	}
 }
@@ -124,8 +124,8 @@ func TestReclamationExecutionPartialBatchRetry(t *testing.T) {
 	if err := h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd); !IsUnrecoverableError(err) {
 		t.Fatalf("first deleteCandidates() error = %v, want unrecoverable", err)
 	}
-	if h.tracker.deleteCalls != 1 {
-		t.Fatalf("delete attempts after partial failure = %d, want 1", h.tracker.deleteCalls)
+	if h.tracker.deleteCallCount() != 1 {
+		t.Fatalf("delete attempts after partial failure = %d, want 1", h.tracker.deleteCallCount())
 	}
 	if err := h.kubeClient.Delete(h.ctx, workload); err != nil {
 		t.Fatal(err)
@@ -133,8 +133,8 @@ func TestReclamationExecutionPartialBatchRetry(t *testing.T) {
 	if err := h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd); err != nil {
 		t.Fatalf("second deleteCandidates() error = %v", err)
 	}
-	if h.tracker.deleteCalls != 2 {
-		t.Fatalf("delete attempts after retry = %d, want 2", h.tracker.deleteCalls)
+	if h.tracker.deleteCallCount() != 2 {
+		t.Fatalf("delete attempts after retry = %d, want 2", h.tracker.deleteCallCount())
 	}
 }
 
@@ -161,8 +161,8 @@ func TestReclamationExecutionContextCancellation(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for cancellation")
 	}
-	if h.tracker.deleteCalls >= 4 {
-		t.Fatalf("delete attempts after cancellation = %d, want fewer than 4", h.tracker.deleteCalls)
+	if h.tracker.deleteCallCount() >= 4 {
+		t.Fatalf("delete attempts after cancellation = %d, want fewer than 4", h.tracker.deleteCallCount())
 	}
 	h.tracker.unblockDeletes()
 }
@@ -216,9 +216,15 @@ func (c *reclamationExecutionDeleteTracker) Delete(ctx context.Context, object c
 	}
 	c.mu.Lock()
 	c.inFlightNow--
-	c.mu.Unlock()
 	c.deleteCalls++
+	c.mu.Unlock()
 	return c.Client.Delete(ctx, object, options...)
+}
+
+func (c *reclamationExecutionDeleteTracker) deleteCallCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deleteCalls
 }
 
 func (c *reclamationExecutionDeleteTracker) inFlight() int {
