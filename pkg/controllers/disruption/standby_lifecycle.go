@@ -56,7 +56,7 @@ func reclamationStandbyDelay(nodePool *v1.NodePool) time.Duration {
 	return delay
 }
 
-func standbyReclamationSoakElapsed(nodePool *v1.NodePool, nodeClaim *v1.NodeClaim, now time.Time) bool {
+func standbyReclamationDelayElapsed(nodePool *v1.NodePool, nodeClaim *v1.NodeClaim, now time.Time) bool {
 	if !standby.IsNodeClaimStandby(nodeClaim) {
 		return false
 	}

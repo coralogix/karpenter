@@ -61,8 +61,8 @@ func (q *Queue) reclamationCandidateBeforeDelete(ctx context.Context, candidate 
 	if !standby.IsNodeClaimStandby(nodeClaim) {
 		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q is no longer standby", candidate.Name()))
 	}
-	if !standbyReclamationSoakElapsed(candidate.NodePool, nodeClaim, q.clock.Now()) {
-		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q has not completed the standby soak", candidate.Name()))
+	if !standbyReclamationDelayElapsed(candidate.NodePool, nodeClaim, q.clock.Now()) {
+		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q has not completed the reclamation delay", candidate.Name()))
 	}
 	if nodeClaim.Labels[v1.NodePoolLabelKey] != candidate.NodePool.Name {
 		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q changed NodePool", candidate.Name()))

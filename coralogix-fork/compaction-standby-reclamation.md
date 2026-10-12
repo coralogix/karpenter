@@ -17,7 +17,7 @@ Removing the score-based annotation returns the pool to upstream emptiness and c
 | Annotation | Applies to | Meaning |
 |------------|------------|---------|
 | `karpenter.coralogix.net/score-based-consolidation` | NodePool | Enables score-based compaction plus standby marking and reclamation. |
-| `karpenter.coralogix.net/reclamation-standby-delay` | NodePool | Minimum time a node must stay in standby before reclamation may delete it. Go duration syntax; missing or invalid values default to **15s**; **`0s` disables** the soak. |
+| `karpenter.coralogix.net/reclamation-standby-delay` | NodePool | Minimum time a node must stay in standby before reclamation may delete it. Go duration syntax; missing or invalid values default to **15s**; **`0s` disables** reclamation delay. |
 
 Example:
 
@@ -53,7 +53,7 @@ Activation clears the standby marker and taint when provisioning or compaction s
 | Method | When it runs | Effect on nodes | Disruption reason | NodePool budget |
 |--------|----------------|-----------------|-------------------|-----------------|
 | **Standby marking** | Empty active nodes in opted-in pools | Marker + standby taint; no pod eviction | `Empty` | Exempt |
-| **Reclamation** | Empty standby nodes past soak | Deletes NodeClaim (instance terminated) | `Empty` | Exempt |
+| **Reclamation** | Empty standby nodes past reclamation delay | Deletes NodeClaim (instance terminated) | `Empty` | Exempt |
 | **Score-based compaction** | Non-empty underused nodes | Evacuates pods; node becomes standby | `Underutilized` | Honored |
 | **Emptiness** (upstream) | Other pools only | Deletes empty nodes directly | `Empty` | Per upstream rules |
 
@@ -74,9 +74,9 @@ Standby ──provisioning or compaction activate──► Active (schedulable)
 
 - **Compaction** simulates placement, may activate existing standby nodes as destinations, taints sources, evicts non-daemon workloads, waits until occupying pods are gone, then persists standby on the evacuated node. It does **not** delete the NodeClaim.
 - **Standby marking** applies the same standby persistence to nodes that are **already** empty, without eviction.
-- **Reclamation** selects **all** soak-eligible standby candidates in each pool on a pass (stable sort by node name within the pool), validates cached state for planning, then performs live Node/NodeClaim/pod checks immediately before deletion with a UID/resourceVersion precondition so activation and deletion cannot both succeed.
+- **Reclamation** selects **all** standby candidates past reclamation delay in each pool on a pass (stable sort by node name within the pool), validates cached state for planning, then performs live Node/NodeClaim/pod checks immediately before deletion with a UID/resourceVersion precondition so activation and deletion cannot both succeed.
 
-Soak eligibility: standby time must be **strictly greater than** the configured delay. Legacy marker value `true` skips soak gating. Nodes with an in-progress activation marker are not reclaimable.
+Reclamation delay: standby time must be **strictly greater than** the configured delay. Legacy marker value `true` skips reclamation delay. Nodes with an in-progress activation marker are not reclaimable.
 
 ## Consistency and API reads
 
@@ -124,7 +124,7 @@ Standby marking does not emit evacuation or consolidation deletion metrics. Recl
 Historically, consolidation both moved pods and deleted source nodes in one flow. Splitting the steps allows:
 
 - Reusing **running** empty instances as cheap warm capacity instead of terminating immediately.
-- Letting compaction optimize placement while reclamation throttles removal independently (soak delay instead of paced batch removal).
+- Letting compaction optimize placement while reclamation throttles removal independently (reclamation delay instead of paced batch removal).
 - Activating standby nodes for new or relocated workloads without a full launch when requirements match.
 
 The tradeoff is ongoing cost for standby instances until reclamation removes them or they are activated.

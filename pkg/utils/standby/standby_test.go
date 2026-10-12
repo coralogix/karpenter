@@ -53,7 +53,7 @@ func TestLegacyStandbyMarker(t *testing.T) {
 		t.Fatal("expected legacy standby marker to be recognized")
 	}
 	if _, ok := NodeClaimStandbySince(nodeClaim); ok {
-		t.Fatal("legacy standby marker should not provide a soak timestamp")
+		t.Fatal("legacy standby marker should not provide a standby-since timestamp")
 	}
 }
 

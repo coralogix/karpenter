@@ -308,7 +308,7 @@ func TestStandbyLifecycleEnabledForReclamation(t *testing.T) {
 	}
 }
 
-func TestStandbyMarkingReclamationSoakElapsed(t *testing.T) {
+func TestStandbyReclamationDelayElapsed(t *testing.T) {
 	now := time.Date(2026, time.October, 9, 12, 0, 0, 0, time.UTC)
 	nodePool := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{
 		Name:        "score-pool",
@@ -316,29 +316,29 @@ func TestStandbyMarkingReclamationSoakElapsed(t *testing.T) {
 	}}
 	nodeClaim := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}
 	standby.SetNodeClaimStandby(nodeClaim, true, now.Add(-10*time.Second))
-	if standbyReclamationSoakElapsed(nodePool, nodeClaim, now) {
-		t.Fatal("expected 10s standby age to remain inside the default 15s soak")
+	if standbyReclamationDelayElapsed(nodePool, nodeClaim, now) {
+		t.Fatal("expected 10s standby age to remain within the default 15s reclamation delay")
 	}
 	standby.SetNodeClaimStandby(nodeClaim, true, now.Add(-15*time.Second))
-	if standbyReclamationSoakElapsed(nodePool, nodeClaim, now) {
-		t.Fatal("expected exactly 15s to remain inside the soak")
+	if standbyReclamationDelayElapsed(nodePool, nodeClaim, now) {
+		t.Fatal("expected exactly 15s to remain within the reclamation delay")
 	}
 	standby.SetNodeClaimStandby(nodeClaim, true, now.Add(-15*time.Second-time.Nanosecond))
-	if !standbyReclamationSoakElapsed(nodePool, nodeClaim, now) {
-		t.Fatal("expected soak to elapse just after 15s")
+	if !standbyReclamationDelayElapsed(nodePool, nodeClaim, now) {
+		t.Fatal("expected reclamation delay to elapse just after 15s")
 	}
 	nodeClaim.Annotations[standby.NodeClaimAnnotationKey] = "true"
-	if !standbyReclamationSoakElapsed(nodePool, nodeClaim, now) {
-		t.Fatal("legacy standby marker should skip soak gating")
+	if !standbyReclamationDelayElapsed(nodePool, nodeClaim, now) {
+		t.Fatal("legacy standby marker should skip reclamation delay")
 	}
 	nodePool.Annotations[v1.ReclamationStandbyDelayAnnotationKey] = "0s"
 	standby.SetNodeClaimStandby(nodeClaim, true, now)
-	if !standbyReclamationSoakElapsed(nodePool, nodeClaim, now) {
-		t.Fatal("0s delay should disable soak gating")
+	if !standbyReclamationDelayElapsed(nodePool, nodeClaim, now) {
+		t.Fatal("0s delay should disable the reclamation delay")
 	}
 }
 
-func TestReclamationSkipsStandbyInsideSoak(t *testing.T) {
+func TestReclamationSkipsStandbyWithinReclamationDelay(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, time.October, 9, 12, 0, 0, 0, time.UTC)
 	clock := clocktesting.NewFakeClock(now)
@@ -358,7 +358,7 @@ func TestReclamationSkipsStandbyInsideSoak(t *testing.T) {
 		t.Fatalf("computeReclamationCommand() error = %v", err)
 	}
 	if cmd != nil {
-		t.Fatal("expected no reclamation command while standby soak has not elapsed")
+		t.Fatal("expected no reclamation command while reclamation delay has not elapsed")
 	}
 }
 

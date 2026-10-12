@@ -112,7 +112,7 @@ func IsNodeClaimStandby(nodeClaim *v1.NodeClaim) bool {
 }
 
 // NodeClaimStandbySince returns when the NodeClaim entered standby. Legacy "true" markers and
-// unparseable values return false so callers can skip soak gating.
+// unparseable values return false so callers can skip reclamation delay.
 func NodeClaimStandbySince(nodeClaim *v1.NodeClaim) (time.Time, bool) {
 	if nodeClaim == nil || nodeClaim.Annotations == nil {
 		return time.Time{}, false

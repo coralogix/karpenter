@@ -304,7 +304,7 @@ func (s *Reclamation) isReclamationCandidateAvailable(ctx context.Context, candi
 	if !standby.IsNodeClaimStandby(currentNodeClaim) {
 		return false
 	}
-	if !standbyReclamationSoakElapsed(candidate.NodePool, currentNodeClaim, s.clock.Now()) {
+	if !standbyReclamationDelayElapsed(candidate.NodePool, currentNodeClaim, s.clock.Now()) {
 		return false
 	}
 	if currentNodeClaim.Labels[v1.NodePoolLabelKey] != candidate.NodePool.Name {
@@ -334,5 +334,5 @@ func (s *Reclamation) reclamationCandidateEligible(candidate *Candidate) bool {
 	if !standbyLifecycleEnabled(candidate.NodePool) {
 		return false
 	}
-	return standbyReclamationSoakElapsed(candidate.NodePool, candidate.NodeClaim, s.clock.Now())
+	return standbyReclamationDelayElapsed(candidate.NodePool, candidate.NodeClaim, s.clock.Now())
 }
