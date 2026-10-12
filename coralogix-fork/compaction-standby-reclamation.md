@@ -97,6 +97,10 @@ Evacuation waits until occupying pods disappear from the API (terminating pods w
 
 **Provisioning** and **score-based compaction** decide *which* standby nodes to use; `pkg/standby.Coordinator` performs the shared activation protocol (reservation markers, taint removal, metrics).
 
+- **Provisioning** and **score-based compaction** treat eligible standby nodes as schedulable during planning by
+  applying a planning-only view that omits the controller-owned standby `NoSchedule` taint. Cluster objects are not
+  mutated for planning; activation clears persisted markers and taints through the coordinator after a standby node
+  is selected.
 - **Provisioning** activates standby nodes chosen during scheduling (`provisioning` source).
 - **Compaction** activates standby destinations before evacuating sources (`compaction` source).
 - **Recovery** runs on startup and during disruption cleanup: if a standby node has gained a workload (including after a race with the scheduler), the controller activates it back to active capacity (`recovery` source) instead of leaving it tainted standby.

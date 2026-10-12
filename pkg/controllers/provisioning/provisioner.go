@@ -455,36 +455,9 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	if options.FromContext(ctx).PreferencePolicy == options.PreferencePolicyIgnore {
 		opts = append(opts, scheduler.IgnorePreferences)
 	}
-	s, err := p.NewScheduler(
-		ctx,
-		pods,
-		cloneStateNodes(nodes.Active()),
-		deletingPodUIDs,
-		opts...,
-	)
+	results, err := p.solveWithStandbyActivation(ctx, pods, nodes, deletingPodUIDs, opts)
 	if err != nil {
-		if errors.Is(err, ErrNodePoolsNotFound) {
-			log.FromContext(ctx).Info("no dynamic nodepools found")
-			p.cluster.MarkPodSchedulingDecisions(ctx, lo.SliceToMap(pods, func(p *corev1.Pod) (*corev1.Pod, error) {
-				return p, fmt.Errorf("no dynamic nodepools found")
-			}), nil, nil)
-			return scheduler.Results{}, nil
-		}
-		return scheduler.Results{}, fmt.Errorf("creating scheduler, %w", err)
-	}
-
-	// Timeout the Solve() method after 1m to ensure that we move faster through provisioning
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-
-	results, err := s.Solve(timeoutCtx, pods)
-	// context errors are ignored because we want to finish provisioning for what has already been scheduled
-	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
 		return scheduler.Results{}, err
-	}
-	results = results.TruncateInstanceTypes(ctx, scheduler.MaxInstanceTypes)
-	if err := p.activateScheduledStandbyNodes(ctx, results); err != nil {
-		return scheduler.Results{}, fmt.Errorf("activating standby capacity, %w", err)
 	}
 	p.logSchedulingResults(ctx, results, pods, start)
 	// Mark in memory when these pods were marked as schedulable or when we made a decision on the pods.
