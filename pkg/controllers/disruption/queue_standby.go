@@ -30,20 +30,10 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption/standbymetrics"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	standbypkg "sigs.k8s.io/karpenter/pkg/standby"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
-
-func updateStandbyState(ctx context.Context, cluster *state.Cluster, reader client.Reader, node *corev1.Node, nodeClaim *v1.NodeClaim) error {
-	var pods corev1.PodList
-	if err := reader.List(ctx, &pods, client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
-		return fmt.Errorf("listing pods after standby transition, %w", err)
-	}
-	cluster.UpdateNodeClaim(nodeClaim)
-	return cluster.UpdateNodeWithPods(ctx, node, lo.ToSlicePtr(pods.Items))
-}
 
 //nolint:gocyclo // Reservation, transition, and per-candidate reporting form one synchronous command.
 func (q *Queue) startStandbyCommand(ctx context.Context, cmd *Command) error {
@@ -69,14 +59,13 @@ func (q *Queue) startStandbyCommand(ctx context.Context, cmd *Command) error {
 		}
 	}()
 
-	standbyMethod, ok := cmd.Method.(*StandbyMarking)
-	if !ok {
+	if _, ok := cmd.Method.(*StandbyMarking); !ok {
 		return fmt.Errorf("standby action requires StandbyMarking method")
 	}
 	var transitioned []*Candidate
 	var errs []error
 	for _, candidate := range cmd.Candidates {
-		marked, err := q.markEmptyNodeStandby(ctx, standbyMethod, candidate)
+		marked, err := q.markEmptyNodeStandby(ctx, candidate)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("marking NodeClaim %q standby, %w", candidate.NodeClaim.Name, err))
 			continue
@@ -100,16 +89,16 @@ func (q *Queue) startStandbyCommand(ctx context.Context, cmd *Command) error {
 	return multierr.Combine(errs...)
 }
 
-func (q *Queue) markEmptyNodeStandby(ctx context.Context, method *StandbyMarking, candidate *Candidate) (bool, error) {
+func (q *Queue) markEmptyNodeStandby(ctx context.Context, candidate *Candidate) (bool, error) {
 	eligibility := func(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
-		return q.standbyCandidateEligibleForTransition(ctx, method, candidate, node, nodeClaim)
+		return q.standbyCandidateEligibleForTransition(ctx, candidate, node, nodeClaim)
 	}
 	result, err := q.standbyCoordinator.EnterStandby(ctx, standbypkg.EnterStandbyRequest{
 		NodeRef:      candidate.Node,
 		NodeClaimRef: candidate.NodeClaim,
 		ProviderID:   candidate.ProviderID(),
 	}, standbypkg.EnterStandbyOptions{
-		Since:       method.clock.Now(),
+		Since:       q.clock.Now(),
 		Eligibility: eligibility,
 	})
 	if err != nil {
@@ -117,7 +106,7 @@ func (q *Queue) markEmptyNodeStandby(ctx context.Context, method *StandbyMarking
 	}
 	switch result.Outcome {
 	case standbypkg.OutcomeCompleted:
-		if err := updateStandbyState(ctx, q.cluster, q.apiReader, result.Node, result.NodeClaim); err != nil {
+		if err := q.updateStandbyState(ctx, result.Node, result.NodeClaim); err != nil {
 			return false, err
 		}
 		candidate.Node = result.Node
@@ -125,7 +114,7 @@ func (q *Queue) markEmptyNodeStandby(ctx context.Context, method *StandbyMarking
 		return true, nil
 	case standbypkg.OutcomeRecovered, standbypkg.OutcomeSkipped, standbypkg.OutcomeUnchanged:
 		if result.Node != nil && result.NodeClaim != nil {
-			if err := updateStandbyState(ctx, q.cluster, q.apiReader, result.Node, result.NodeClaim); err != nil {
+			if err := q.updateStandbyState(ctx, result.Node, result.NodeClaim); err != nil {
 				return false, err
 			}
 		}
@@ -136,7 +125,7 @@ func (q *Queue) markEmptyNodeStandby(ctx context.Context, method *StandbyMarking
 }
 
 //nolint:gocyclo // Identity, cached policy, nomination, and live occupancy checks are one transition precondition.
-func (q *Queue) standbyCandidateEligibleForTransition(ctx context.Context, method *StandbyMarking, candidate *Candidate, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
+func (q *Queue) standbyCandidateEligibleForTransition(ctx context.Context, candidate *Candidate, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
 	if candidate == nil || candidate.Node == nil || candidate.NodeClaim == nil || candidate.NodePool == nil || node == nil || nodeClaim == nil {
 		return false, fmt.Errorf("standby candidate is missing its Node, NodeClaim, or NodePool")
 	}
@@ -148,11 +137,11 @@ func (q *Queue) standbyCandidateEligibleForTransition(ctx context.Context, metho
 		standby.IsNodeClaimStandby(nodeClaim) || standby.IsNodeClaimActivating(nodeClaim) || standby.HasNodeTaint(node) ||
 		node.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" ||
 		node.Annotations[v1.DoNotDisruptAnnotationKey] == "true" || nodeClaim.Annotations[v1.DoNotDisruptAnnotationKey] == "true" ||
-		(method.cluster != nil && method.cluster.IsNodeNominated(candidate.ProviderID())) {
+		q.cluster.IsNodeNominated(candidate.ProviderID()) {
 		return false, nil
 	}
 	nodePool := &v1.NodePool{}
-	if err := method.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.NodePool), nodePool); err != nil {
+	if err := q.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.NodePool), nodePool); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
@@ -170,4 +159,13 @@ func (q *Queue) standbyCandidateEligibleForTransition(ctx context.Context, metho
 		return false, err
 	}
 	return true, nil
+}
+
+func (q *Queue) updateStandbyState(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) error {
+	var pods corev1.PodList
+	if err := q.apiReader.List(ctx, &pods, client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
+		return fmt.Errorf("listing pods after standby transition, %w", err)
+	}
+	q.cluster.UpdateNodeClaim(nodeClaim)
+	return q.cluster.UpdateNodeWithPods(ctx, node, lo.ToSlicePtr(pods.Items))
 }

@@ -78,7 +78,7 @@ func (q *Queue) recoverOccupiedStandbyNodes(ctx context.Context) error {
 			return err
 		}
 		if repaired {
-			if err := updateStandbyState(ctx, q.cluster, q.apiReader, node, nodeClaim); err != nil {
+			if err := q.updateStandbyState(ctx, node, nodeClaim); err != nil {
 				return fmt.Errorf("refreshing Node %q after removing orphan standby taint, %w", node.Name, err)
 			}
 			continue
@@ -116,7 +116,7 @@ func (q *Queue) refreshStandbyState(ctx context.Context, nodeName, nodeClaimName
 	if !standbypkg.ActivationComplete(node, nodeClaim) {
 		return fmt.Errorf("standby activation for NodeClaim %q has not completed", nodeClaimName)
 	}
-	return updateStandbyState(ctx, q.cluster, q.apiReader, node, nodeClaim)
+	return q.updateStandbyState(ctx, node, nodeClaim)
 }
 
 func (q *Queue) ensureStandbyTaints(ctx context.Context, nodes ...*state.StateNode) error {

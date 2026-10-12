@@ -86,8 +86,8 @@ func (q *Queue) deleteCandidate(ctx context.Context, cmd *Command, progress *del
 	default:
 		return NewUnrecoverableError(fmt.Errorf("unknown deletion phase %d", phase))
 	}
-	if reclamation, ok := cmd.Method.(*Reclamation); ok {
-		if err := q.reclamationCandidateBeforeDelete(ctx, reclamation, candidate); err != nil {
+	if _, ok := cmd.Method.(*Reclamation); ok {
+		if err := q.reclamationCandidateBeforeDelete(ctx, candidate); err != nil {
 			return fmt.Errorf("validating node before deletion, %w", err)
 		}
 	}

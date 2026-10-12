@@ -24,7 +24,6 @@ import (
 	"github.com/awslabs/operatorpkg/option"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -280,20 +279,6 @@ func (s *Reclamation) reclamationCandidateNodeClaim(ctx context.Context, candida
 		return nil, false, nil
 	}
 	return nodeClaim, true, nil
-}
-
-func (s *Reclamation) reclamationNodePoolStillManaged(ctx context.Context, nodePoolName string) error {
-	nodePool := &v1.NodePool{}
-	if err := s.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
-		if apierrors.IsNotFound(err) {
-			return NewUnrecoverableError(fmt.Errorf("reclamation NodePool %q was deleted", nodePoolName))
-		}
-		return fmt.Errorf("getting reclamation NodePool, %w", err)
-	}
-	if !standbyLifecycleEnabled(nodePool) {
-		return NewUnrecoverableError(fmt.Errorf("reclamation NodePool %q is no longer eligible for reclamation", nodePool.Name))
-	}
-	return nil
 }
 
 func (s *Reclamation) reclamationDeleteSucceeded(_ context.Context, candidate *Candidate) error {

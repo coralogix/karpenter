@@ -211,4 +211,14 @@ var (
 		},
 		[]string{metrics.ReasonLabel},
 	)
+	NodeClaimsEvacuatedTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: metrics.NodeClaimSubsystem,
+			Name:      "evacuated_total",
+			Help:      "Number of nodeclaims evacuated to standby in total by Karpenter. Labeled by reason, owning nodepool, and capacity type.",
+		},
+		[]string{metrics.ReasonLabel, metrics.NodePoolLabel, metrics.CapacityTypeLabel},
+	)
 )
