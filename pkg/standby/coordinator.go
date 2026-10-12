@@ -95,16 +95,12 @@ func (c *Coordinator) EnterStandby(ctx context.Context, req EnterStandbyRequest,
 func (c *Coordinator) enterStandbyPostEvacuation(ctx context.Context, req EnterStandbyRequest, opts EnterStandbyOptions) (TransitionResult, error) {
 	var result TransitionResult
 	err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
-		node := &corev1.Node{}
-		if err := c.reader.Get(ctx, client.ObjectKeyFromObject(req.NodeRef), node); err != nil {
+		node, nodeClaim, matches, err := c.readLivePair(ctx, req.NodeRef, req.NodeClaimRef, req.ProviderID)
+		if err != nil {
 			return err
 		}
-		nodeClaim := &v1.NodeClaim{}
-		if err := c.reader.Get(ctx, client.ObjectKeyFromObject(req.NodeClaimRef), nodeClaim); err != nil {
-			return err
-		}
-		if node.UID != req.NodeRef.UID || nodeClaim.UID != req.NodeClaimRef.UID || node.Spec.ProviderID != req.ProviderID {
-			result = TransitionResult{Outcome: OutcomeSkipped, Node: node, NodeClaim: nodeClaim}
+		if !matches {
+			result = TransitionResult{Outcome: OutcomeSkipped}
 			return nil
 		}
 		if utilstandby.IsNodeClaimActivating(nodeClaim) || utilstandby.HasNodeActivationMarker(node) {
@@ -129,23 +125,27 @@ func (c *Coordinator) enterStandbyPostEvacuation(ctx context.Context, req EnterS
 			if err := c.patchNodeClaimStandby(ctx, nodeClaim, true, opts.Since); err != nil {
 				return err
 			}
-			if err := c.reader.Get(ctx, client.ObjectKeyFromObject(req.NodeClaimRef), nodeClaim); err != nil {
-				return err
-			}
 		}
-		if err := c.reader.Get(ctx, client.ObjectKeyFromObject(req.NodeRef), node); err != nil {
+		node, _, matches, err = c.readLivePair(ctx, req.NodeRef, req.NodeClaimRef, req.ProviderID)
+		if err != nil {
 			return err
+		}
+		if !matches {
+			result = TransitionResult{Outcome: OutcomeSkipped}
+			return nil
 		}
 		if !utilstandby.HasNodeTaint(node) {
-			if err := c.ensureNodeStandbyTaint(ctx, node); err != nil {
+			if err := c.patchNodeStandbyTaint(ctx, node, true); err != nil {
 				return err
 			}
 		}
-		if err := c.reader.Get(ctx, client.ObjectKeyFromObject(req.NodeRef), node); err != nil {
+		node, nodeClaim, matches, err = c.readLivePair(ctx, req.NodeRef, req.NodeClaimRef, req.ProviderID)
+		if err != nil {
 			return err
 		}
-		if err := c.reader.Get(ctx, client.ObjectKeyFromObject(req.NodeClaimRef), nodeClaim); err != nil {
-			return err
+		if !matches {
+			result = TransitionResult{Outcome: OutcomeSkipped}
+			return nil
 		}
 		if !StandbyEntryComplete(node, nodeClaim) {
 			return fmt.Errorf("standby entry incomplete after post-evacuation persistence")
@@ -176,7 +176,7 @@ func (c *Coordinator) enterStandbyEmptyMarking(ctx context.Context, req EnterSta
 		return TransitionResult{Outcome: OutcomeFailed}, err
 	}
 
-	node, nodeClaim, eligible, err = c.readEligiblePair(ctx, req, opts.Eligibility)
+	_, nodeClaim, eligible, err = c.readEligiblePair(ctx, req, opts.Eligibility)
 	if err != nil || !eligible {
 		rollbackErr := removeDisruptionTaint(ctx, c.reader, c.writer, req.NodeRef.Name)
 		return TransitionResult{Outcome: OutcomeSkipped}, multierr.Combine(err, rollbackErr)
@@ -189,15 +189,14 @@ func (c *Coordinator) enterStandbyEmptyMarking(ctx context.Context, req EnterSta
 		return TransitionResult{Outcome: OutcomeFailed}, multierr.Combine(err, rollbackErr)
 	}
 
-	if err := c.reader.Get(ctx, client.ObjectKeyFromObject(req.NodeRef), node); err != nil {
-		return TransitionResult{Outcome: OutcomeFailed}, err
+	node, nodeClaim, matches, err := c.readLivePair(ctx, req.NodeRef, req.NodeClaimRef, req.ProviderID)
+	if err != nil {
+		rollbackErr := removeDisruptionTaint(ctx, c.reader, c.writer, req.NodeRef.Name)
+		return TransitionResult{Outcome: OutcomeFailed}, multierr.Combine(err, rollbackErr)
 	}
-	nodeClaim = &v1.NodeClaim{}
-	if err := c.reader.Get(ctx, client.ObjectKeyFromObject(req.NodeClaimRef), nodeClaim); err != nil {
-		return TransitionResult{Outcome: OutcomeFailed}, err
-	}
-	if nodeClaim.UID != req.NodeClaimRef.UID {
-		return TransitionResult{Outcome: OutcomeSkipped}, nil
+	if !matches {
+		rollbackErr := removeDisruptionTaint(ctx, c.reader, c.writer, req.NodeRef.Name)
+		return TransitionResult{Outcome: OutcomeSkipped}, rollbackErr
 	}
 	if !utilstandby.IsNodeClaimStandby(nodeClaim) || utilstandby.IsNodeClaimActivating(nodeClaim) || node.Annotations[utilstandby.NodeClaimActivatingAnnotationKey] == "true" {
 		if err := removeDisruptionTaint(ctx, c.reader, c.writer, node.Name); err != nil {
@@ -211,11 +210,12 @@ func (c *Coordinator) enterStandbyEmptyMarking(ctx context.Context, req EnterSta
 	if err := removeDisruptionTaint(ctx, c.reader, c.writer, node.Name); err != nil {
 		return TransitionResult{Outcome: OutcomeFailed}, err
 	}
-	if err := c.reader.Get(ctx, client.ObjectKeyFromObject(req.NodeRef), node); err != nil {
+	node, nodeClaim, matches, err = c.readLivePair(ctx, req.NodeRef, req.NodeClaimRef, req.ProviderID)
+	if err != nil {
 		return TransitionResult{Outcome: OutcomeFailed}, err
 	}
-	if err := c.reader.Get(ctx, client.ObjectKeyFromObject(req.NodeClaimRef), nodeClaim); err != nil {
-		return TransitionResult{Outcome: OutcomeFailed}, err
+	if !matches {
+		return TransitionResult{Outcome: OutcomeSkipped}, nil
 	}
 
 	recovered, err := c.recoverOccupiedStandby(ctx, node, nodeClaim)

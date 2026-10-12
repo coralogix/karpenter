@@ -113,17 +113,6 @@ func (c *Coordinator) readLivePair(ctx context.Context, nodeRef *corev1.Node, no
 	return node, nodeClaim, true, nil
 }
 
-func (c *Coordinator) ensureNodeStandbyTaint(ctx context.Context, nodeRef *corev1.Node) error {
-	if nodeRef == nil {
-		return fmt.Errorf("cannot restore standby taint without a Node")
-	}
-	node := &corev1.Node{}
-	if err := c.reader.Get(ctx, client.ObjectKeyFromObject(nodeRef), node); err != nil {
-		return err
-	}
-	return c.applyNodeStandbyTaint(ctx, node)
-}
-
 func (c *Coordinator) ensureStandbyTaintForClaim(ctx context.Context, nodeRef *corev1.Node, nodeClaimRef *v1.NodeClaim) error {
 	if nodeRef == nil || nodeClaimRef == nil {
 		return nil

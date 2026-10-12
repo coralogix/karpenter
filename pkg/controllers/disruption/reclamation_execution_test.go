@@ -47,6 +47,17 @@ func TestReclamationExecutionRefusesStalePlanning(t *testing.T) {
 	}
 }
 
+func TestReclamationExecutionSkipsBufferReservedCandidateInBatch(t *testing.T) {
+	h := newReclamationExecutionHarness(t, 2)
+	h.queue.cluster.UpdateBufferPodCounts(map[string]int{h.candidates[0].ProviderID(): 1})
+	if err := h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd); err != nil {
+		t.Fatalf("deleteCandidates() error = %v", err)
+	}
+	if h.tracker.deleteCallCount() != 1 {
+		t.Fatalf("delete attempts = %d, want 1 for the eligible candidate", h.tracker.deleteCallCount())
+	}
+}
+
 func TestReclamationExecutionSkipsInvalidCandidateInBatch(t *testing.T) {
 	h := newReclamationExecutionHarness(t, 2)
 	workload := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "late-pod", Namespace: "default"}, Spec: corev1.PodSpec{NodeName: h.candidates[0].Node.Name}}

@@ -551,3 +551,29 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 		t.Fatalf("reclamationCandidateBeforeDelete() error for an activating node = %v, want unrecoverable", err)
 	}
 }
+
+func TestReclamationRejectsBufferReservedNode(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, time.September, 25, 13, 0, 0, 0, time.UTC)
+	nodePool := reclamationTestPool("score-pool")
+	standbySince := now.Add(-30 * time.Second)
+	nodeClaim, node := reclamationTestNode(nodePool.Name, "buffer-standby", true, true, false)
+	standby.SetNodeClaimStandby(nodeClaim, true, standbySince)
+	kubeClient := reclamationTestClient(nodePool, nodeClaim, node)
+	clk := clocktesting.NewFakeClock(now)
+	cluster := state.NewCluster(clk, kubeClient, nil)
+	cluster.UpdateNodeClaim(nodeClaim)
+	if err := cluster.UpdateNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	cluster.UpdateBufferPodCounts(map[string]int{node.Spec.ProviderID: 1})
+	reclamation := NewReclamation(MakeConsolidation(clk, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil))
+	candidate := reclamationCandidate(nodePool, nodeClaim, node)
+	if reclamation.ShouldDisrupt(ctx, candidate) {
+		t.Fatal("ShouldDisrupt() = true, want false for buffer-reserved standby node")
+	}
+	queue := NewTestQueue(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cluster, clk, nil)
+	if err := queue.reclamationCandidateBeforeDelete(ctx, candidate); !IsUnrecoverableError(err) {
+		t.Fatalf("reclamationCandidateBeforeDelete() error = %v, want unrecoverable for buffer reservation", err)
+	}
+}

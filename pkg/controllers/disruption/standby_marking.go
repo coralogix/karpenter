@@ -54,6 +54,9 @@ func (s *StandbyMarking) ShouldDisrupt(ctx context.Context, candidate *Candidate
 	if s.cluster != nil && s.cluster.IsNodeNominated(candidate.ProviderID()) {
 		return false
 	}
+	if s.cluster != nil && s.cluster.HasBufferPods(candidate.ProviderID()) {
+		return false
+	}
 	empty, err := nodeEmpty(ctx, s.kubeClient, candidate.Node)
 	return err == nil && empty
 }

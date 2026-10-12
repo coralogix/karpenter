@@ -245,6 +245,9 @@ func (s *Reclamation) isReclamationCandidateAvailable(ctx context.Context, candi
 	if !currentNode.DeletionTimestamp.IsZero() || currentNode.Annotations[v1.DoNotDisruptAnnotationKey] == "true" || currentNodeClaim.Annotations[v1.DoNotDisruptAnnotationKey] == "true" {
 		return false
 	}
+	if s.cluster != nil && s.cluster.HasBufferPods(candidate.ProviderID()) {
+		return false
+	}
 	empty, err := nodeEmpty(ctx, s.kubeClient, currentNode)
 	return err == nil && empty
 }

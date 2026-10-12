@@ -57,6 +57,9 @@ func (q *Queue) reclamationCandidateBeforeDelete(ctx context.Context, candidate 
 	if standby.IsNodeClaimActivating(nodeClaim) || q.cluster.IsNodeNominated(candidate.ProviderID()) {
 		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q is activating or nominated", candidate.Name()))
 	}
+	if q.cluster.HasBufferPods(candidate.ProviderID()) {
+		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q has buffer pods", candidate.Name()))
+	}
 	if nodeClaim.Annotations[v1.DoNotDisruptAnnotationKey] == "true" {
 		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q is do-not-disrupt", candidate.Name()))
 	}

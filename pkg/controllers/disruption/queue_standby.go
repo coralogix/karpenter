@@ -140,6 +140,9 @@ func (q *Queue) standbyCandidateEligibleForTransition(ctx context.Context, candi
 		q.cluster.IsNodeNominated(candidate.ProviderID()) {
 		return false, nil
 	}
+	if q.cluster.HasBufferPods(candidate.ProviderID()) {
+		return false, nil
+	}
 	nodePool := &v1.NodePool{}
 	if err := q.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.NodePool), nodePool); err != nil {
 		if apierrors.IsNotFound(err) {

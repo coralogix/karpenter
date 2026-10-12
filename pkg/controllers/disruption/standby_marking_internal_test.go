@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
+	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -53,6 +54,18 @@ func TestStandbyMarkingFiltersToEligibleEmptyActiveNodes(t *testing.T) {
 				t.Fatalf("ShouldDisrupt() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestStandbyMarkingRejectsBufferReservedNode(t *testing.T) {
+	ctx := context.Background()
+	candidate, kubeClient := standbyMarkingTestCandidate(true, false, false)
+	clk := clocktesting.NewFakeClock(time.Now())
+	cluster := state.NewCluster(clk, kubeClient, nil)
+	cluster.UpdateBufferPodCounts(map[string]int{candidate.ProviderID(): 1})
+	method := NewStandbyMarking(consolidation{kubeClient: kubeClient, cluster: cluster})
+	if method.ShouldDisrupt(ctx, candidate) {
+		t.Fatal("ShouldDisrupt() = true, want false for buffer-reserved empty node")
 	}
 }
 

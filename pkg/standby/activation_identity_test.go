@@ -139,6 +139,18 @@ func replaceNodeSameName(ctx context.Context, kubeClient client.Client, node *co
 	return kubeClient.Create(ctx, replacementNode)
 }
 
+func replaceActiveNodeSameName(ctx context.Context, kubeClient client.Client, node *corev1.Node, newNodeUID types.UID) error {
+	if err := kubeClient.Delete(ctx, node); err != nil {
+		return err
+	}
+	replacementNode := node.DeepCopy()
+	replacementNode.UID = newNodeUID
+	replacementNode.ResourceVersion = ""
+	replacementNode.Spec.Taints = nil
+	delete(replacementNode.Annotations, utilstandby.NodeClaimActivatingAnnotationKey)
+	return kubeClient.Create(ctx, replacementNode)
+}
+
 func replaceSameName(ctx context.Context, kubeClient client.Client, node *corev1.Node, claim *karpv1.NodeClaim, newNodeUID, newClaimUID types.UID) error {
 	if err := kubeClient.Delete(ctx, claim); err != nil {
 		return err
