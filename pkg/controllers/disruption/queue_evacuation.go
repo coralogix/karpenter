@@ -184,12 +184,10 @@ func (q *Queue) enterStandbyAfterEvacuation(ctx context.Context, candidate *Cand
 		if err != nil {
 			return err
 		}
-		switch result.Outcome {
-		case standbypkg.OutcomeCompleted, standbypkg.OutcomeUnchanged, standbypkg.OutcomeSkipped:
-			return nil
-		default:
-			return fmt.Errorf("unexpected evacuation standby outcome %q", result.Outcome)
+		if !standbypkg.StandbyEntrySucceeded(result) {
+			return fmt.Errorf("evacuation standby entry did not complete: outcome %q", result.Outcome)
 		}
+		return nil
 	})
 }
 

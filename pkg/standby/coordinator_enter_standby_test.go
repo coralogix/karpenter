@@ -36,10 +36,16 @@ import (
 
 type patchHookClient struct {
 	client.Client
-	afterPatch func(context.Context, client.Object) error
+	afterPatch      func(context.Context, client.Object) error
+	beforeNodePatch func(*corev1.Node) error
 }
 
 func (c *patchHookClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+	if node, ok := object.(*corev1.Node); ok && c.beforeNodePatch != nil {
+		if err := c.beforeNodePatch(node); err != nil {
+			return err
+		}
+	}
 	if err := c.Client.Patch(ctx, object, patch, options...); err != nil {
 		return err
 	}

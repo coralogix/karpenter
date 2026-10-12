@@ -21,11 +21,9 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -59,49 +57,4 @@ func TestLifecycleReadLivePairRejectsStaleIdentity(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestEnsureStandbyTaintForClaimConflictsWithConcurrentActivation(t *testing.T) {
-	ctx := context.Background()
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node"}}
-	nodeClaim := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
-		Name:        "claim",
-		Annotations: map[string]string{NodeClaimAnnotationKey: "true"},
-	}}
-	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(node, nodeClaim).Build()
-	lifecycle := NewLifecycle(activationRaceReader{Reader: kubeClient, writer: kubeClient}, kubeClient)
-
-	err := lifecycle.EnsureStandbyTaintForClaim(ctx, node, nodeClaim)
-	if !apierrors.IsConflict(err) {
-		t.Fatalf("ensuring standby taint error = %v, want optimistic-lock conflict", err)
-	}
-	storedNode := &corev1.Node{}
-	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(node), storedNode); err != nil {
-		t.Fatalf("getting live Node: %v", err)
-	}
-	if !HasNodeActivationMarker(storedNode) || HasNodeTaint(storedNode) {
-		t.Fatalf("concurrent activation was not preserved: annotations=%v taints=%v", storedNode.Annotations, storedNode.Spec.Taints)
-	}
-}
-
-type activationRaceReader struct {
-	client.Reader
-	writer client.Client
-}
-
-func (r activationRaceReader) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
-	if _, ok := object.(*v1.NodeClaim); ok {
-		node := &corev1.Node{}
-		if err := r.writer.Get(ctx, types.NamespacedName{Name: "node"}, node); err != nil {
-			return err
-		}
-		if node.Annotations == nil {
-			node.Annotations = map[string]string{}
-		}
-		node.Annotations[NodeClaimActivatingAnnotationKey] = "true"
-		if err := r.writer.Update(ctx, node); err != nil {
-			return err
-		}
-	}
-	return r.Reader.Get(ctx, key, object, options...)
 }
