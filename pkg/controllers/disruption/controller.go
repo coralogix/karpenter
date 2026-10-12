@@ -52,7 +52,6 @@ type Controller struct {
 	queue            *Queue
 	kubeClient       client.Client
 	apiReader        client.Reader
-	nodePoolReader   client.Reader
 	cluster          *state.Cluster
 	provisioner      *provisioning.Provisioner
 	recorder         events.Recorder
@@ -71,7 +70,6 @@ const pollingPeriod = 10 * time.Second
 type ControllerOptions struct {
 	methods          []Method
 	disruptionPacing *DisruptionPacing
-	nodePoolReader   client.Reader
 	apiReader        client.Reader
 }
 
@@ -83,10 +81,6 @@ func WithMethods(methods ...Method) option.Function[ControllerOptions] {
 
 func WithDisruptionPacing(pace *DisruptionPacing) option.Function[ControllerOptions] {
 	return func(o *ControllerOptions) { o.disruptionPacing = pace }
-}
-
-func WithNodePoolReader(reader client.Reader) option.Function[ControllerOptions] {
-	return func(o *ControllerOptions) { o.nodePoolReader = reader }
 }
 
 func WithAPIReader(reader client.Reader) option.Function[ControllerOptions] {
@@ -105,10 +99,6 @@ func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provi
 	if methods == nil {
 		methods = NewMethods(clk, cluster, kubeClient, provisioner, cp, recorder, queue, pace)
 	}
-	nodePoolReader := o.nodePoolReader
-	if nodePoolReader == nil {
-		nodePoolReader = kubeClient
-	}
 	apiReader := o.apiReader
 	if apiReader == nil {
 		apiReader = kubeClient
@@ -118,7 +108,6 @@ func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provi
 		clock:            clk,
 		kubeClient:       kubeClient,
 		apiReader:        apiReader,
-		nodePoolReader:   nodePoolReader,
 		cluster:          cluster,
 		provisioner:      provisioner,
 		recorder:         recorder,

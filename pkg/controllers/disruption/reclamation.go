@@ -262,7 +262,7 @@ func (s *Reclamation) emptyReclamationNodeInventory(ctx context.Context, node *s
 	if nodePool == nil {
 		return nil, "", false, false, nil
 	}
-	empty, err := nodeEmpty(ctx, s.apiReader(), node.Node)
+	empty, err := nodeEmpty(ctx, s.kubeClient, node.Node)
 	if err != nil {
 		return nil, "", false, false, fmt.Errorf("checking emptiness of node %q for reclamation, %w", node.Name(), err)
 	}
@@ -285,7 +285,7 @@ func (s *Reclamation) reclamationCandidateBeforeDelete(ctx context.Context, cand
 		return NewUnrecoverableError(fmt.Errorf("reclamation candidate is missing its Node, NodeClaim, or NodePool"))
 	}
 	nodeClaim := &v1.NodeClaim{}
-	if err := s.apiReader().Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
+	if err := s.executionReader().Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
 		if apierrors.IsNotFound(err) {
 			// NotFound is OK: conditional delete cannot remove a same-name replacement.
 			return nil
@@ -329,7 +329,7 @@ func (s *Reclamation) reclamationCandidateBeforeDelete(ctx context.Context, cand
 
 func (s *Reclamation) reclamationCandidateNodeClaim(ctx context.Context, candidate *Candidate) (*v1.NodeClaim, bool, error) {
 	nodeClaim := &v1.NodeClaim{}
-	if err := s.apiReader().Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
+	if err := s.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, false, nil
 		}
@@ -343,7 +343,7 @@ func (s *Reclamation) reclamationCandidateNodeClaim(ctx context.Context, candida
 
 func (s *Reclamation) reclamationNodePoolStillManaged(ctx context.Context, nodePoolName string) error {
 	nodePool := &v1.NodePool{}
-	if err := s.apiReader().Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
+	if err := s.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
 		if apierrors.IsNotFound(err) {
 			return NewUnrecoverableError(fmt.Errorf("reclamation NodePool %q was deleted", nodePoolName))
 		}
@@ -358,7 +358,7 @@ func (s *Reclamation) reclamationNodePoolStillManaged(ctx context.Context, nodeP
 //nolint:gocyclo // These live Node checks form one final identity, standby, and emptiness validation.
 func (s *Reclamation) reclamationNodeStillEmpty(ctx context.Context, candidate *Candidate) error {
 	node := &corev1.Node{}
-	if err := s.apiReader().Get(ctx, types.NamespacedName{Name: candidate.Node.Name}, node); err != nil {
+	if err := s.executionReader().Get(ctx, types.NamespacedName{Name: candidate.Node.Name}, node); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil
 		}
@@ -376,7 +376,7 @@ func (s *Reclamation) reclamationNodeStillEmpty(ctx context.Context, candidate *
 	if node.Annotations[v1.DoNotDisruptAnnotationKey] == "true" || node.Labels[v1.NodeInitializedLabelKey] != "true" {
 		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q is no longer eligible", candidate.Name()))
 	}
-	empty, err := nodeEmpty(ctx, s.apiReader(), node)
+	empty, err := nodeEmpty(ctx, s.executionReader(), node)
 	if err != nil {
 		return fmt.Errorf("checking reclamation candidate emptiness, %w", err)
 	}
@@ -395,7 +395,7 @@ func (s *Reclamation) reclamationDeleteSucceeded(_ context.Context, candidate *C
 	return nil
 }
 
-func (s *Reclamation) apiReader() client.Reader {
+func (s *Reclamation) executionReader() client.Reader {
 	if s.queue != nil {
 		return s.queue.apiReader
 	}
@@ -424,7 +424,7 @@ func (s *Reclamation) isReclamationCandidateAvailable(ctx context.Context, candi
 		return false
 	}
 	currentNode := &corev1.Node{}
-	if err := s.apiReader().Get(ctx, client.ObjectKeyFromObject(candidate.Node), currentNode); err != nil {
+	if err := s.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.Node), currentNode); err != nil {
 		return false
 	}
 	if currentNode.UID != candidate.Node.UID || !standby.HasNodeTaint(currentNode) || currentNode.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" {
@@ -433,7 +433,7 @@ func (s *Reclamation) isReclamationCandidateAvailable(ctx context.Context, candi
 	if !currentNode.DeletionTimestamp.IsZero() || currentNode.Annotations[v1.DoNotDisruptAnnotationKey] == "true" || currentNodeClaim.Annotations[v1.DoNotDisruptAnnotationKey] == "true" {
 		return false
 	}
-	empty, err := nodeEmpty(ctx, s.apiReader(), currentNode)
+	empty, err := nodeEmpty(ctx, s.kubeClient, currentNode)
 	return err == nil && empty
 }
 

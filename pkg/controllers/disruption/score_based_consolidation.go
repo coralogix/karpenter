@@ -209,7 +209,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		case <-s.clock.After(remainingValidationDelay):
 		}
 	}
-	cmd, err := selectFirstStillValidCommand(ctx, s.validator, s.recorder, evals, s.validateLiveCompactionCommand)
+	cmd, err := selectFirstStillValidCommand(ctx, s.validator, s.recorder, evals, s.validateCompactionCommand)
 	if err != nil {
 		return []Command{}, err
 	}

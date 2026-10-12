@@ -177,7 +177,7 @@ func stateNodeMatchesReclamationCandidate(node *state.StateNode, candidate *Cand
 
 func (s *reclamationValidator) reclamationPool(ctx context.Context, name string) (*v1.NodePool, map[string]*cloudprovider.InstanceType, bool, error) {
 	pool := &v1.NodePool{}
-	if err := s.reclamation.apiReader().Get(ctx, types.NamespacedName{Name: name}, pool); err != nil {
+	if err := s.reclamation.kubeClient.Get(ctx, types.NamespacedName{Name: name}, pool); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, nil, false, nil
 		}
@@ -208,13 +208,12 @@ func (s *reclamationValidator) reclamationPool(ctx context.Context, name string)
 func (s *reclamationValidator) refreshSelectedCandidate(ctx context.Context, candidate *Candidate, stateNode *state.StateNode, pool *v1.NodePool,
 	instanceTypes map[string]*cloudprovider.InstanceType, pdbLimits pdb.Limits,
 ) (*Candidate, bool) {
-	reader := s.reclamation.apiReader()
 	nodeClaim := &v1.NodeClaim{}
-	if err := reader.Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
+	if err := s.reclamation.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
 		return nil, false
 	}
 	node := &corev1.Node{}
-	if err := reader.Get(ctx, client.ObjectKeyFromObject(candidate.Node), node); err != nil {
+	if err := s.reclamation.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.Node), node); err != nil {
 		return nil, false
 	}
 	if nodeClaim.UID != candidate.NodeClaim.UID || node.UID != candidate.Node.UID ||

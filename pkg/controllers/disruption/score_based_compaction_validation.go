@@ -30,64 +30,53 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-//nolint:gocyclo // Identity, deletion, standby, activation, and occupancy checks jointly protect one live source.
-func (s *ScoreBasedConsolidation) validateLiveCompactionCandidate(ctx context.Context, reader client.Reader, candidate *Candidate, nodePoolName string) error {
-	if reader == nil {
-		return fmt.Errorf("score-based compaction requires an API reader for live validation")
-	}
-	liveNode := &corev1.Node{}
-	if err := reader.Get(ctx, client.ObjectKeyFromObject(candidate.Node), liveNode); err != nil {
+//nolint:gocyclo // Identity, deletion, standby, activation, and occupancy checks jointly protect one candidate source.
+func (s *ScoreBasedConsolidation) validateCompactionCandidate(ctx context.Context, candidate *Candidate, nodePoolName string) error {
+	currentNode := &corev1.Node{}
+	if err := s.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.Node), currentNode); err != nil {
 		if apierrors.IsNotFound(err) {
 			return NewChurnValidationError(fmt.Errorf("score-based compaction candidate Node %q no longer exists", candidate.Node.Name))
 		}
-		return fmt.Errorf("getting live Node %q for score-based compaction validation, %w", candidate.Node.Name, err)
+		return fmt.Errorf("getting Node %q for score-based compaction validation, %w", candidate.Node.Name, err)
 	}
-	if liveNode.UID != candidate.Node.UID || liveNode.Spec.ProviderID != candidate.ProviderID() || !liveNode.DeletionTimestamp.IsZero() ||
-		standby.HasNodeTaint(liveNode) || liveNode.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" ||
-		liveNode.Labels[v1.NodePoolLabelKey] != nodePoolName {
+	if currentNode.UID != candidate.Node.UID || currentNode.Spec.ProviderID != candidate.ProviderID() || !currentNode.DeletionTimestamp.IsZero() ||
+		standby.HasNodeTaint(currentNode) || currentNode.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" ||
+		currentNode.Labels[v1.NodePoolLabelKey] != nodePoolName {
 		return NewChurnValidationError(fmt.Errorf("score-based compaction candidate Node %q changed identity or state", candidate.Node.Name))
 	}
-	liveNodeClaim := &v1.NodeClaim{}
-	if err := reader.Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), liveNodeClaim); err != nil {
+	currentNodeClaim := &v1.NodeClaim{}
+	if err := s.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), currentNodeClaim); err != nil {
 		if apierrors.IsNotFound(err) {
 			return NewChurnValidationError(fmt.Errorf("score-based compaction candidate NodeClaim %q no longer exists", candidate.NodeClaim.Name))
 		}
-		return fmt.Errorf("getting live NodeClaim %q for score-based compaction validation, %w", candidate.NodeClaim.Name, err)
+		return fmt.Errorf("getting NodeClaim %q for score-based compaction validation, %w", candidate.NodeClaim.Name, err)
 	}
-	if liveNodeClaim.UID != candidate.NodeClaim.UID || !liveNodeClaim.DeletionTimestamp.IsZero() ||
-		liveNodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() ||
-		standby.IsNodeClaimStandby(liveNodeClaim) || standby.IsNodeClaimActivating(liveNodeClaim) ||
-		liveNodeClaim.Labels[v1.NodePoolLabelKey] != nodePoolName {
+	if currentNodeClaim.UID != candidate.NodeClaim.UID || !currentNodeClaim.DeletionTimestamp.IsZero() ||
+		currentNodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() ||
+		standby.IsNodeClaimStandby(currentNodeClaim) || standby.IsNodeClaimActivating(currentNodeClaim) ||
+		currentNodeClaim.Labels[v1.NodePoolLabelKey] != nodePoolName {
 		return NewChurnValidationError(fmt.Errorf("score-based compaction candidate NodeClaim %q changed state", candidate.NodeClaim.Name))
 	}
-	livePods, err := nodeOccupyingPods(ctx, reader, liveNode)
+	occupyingPods, err := nodeOccupyingPods(ctx, s.kubeClient, currentNode)
 	if err != nil {
-		return fmt.Errorf("checking live occupancy for score-based compaction Node %q, %w", liveNode.Name, err)
+		return fmt.Errorf("checking occupancy for score-based compaction Node %q, %w", currentNode.Name, err)
 	}
-	if lo.NoneBy(livePods, func(pod *corev1.Pod) bool {
+	if lo.NoneBy(occupyingPods, func(pod *corev1.Pod) bool {
 		return podutils.IsActive(pod) && podutils.IsReschedulable(pod)
 	}) {
-		return NewChurnValidationError(fmt.Errorf("score-based compaction candidate Node %q no longer has reschedulable workload", liveNode.Name))
+		return NewChurnValidationError(fmt.Errorf("score-based compaction candidate Node %q no longer has reschedulable workload", currentNode.Name))
 	}
 	return nil
 }
 
-func (s *ScoreBasedConsolidation) validateLiveCompactionCommand(ctx context.Context, cmd *Command) error {
-	reader := s.apiReader()
+func (s *ScoreBasedConsolidation) validateCompactionCommand(ctx context.Context, cmd *Command) error {
 	for _, candidate := range cmd.Candidates {
 		if candidate == nil || candidate.NodePool == nil {
 			return NewChurnValidationError(fmt.Errorf("score-based compaction candidate is missing its NodePool"))
 		}
-		if err := s.validateLiveCompactionCandidate(ctx, reader, candidate, candidate.NodePool.Name); err != nil {
+		if err := s.validateCompactionCandidate(ctx, candidate, candidate.NodePool.Name); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func (s *ScoreBasedConsolidation) apiReader() client.Reader {
-	if s.queue != nil {
-		return s.queue.apiReader
-	}
-	return s.kubeClient
 }

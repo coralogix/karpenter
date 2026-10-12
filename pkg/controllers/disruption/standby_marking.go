@@ -67,7 +67,7 @@ func (s *StandbyMarking) ShouldDisrupt(ctx context.Context, candidate *Candidate
 	if s.cluster != nil && s.cluster.IsNodeNominated(candidate.ProviderID()) {
 		return false
 	}
-	empty, err := nodeEmpty(ctx, s.apiReader(), candidate.Node)
+	empty, err := nodeEmpty(ctx, s.kubeClient, candidate.Node)
 	return err == nil && empty
 }
 
@@ -96,48 +96,48 @@ func (s *StandbyMarking) ConsolidationType() string {
 	return StandbyMarkingType
 }
 
-func (s *StandbyMarking) apiReader() client.Reader {
+func (s *StandbyMarking) executionReader() client.Reader {
 	if s.queue != nil {
 		return s.queue.apiReader
 	}
 	return s.kubeClient
 }
 
-//nolint:gocyclo // The live identity, policy, nomination, and pod checks are one transition precondition.
-func (s *StandbyMarking) standbyCandidateMatchesLiveObjects(ctx context.Context, candidate *Candidate) (*corev1.Node, *v1.NodeClaim, bool, error) {
-	if candidate == nil || candidate.Node == nil || candidate.NodeClaim == nil || candidate.NodePool == nil {
-		return nil, nil, false, fmt.Errorf("standby candidate is missing its Node, NodeClaim, or NodePool")
+//nolint:gocyclo // Identity, cached policy, nomination, and live occupancy checks are one transition precondition.
+func (s *StandbyMarking) standbyCandidateEligibleForTransition(ctx context.Context, candidate *Candidate, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
+	if candidate == nil || candidate.Node == nil || candidate.NodeClaim == nil || candidate.NodePool == nil || node == nil || nodeClaim == nil {
+		return false, fmt.Errorf("standby candidate is missing its Node, NodeClaim, or NodePool")
 	}
-	node, nodeClaim, matches, err := s.queue.standbyCoordinator.ReadLivePair(ctx, candidate.Node, candidate.NodeClaim, candidate.ProviderID())
-	if err != nil || !matches {
-		return nil, nil, false, err
+	if node.UID != candidate.Node.UID || nodeClaim.UID != candidate.NodeClaim.UID ||
+		node.Spec.ProviderID != candidate.ProviderID() || nodeClaim.Status.ProviderID != candidate.ProviderID() {
+		return false, nil
 	}
 	if !node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() || nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() ||
 		standby.IsNodeClaimStandby(nodeClaim) || standby.IsNodeClaimActivating(nodeClaim) || standby.HasNodeTaint(node) ||
 		node.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" ||
 		node.Annotations[v1.DoNotDisruptAnnotationKey] == "true" || nodeClaim.Annotations[v1.DoNotDisruptAnnotationKey] == "true" ||
 		(s.cluster != nil && s.cluster.IsNodeNominated(candidate.ProviderID())) {
-		return nil, nil, false, nil
+		return false, nil
 	}
 	nodePool := &v1.NodePool{}
-	if err := s.apiReader().Get(ctx, client.ObjectKeyFromObject(candidate.NodePool), nodePool); err != nil {
+	if err := s.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.NodePool), nodePool); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil, nil, false, nil
+			return false, nil
 		}
-		return nil, nil, false, fmt.Errorf("getting standby candidate NodePool, %w", err)
+		return false, fmt.Errorf("getting standby candidate NodePool, %w", err)
 	}
 	if !standbyLifecycleEnabled(nodePool) {
-		return nil, nil, false, nil
+		return false, nil
 	}
 	if node.Labels[v1.NodePoolLabelKey] != candidate.NodePool.Name || nodeClaim.Labels[v1.NodePoolLabelKey] != candidate.NodePool.Name ||
 		node.Labels[v1.NodeInitializedLabelKey] != "true" {
-		return nil, nil, false, nil
+		return false, nil
 	}
-	empty, err := nodeEmpty(ctx, s.apiReader(), node)
+	empty, err := nodeEmpty(ctx, s.executionReader(), node)
 	if err != nil || !empty {
-		return nil, nil, false, err
+		return false, err
 	}
-	return node, nodeClaim, true, nil
+	return true, nil
 }
 
 func updateStandbyState(ctx context.Context, cluster *state.Cluster, reader client.Reader, node *corev1.Node, nodeClaim *v1.NodeClaim) error {
@@ -206,11 +206,7 @@ func (q *Queue) startStandbyCommand(ctx context.Context, cmd *Command) error {
 
 func (q *Queue) markEmptyNodeStandby(ctx context.Context, method *StandbyMarking, candidate *Candidate) (bool, error) {
 	eligibility := func(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
-		_, _, eligible, err := method.standbyCandidateMatchesLiveObjects(ctx, &Candidate{
-			StateNode: &state.StateNode{Node: node, NodeClaim: nodeClaim},
-			NodePool:  candidate.NodePool,
-		})
-		return eligible, err
+		return method.standbyCandidateEligibleForTransition(ctx, candidate, node, nodeClaim)
 	}
 	result, err := q.standbyCoordinator.EnterStandby(ctx, standbypkg.EnterStandbyRequest{
 		NodeRef:      candidate.Node,
@@ -225,7 +221,7 @@ func (q *Queue) markEmptyNodeStandby(ctx context.Context, method *StandbyMarking
 	}
 	switch result.Outcome {
 	case standbypkg.OutcomeCompleted:
-		if err := updateStandbyState(ctx, q.cluster, method.apiReader(), result.Node, result.NodeClaim); err != nil {
+		if err := updateStandbyState(ctx, q.cluster, method.executionReader(), result.Node, result.NodeClaim); err != nil {
 			return false, err
 		}
 		candidate.Node = result.Node
@@ -233,7 +229,7 @@ func (q *Queue) markEmptyNodeStandby(ctx context.Context, method *StandbyMarking
 		return true, nil
 	case standbypkg.OutcomeRecovered, standbypkg.OutcomeSkipped, standbypkg.OutcomeUnchanged:
 		if result.Node != nil && result.NodeClaim != nil {
-			if err := updateStandbyState(ctx, q.cluster, method.apiReader(), result.Node, result.NodeClaim); err != nil {
+			if err := updateStandbyState(ctx, q.cluster, method.executionReader(), result.Node, result.NodeClaim); err != nil {
 				return false, err
 			}
 		}

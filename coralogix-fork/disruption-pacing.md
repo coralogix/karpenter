@@ -72,6 +72,7 @@ The rate and cap are group-wide. The cap of `1` applies across both pools and al
 - Pacing limits successful admission and command-start spacing; it does not guarantee spacing between later pod evictions. Delete and replace commands charge the existing non-empty candidates, not net node reduction.
 - Pacing is an additional gate. Per-NodePool disruption budgets and their existing reasons remain unchanged: drift uses `Drifted`, and consolidation uses its existing reason. Pacing does not change expiration behavior.
 - Outstanding cooldown carries across rate or group-membership changes. Neither a slower nor a faster rate changes an existing deadline; the next successful start uses the rate from final admission. State is in memory and resets on controller restart or leader failover.
+- Pacing policy is refreshed from the controller cache at the start of each disruption loop and again immediately before paced admission. Annotation or NodePool changes apply when the cache observes them, not necessarily on the next API write.
 - When a grouped configuration becomes invalid, the whole group's non-empty consolidation and dynamic or static drift are blocked until all members agree again. Once corrected, processing resumes with the existing cooldown state.
 
 ## Rollback to upstream
