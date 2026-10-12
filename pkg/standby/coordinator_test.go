@@ -214,6 +214,87 @@ func TestActivateRecordsStandbyMetricsForRecoveryPaths(t *testing.T) {
 	}
 }
 
+func TestRepairStandbyNodeResumesEmptyInterruptedActivation(t *testing.T) {
+	ctx := context.Background()
+	providerID := "provider://standby-node"
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "standby-node",
+			UID:  types.UID("standby-node-uid"),
+			Annotations: map[string]string{
+				utilstandby.NodeClaimActivatingAnnotationKey: "true",
+			},
+		},
+		Spec: corev1.NodeSpec{
+			ProviderID: providerID,
+			Taints:     []corev1.Taint{utilstandby.NodeTaint()},
+		},
+	}
+	nodeClaim := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "standby-node",
+		UID:  types.UID("standby-node-claim-uid"),
+		Labels: map[string]string{
+			karpv1.NodePoolLabelKey:        "standby-pool",
+			corev1.LabelInstanceTypeStable: "m6i.large",
+		},
+		Annotations: map[string]string{
+			utilstandby.NodeClaimAnnotationKey:           "true",
+			utilstandby.NodeClaimActivatingAnnotationKey: "true",
+		},
+	}}
+	nodeClaim.Status.ProviderID = providerID
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(node, nodeClaim).Build()
+	coordinator := TestCoordinator(kubeClient, nil)
+	result, err := coordinator.RepairStandbyNode(ctx, RepairRequest{
+		NodeRef:      node,
+		NodeClaimRef: nodeClaim,
+		ProviderID:   providerID,
+	})
+	if err != nil {
+		t.Fatalf("RepairStandbyNode() error = %v", err)
+	}
+	if result.Outcome != OutcomeRecovered {
+		t.Fatalf("RepairStandbyNode() outcome = %q, want recovered", result.Outcome)
+	}
+	assertActivatedStandbyNode(t, ctx, kubeClient, node, nodeClaim)
+}
+
+func TestRepairStandbyNodeRestoresMissingStandbyTaint(t *testing.T) {
+	ctx := context.Background()
+	providerID := "provider://standby-node"
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "standby-node", UID: types.UID("standby-node-uid")},
+		Spec:       corev1.NodeSpec{ProviderID: providerID},
+	}
+	nodeClaim := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name:        "standby-node",
+		UID:         types.UID("standby-node-claim-uid"),
+		Labels:      map[string]string{karpv1.NodePoolLabelKey: "standby-pool"},
+		Annotations: map[string]string{utilstandby.NodeClaimAnnotationKey: "true"},
+	}}
+	nodeClaim.Status.ProviderID = providerID
+	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(node, nodeClaim).Build()
+	coordinator := TestCoordinator(kubeClient, nil)
+	result, err := coordinator.RepairStandbyNode(ctx, RepairRequest{
+		NodeRef:      node,
+		NodeClaimRef: nodeClaim,
+		ProviderID:   providerID,
+	})
+	if err != nil {
+		t.Fatalf("RepairStandbyNode() error = %v", err)
+	}
+	if result.Outcome != OutcomeRecovered {
+		t.Fatalf("RepairStandbyNode() outcome = %q, want recovered", result.Outcome)
+	}
+	storedNode := &corev1.Node{}
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(node), storedNode); err != nil {
+		t.Fatalf("getting Node: %v", err)
+	}
+	if !utilstandby.HasNodeTaint(storedNode) {
+		t.Fatal("expected missing standby taint to be restored")
+	}
+}
+
 func standbyActivationCount(t *testing.T, nodePool, instanceType, source string) float64 {
 	t.Helper()
 	families, err := crmetrics.Registry.Gather()

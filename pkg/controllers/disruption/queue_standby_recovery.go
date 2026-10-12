@@ -22,6 +22,8 @@ import (
 
 	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/samber/lo"
+	"go.uber.org/multierr"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -31,17 +33,13 @@ import (
 )
 
 func (q *Queue) cleanupStaleDisruptionState(ctx context.Context) error {
-	if err := q.recoverOccupiedStandbyNodes(ctx); err != nil {
-		return fmt.Errorf("recovering occupied standby nodes, %w", err)
+	if err := q.repairStandbyNodes(ctx); err != nil {
+		log.FromContext(ctx).Error(err, "repairing standby nodes")
 	}
 	// Clear stale karpenter.sh/disruption taints from nodes that are not in the orchestration queue.
 	outdatedNodes := lo.Reject(q.cluster.DeepCopyNodes(), func(s *state.StateNode, _ int) bool {
 		return q.HasAny(s.ProviderID()) || s.MarkedForDeletion() || standby.IsNodeClaimActivating(s.NodeClaim)
 	})
-	standbyNodes := lo.Filter(outdatedNodes, func(s *state.StateNode, _ int) bool { return standby.IsNodeClaimStandby(s.NodeClaim) })
-	if err := q.ensureStandbyTaints(ctx, standbyNodes...); err != nil {
-		return serrors.Wrap(fmt.Errorf("restoring standby taint, %w", err), "taint", standby.NodeTaintKey)
-	}
 	if err := state.RequireNoScheduleTaint(ctx, q.kubeClient, false, outdatedNodes...); err != nil {
 		return serrors.Wrap(fmt.Errorf("removing taint from nodes, %w", err), "taint", pretty.Taint(v1.DisruptedNoScheduleTaint))
 	}
@@ -52,8 +50,9 @@ func (q *Queue) cleanupStaleDisruptionState(ctx context.Context) error {
 }
 
 //nolint:gocyclo // Each cluster node keeps its eligibility checks beside the repair call.
-func (q *Queue) recoverOccupiedStandbyNodes(ctx context.Context) error {
+func (q *Queue) repairStandbyNodes(ctx context.Context) error {
 	coordinator := q.standbyCoordinator
+	var errs []error
 	for _, stateNode := range q.cluster.DeepCopyNodes() {
 		if stateNode == nil || stateNode.Node == nil || stateNode.NodeClaim == nil || stateNode.MarkedForDeletion() || q.HasAny(stateNode.ProviderID()) {
 			continue
@@ -68,27 +67,15 @@ func (q *Queue) recoverOccupiedStandbyNodes(ctx context.Context) error {
 			ProviderID:   stateNode.ProviderID(),
 		})
 		if err != nil {
-			return fmt.Errorf("repairing standby Node %q, %w", stateNode.Name(), err)
+			errs = append(errs, fmt.Errorf("repairing standby Node %q, %w", stateNode.Name(), err))
+			continue
 		}
 		if result.Outcome != standbypkg.OutcomeRecovered || result.Node == nil || result.NodeClaim == nil {
 			continue
 		}
 		if err := q.updateStandbyState(ctx, result.Node, result.NodeClaim); err != nil {
-			return fmt.Errorf("refreshing Node %q after standby repair, %w", result.Node.Name, err)
+			errs = append(errs, fmt.Errorf("refreshing Node %q after standby repair, %w", result.Node.Name, err))
 		}
 	}
-	return nil
-}
-
-func (q *Queue) ensureStandbyTaints(ctx context.Context, nodes ...*state.StateNode) error {
-	for _, stateNode := range nodes {
-		if err := q.ensureStandbyTaint(ctx, stateNode); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (q *Queue) ensureStandbyTaint(ctx context.Context, stateNode *state.StateNode) error {
-	return q.standbyCoordinator.EnsureStandbyTaintForClaim(ctx, stateNode.Node, stateNode.NodeClaim)
+	return multierr.Combine(errs...)
 }

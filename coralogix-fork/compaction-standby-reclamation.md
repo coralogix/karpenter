@@ -105,7 +105,7 @@ Evacuation waits until occupying pods disappear from the API (terminating pods w
 - **Compaction** activates standby destinations before evacuating sources (`compaction` source).
 - **Recovery** runs on startup and during disruption cleanup: if a standby node has gained a workload (including after a race with the scheduler), the controller activates it back to active capacity (`recovery` source) instead of leaving it tainted standby.
 
-The disruption controller also clears stale `karpenter.sh/disruption` taints from nodes not in an in-flight queue command, restores missing standby taints on marked claims, and reconciles cluster state after coordinator transitions.
+The disruption controller also clears stale `karpenter.sh/disruption` taints from nodes not in an in-flight queue command. During cleanup it runs one coordinator repair pass per selected node to resume interrupted activation, remove orphan standby taints, restore missing standby taints, recover occupied standby capacity, and refresh cluster state after successful repairs.
 
 ## Observability
 

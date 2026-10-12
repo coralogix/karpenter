@@ -18,18 +18,14 @@ package disruption
 
 import (
 	"context"
-	"fmt"
 )
 
-func (c *Controller) refreshEmptyReclamationInventory(ctx context.Context, disruption Method) error {
+func (c *Controller) refreshEmptyReclamationInventory(ctx context.Context, disruption Method) {
 	reclamation, ok := disruption.(*Reclamation)
 	if !ok {
-		return nil
+		return
 	}
-	if err := reclamation.refreshReclamationInventory(ctx); err != nil {
-		return fmt.Errorf("updating reclamation inventory, %w", err)
-	}
-	return nil
+	reclamation.refreshReclamationInventory(ctx)
 }
 
 func (c *Controller) budgetMappingForMethod(ctx context.Context, disruption Method) (map[string]int, error) {

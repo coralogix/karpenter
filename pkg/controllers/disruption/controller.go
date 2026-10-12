@@ -208,9 +208,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 
 	// If there are no candidates, move to the next disruption
 	if len(candidates) == 0 {
-		if err := c.refreshEmptyReclamationInventory(ctx, disruption); err != nil {
-			return false, err
-		}
+		c.refreshEmptyReclamationInventory(ctx, disruption)
 		return false, nil
 	}
 	// Pass precomputed NodePool totals to consolidation methods for balanced scoring

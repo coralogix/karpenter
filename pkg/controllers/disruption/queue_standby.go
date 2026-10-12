@@ -90,16 +90,18 @@ func (q *Queue) startStandbyCommand(ctx context.Context, cmd *Command) error {
 }
 
 func (q *Queue) markEmptyNodeStandby(ctx context.Context, candidate *Candidate) (bool, error) {
-	eligibility := func(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
-		return q.standbyCandidateEligibleForTransition(ctx, candidate, node, nodeClaim)
-	}
 	result, err := q.standbyCoordinator.EnterStandby(ctx, standbypkg.EnterStandbyRequest{
 		NodeRef:      candidate.Node,
 		NodeClaimRef: candidate.NodeClaim,
 		ProviderID:   candidate.ProviderID(),
 	}, standbypkg.EnterStandbyOptions{
-		Since:       q.clock.Now(),
-		Eligibility: eligibility,
+		Since: q.clock.Now(),
+		Eligibility: func(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
+			return q.standbyCandidateEligibleForTransition(ctx, candidate, node, nodeClaim)
+		},
+		PostBarrierEligibility: func(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
+			return q.standbyCandidateOccupiedAfterBarrier(ctx, candidate, node, nodeClaim)
+		},
 	})
 	if err != nil {
 		return false, err
@@ -129,8 +131,7 @@ func (q *Queue) standbyCandidateEligibleForTransition(ctx context.Context, candi
 	if candidate == nil || candidate.Node == nil || candidate.NodeClaim == nil || candidate.NodePool == nil || node == nil || nodeClaim == nil {
 		return false, fmt.Errorf("standby candidate is missing its Node, NodeClaim, or NodePool")
 	}
-	if node.UID != candidate.Node.UID || nodeClaim.UID != candidate.NodeClaim.UID ||
-		node.Spec.ProviderID != candidate.ProviderID() || nodeClaim.Status.ProviderID != candidate.ProviderID() {
+	if !standbyPairMatchesCandidate(candidate, node, nodeClaim) {
 		return false, nil
 	}
 	if !node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() || nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() ||
@@ -162,6 +163,28 @@ func (q *Queue) standbyCandidateEligibleForTransition(ctx context.Context, candi
 		return false, err
 	}
 	return true, nil
+}
+
+func (q *Queue) standbyCandidateOccupiedAfterBarrier(ctx context.Context, candidate *Candidate, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
+	if candidate == nil || node == nil || nodeClaim == nil {
+		return false, fmt.Errorf("standby candidate is missing its Node or NodeClaim")
+	}
+	if !standbyPairMatchesCandidate(candidate, node, nodeClaim) {
+		return false, nil
+	}
+	if q.cluster.IsNodeNominated(candidate.ProviderID()) || q.cluster.HasBufferPods(candidate.ProviderID()) {
+		return false, nil
+	}
+	empty, err := nodeEmpty(ctx, q.apiReader, node)
+	if err != nil || !empty {
+		return false, err
+	}
+	return true, nil
+}
+
+func standbyPairMatchesCandidate(candidate *Candidate, node *corev1.Node, nodeClaim *v1.NodeClaim) bool {
+	return node.UID == candidate.Node.UID && nodeClaim.UID == candidate.NodeClaim.UID &&
+		node.Spec.ProviderID == candidate.ProviderID() && nodeClaim.Status.ProviderID == candidate.ProviderID()
 }
 
 func (q *Queue) updateStandbyState(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) error {

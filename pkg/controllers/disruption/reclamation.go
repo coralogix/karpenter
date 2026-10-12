@@ -38,10 +38,6 @@ type Reclamation struct {
 	consolidation
 }
 
-type reclamationInventory struct {
-	emptyNodeCounts map[string]emptyNodeCounts
-}
-
 func NewReclamation(c consolidation) *Reclamation {
 	return &Reclamation{consolidation: c}
 }
@@ -51,10 +47,7 @@ func (s *Reclamation) ShouldDisrupt(ctx context.Context, candidate *Candidate) b
 }
 
 func (s *Reclamation) ComputeCommands(ctx context.Context, _ map[string]int, candidates ...*Candidate) ([]Command, error) {
-	cmd, err := s.computeReclamationCommand(ctx, candidates)
-	if err != nil {
-		return []Command{}, err
-	}
+	cmd := s.computeReclamationCommand(ctx, candidates)
 	if cmd == nil {
 		return []Command{}, nil
 	}
@@ -73,16 +66,11 @@ func (s *Reclamation) ConsolidationType() string {
 	return ReclamationType
 }
 
-func (s *Reclamation) computeReclamationCommand(ctx context.Context, candidates []*Candidate) (*Command, error) {
-	if err := s.refreshReclamationInventory(ctx); err != nil {
-		return nil, err
-	}
-	eligible := lo.Filter(candidates, func(candidate *Candidate, _ int) bool {
-		return s.reclamationCandidateEligible(candidate)
-	})
-	selected := selectReclamationCandidates(eligible)
+func (s *Reclamation) computeReclamationCommand(ctx context.Context, candidates []*Candidate) *Command {
+	s.refreshReclamationInventory(ctx)
+	selected := selectReclamationCandidates(candidates)
 	if len(selected) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	logReclamationBatchSelected(ctx, selected)
@@ -90,7 +78,7 @@ func (s *Reclamation) computeReclamationCommand(ctx context.Context, candidates 
 		Method:     s,
 		Action:     DeleteAction,
 		Candidates: selected,
-	}, nil
+	}
 }
 
 func logReclamationBatchSelected(ctx context.Context, candidates []*Candidate) {
@@ -112,16 +100,9 @@ func reclamationCandidateCounts(candidates []*Candidate) map[string]int {
 }
 
 func selectReclamationCandidates(candidates []*Candidate) []*Candidate {
-	var selected []*Candidate
-	for _, candidate := range candidates {
-		if candidate == nil || candidate.NodePool == nil || !standbyLifecycleEnabled(candidate.NodePool) {
-			continue
-		}
-		if !reclamationCandidateHasIdentity(candidate) {
-			continue
-		}
-		selected = append(selected, candidate)
-	}
+	selected := lo.Filter(candidates, func(candidate *Candidate, _ int) bool {
+		return candidate != nil && candidate.NodePool != nil
+	})
 	sort.Slice(selected, func(i, j int) bool {
 		if selected[i].NodePool.Name != selected[j].NodePool.Name {
 			return selected[i].NodePool.Name < selected[j].NodePool.Name
@@ -131,38 +112,31 @@ func selectReclamationCandidates(candidates []*Candidate) []*Candidate {
 	return selected
 }
 
-func reclamationCandidateHasIdentity(candidate *Candidate) bool {
-	return candidate != nil && candidate.StateNode != nil && candidate.Node != nil && candidate.NodeClaim != nil && candidate.NodePool != nil
-}
-
-func (s *Reclamation) refreshReclamationInventory(ctx context.Context) error {
-	inventory, err := s.collectReclamationInventory(ctx)
+func (s *Reclamation) refreshReclamationInventory(ctx context.Context) {
+	emptyNodeCounts, err := s.collectReclamationInventory(ctx)
 	if err != nil {
-		return err
+		log.FromContext(ctx).Error(err, "collecting reclamation empty-node inventory")
+		return
 	}
-	updateReclamationEmptyNodeMetrics(inventory.emptyNodeCounts)
-	return nil
+	updateReclamationEmptyNodeMetrics(emptyNodeCounts)
 }
 
-func (s *Reclamation) collectReclamationInventory(ctx context.Context) (*reclamationInventory, error) {
+func (s *Reclamation) collectReclamationInventory(ctx context.Context) (map[string]emptyNodeCounts, error) {
 	nodePools, inventoryCounts, err := s.reclamationPools(ctx)
 	if err != nil {
 		return nil, err
 	}
-	inventory := &reclamationInventory{
-		emptyNodeCounts: inventoryCounts,
-	}
 	for _, node := range s.cluster.DeepCopyNodes() {
-		_, poolName, isStandby, empty, err := s.emptyReclamationNodeInventory(ctx, node, nodePools)
+		poolName, isStandby, empty, err := s.emptyReclamationNodeInventory(ctx, node, nodePools)
 		if err != nil {
 			return nil, err
 		}
 		if !empty {
 			continue
 		}
-		inventory.emptyNodeCounts[poolName] = inventory.emptyNodeCounts[poolName].add(isStandby)
+		inventoryCounts[poolName] = inventoryCounts[poolName].add(isStandby)
 	}
-	return inventory, nil
+	return inventoryCounts, nil
 }
 
 func (s *Reclamation) reclamationPools(ctx context.Context) (map[string]*v1.NodePool, map[string]emptyNodeCounts, error) {
@@ -183,21 +157,20 @@ func (s *Reclamation) reclamationPools(ctx context.Context) (map[string]*v1.Node
 	return nodePools, inventoryCounts, nil
 }
 
-func (s *Reclamation) emptyReclamationNodeInventory(ctx context.Context, node *state.StateNode, nodePools map[string]*v1.NodePool) (*v1.NodePool, string, bool, bool, error) {
+func (s *Reclamation) emptyReclamationNodeInventory(ctx context.Context, node *state.StateNode, nodePools map[string]*v1.NodePool) (string, bool, bool, error) {
 	if node.NodeClaim == nil || node.Node == nil || node.MarkedForDeletion() {
-		return nil, "", false, false, nil
+		return "", false, false, nil
 	}
 	poolName := node.Labels()[v1.NodePoolLabelKey]
-	nodePool := nodePools[poolName]
-	if nodePool == nil {
-		return nil, "", false, false, nil
+	if nodePools[poolName] == nil {
+		return "", false, false, nil
 	}
 	empty, err := nodeEmpty(ctx, s.kubeClient, node.Node)
 	if err != nil {
-		return nil, "", false, false, fmt.Errorf("checking emptiness of node %q for reclamation, %w", node.Name(), err)
+		return "", false, false, fmt.Errorf("checking emptiness of node %q for reclamation, %w", node.Name(), err)
 	}
 	isStandby := standby.IsNodeClaimStandby(node.NodeClaim) && standby.HasNodeTaint(node.Node)
-	return nodePool, poolName, isStandby, empty, nil
+	return poolName, isStandby, empty, nil
 }
 
 func (s *Reclamation) reclamationCandidateNodeClaim(ctx context.Context, candidate *Candidate) (*v1.NodeClaim, bool, error) {

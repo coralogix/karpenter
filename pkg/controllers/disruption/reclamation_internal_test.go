@@ -71,9 +71,7 @@ func TestReclamationEmptyNodeMetricsIncludeAllConfiguredPools(t *testing.T) {
 	consolidator := MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
 	reclamation := NewReclamation(consolidator)
 
-	if err := reclamation.refreshReclamationInventory(ctx); err != nil {
-		t.Fatalf("refreshReclamationInventory() error = %v", err)
-	}
+	reclamation.refreshReclamationInventory(ctx)
 	assertScoreBasedEmptyNodeMetric(t, "due-pool", reclamationEmptyNodeStateStandby, 1, true)
 	assertScoreBasedEmptyNodeMetric(t, "due-pool", reclamationEmptyNodeStateOther, 1, true)
 	assertScoreBasedEmptyNodeMetric(t, "other-pool", reclamationEmptyNodeStateStandby, 0, true)
@@ -99,9 +97,7 @@ func TestReclamationEmptyNodeMetricsKeepLastCompleteScanAndRemoveOutOfScopePools
 	}
 	consolidator := MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
 	reclamation := NewReclamation(consolidator)
-	if err := reclamation.refreshReclamationInventory(ctx); err != nil {
-		t.Fatalf("initial refreshReclamationInventory() error = %v", err)
-	}
+	reclamation.refreshReclamationInventory(ctx)
 	assertScoreBasedEmptyNodeMetric(t, "old-pool", reclamationEmptyNodeStateOther, 1, true)
 
 	newPool := reclamationTestPool("new-pool")
@@ -124,16 +120,12 @@ func TestReclamationEmptyNodeMetricsKeepLastCompleteScanAndRemoveOutOfScopePools
 	}
 
 	reclamation.kubeClient = errorOnPodListClient{Client: kubeClient, err: errors.New("pod list failed")}
-	if err := reclamation.refreshReclamationInventory(ctx); err == nil {
-		t.Fatal("refreshReclamationInventory() error = nil, want pod-list error")
-	}
+	reclamation.refreshReclamationInventory(ctx)
 	assertScoreBasedEmptyNodeMetric(t, "old-pool", reclamationEmptyNodeStateOther, 1, true)
 	assertScoreBasedEmptyNodeMetric(t, "new-pool", reclamationEmptyNodeStateOther, 0, false)
 
 	reclamation.kubeClient = kubeClient
-	if err := reclamation.refreshReclamationInventory(ctx); err != nil {
-		t.Fatalf("complete refreshReclamationInventory() error = %v", err)
-	}
+	reclamation.refreshReclamationInventory(ctx)
 	assertScoreBasedEmptyNodeMetric(t, "old-pool", reclamationEmptyNodeStateOther, 0, false)
 	assertScoreBasedEmptyNodeMetric(t, "new-pool", reclamationEmptyNodeStateOther, 1, true)
 }
@@ -350,12 +342,9 @@ func TestReclamationSkipsStandbyWithinReclamationDelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	reclamation := NewReclamation(MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil))
-	cmd, err := reclamation.computeReclamationCommand(ctx, []*Candidate{reclamationCandidate(pool, youngClaim, youngNode)})
-	if err != nil {
-		t.Fatalf("computeReclamationCommand() error = %v", err)
-	}
-	if cmd != nil {
-		t.Fatal("expected no reclamation command while reclamation delay has not elapsed")
+	candidate := reclamationCandidate(pool, youngClaim, youngNode)
+	if reclamation.ShouldDisrupt(ctx, candidate) {
+		t.Fatal("ShouldDisrupt() = true, want false while reclamation delay has not elapsed")
 	}
 }
 
@@ -390,18 +379,11 @@ func TestReclamationComputeCommandSelectsEligibleCandidatesAcrossPools(t *testin
 		}
 	}
 	recorder := events.NewRecorder(&record.FakeRecorder{})
-	queue := NewTestQueue(kubeClient, recorder, cluster, clock, nil)
-	reclamation := NewReclamation(MakeConsolidation(clock, cluster, kubeClient, nil, nil, recorder, queue, nil))
-	cmd, err := reclamation.computeReclamationCommand(ctx, []*Candidate{
+	reclamation := NewReclamation(MakeConsolidation(clock, cluster, kubeClient, nil, nil, recorder, nil, nil))
+	cmd := reclamation.computeReclamationCommand(ctx, []*Candidate{
 		reclamationCandidate(poolA, claimA, nodeA),
 		reclamationCandidate(poolB, claimB, nodeB),
-		reclamationCandidate(poolA, youngClaim, youngNode),
-		reclamationCandidate(poolA, activatingClaim, activatingNode),
-		reclamationCandidate(disabledPool, disabledClaim, disabledNode),
 	})
-	if err != nil {
-		t.Fatalf("computeReclamationCommand() error = %v", err)
-	}
 	if cmd == nil {
 		t.Fatal("expected reclamation command for eligible standby nodes")
 	}
@@ -575,5 +557,27 @@ func TestReclamationRejectsBufferReservedNode(t *testing.T) {
 	queue := NewTestQueue(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cluster, clk, nil)
 	if err := queue.reclamationCandidateBeforeDelete(ctx, candidate); !IsUnrecoverableError(err) {
 		t.Fatalf("reclamationCandidateBeforeDelete() error = %v, want unrecoverable for buffer reservation", err)
+	}
+}
+
+func TestReclamationComputeCommandSucceedsWhenInventoryCollectionFails(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, time.October, 10, 12, 0, 0, 0, time.UTC)
+	clock := clocktesting.NewFakeClock(now)
+	pool := reclamationTestPool("pool-a")
+	standbySince := now.Add(-30 * time.Second)
+	claim, node := reclamationTestNode("pool-a", "ready-a", true, true, false)
+	standby.SetNodeClaimStandby(claim, true, standbySince)
+	kubeClient := reclamationTestClient(pool, claim, node)
+	cluster := state.NewCluster(clock, kubeClient, nil)
+	cluster.UpdateNodeClaim(claim)
+	if err := cluster.UpdateNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	reclamation := NewReclamation(MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil))
+	reclamation.kubeClient = errorOnPodListClient{Client: kubeClient, err: errors.New("pod list failed")}
+	cmd := reclamation.computeReclamationCommand(ctx, []*Candidate{reclamationCandidate(pool, claim, node)})
+	if cmd == nil || len(cmd.Candidates) != 1 {
+		t.Fatalf("computeReclamationCommand() = %v, want one selected candidate", cmd)
 	}
 }

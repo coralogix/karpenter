@@ -167,8 +167,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	candidates = s.SortCandidates(candidates)
 	var validCandidates []*Candidate
 	for _, candidate := range candidates {
-		if candidate == nil || candidate.NodePool == nil ||
-			standby.IsNodeClaimActivating(candidate.NodeClaim) || standby.IsNodeClaimStandby(candidate.NodeClaim) || standby.HasNodeTaint(candidate.Node) {
+		if candidate == nil || candidate.NodePool == nil {
 			continue
 		}
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {

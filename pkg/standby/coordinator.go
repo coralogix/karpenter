@@ -71,8 +71,10 @@ type EnterStandbyOptions struct {
 	// BarrierTaintPresent skips applying the temporary disruption scheduling barrier.
 	BarrierTaintPresent bool
 	Since               time.Time
-	// Eligibility is evaluated on live Node and NodeClaim reads at each protocol boundary.
+	// Eligibility is evaluated on live Node and NodeClaim reads before the disruption barrier.
 	Eligibility func(context.Context, *corev1.Node, *v1.NodeClaim) (bool, error)
+	// PostBarrierEligibility is evaluated after the barrier is applied during empty marking.
+	PostBarrierEligibility func(context.Context, *corev1.Node, *v1.NodeClaim) (bool, error)
 }
 
 type EnterStandbyRequest struct {
@@ -176,7 +178,7 @@ func (c *Coordinator) enterStandbyEmptyMarking(ctx context.Context, req EnterSta
 		return TransitionResult{Outcome: OutcomeFailed}, err
 	}
 
-	_, nodeClaim, eligible, err = c.readEligiblePair(ctx, req, opts.Eligibility)
+	_, nodeClaim, eligible, err = c.readEligiblePair(ctx, req, c.postBarrierEligibility(opts))
 	if err != nil || !eligible {
 		rollbackErr := removeDisruptionTaint(ctx, c.reader, c.writer, req.NodeRef.Name)
 		return TransitionResult{Outcome: OutcomeSkipped}, multierr.Combine(err, rollbackErr)
@@ -229,6 +231,13 @@ func (c *Coordinator) enterStandbyEmptyMarking(ctx context.Context, req EnterSta
 		return TransitionResult{Outcome: OutcomeSkipped, Node: node, NodeClaim: nodeClaim}, nil
 	}
 	return TransitionResult{Outcome: OutcomeCompleted, Node: node, NodeClaim: nodeClaim}, nil
+}
+
+func (c *Coordinator) postBarrierEligibility(opts EnterStandbyOptions) func(context.Context, *corev1.Node, *v1.NodeClaim) (bool, error) {
+	if opts.PostBarrierEligibility != nil {
+		return opts.PostBarrierEligibility
+	}
+	return opts.Eligibility
 }
 
 func (c *Coordinator) readEligiblePair(ctx context.Context, req EnterStandbyRequest, eligibility func(context.Context, *corev1.Node, *v1.NodeClaim) (bool, error)) (*corev1.Node, *v1.NodeClaim, bool, error) {
@@ -292,12 +301,41 @@ func (c *Coordinator) RepairStandbyNode(ctx context.Context, req RepairRequest) 
 	if repaired {
 		return TransitionResult{Outcome: OutcomeRecovered, Node: node, NodeClaim: nodeClaim}, nil
 	}
+	if utilstandby.IsNodeClaimActivating(nodeClaim) || utilstandby.HasNodeActivationMarker(node) {
+		stateNode := &state.StateNode{Node: node.DeepCopy(), NodeClaim: nodeClaim.DeepCopy()}
+		actResult, err := c.Activate(ctx, utilstandby.ActivationSourceRecovery, stateNode)
+		if err != nil {
+			return TransitionResult{Outcome: OutcomeFailed}, err
+		}
+		if len(actResult.Activated) > 0 {
+			pair := actResult.Activated[0]
+			return TransitionResult{Outcome: OutcomeRecovered, Node: pair.Node, NodeClaim: pair.NodeClaim}, nil
+		}
+		node, nodeClaim, matches, err = c.readLivePair(ctx, req.NodeRef, req.NodeClaimRef, req.ProviderID)
+		if err != nil || !matches {
+			if err != nil {
+				return TransitionResult{Outcome: OutcomeFailed}, err
+			}
+			return TransitionResult{Outcome: OutcomeSkipped}, nil
+		}
+	}
+	if utilstandby.IsNodeClaimStandby(nodeClaim) && !utilstandby.IsNodeClaimActivating(nodeClaim) &&
+		!utilstandby.HasNodeActivationMarker(node) && !utilstandby.HasNodeTaint(node) {
+		if err := c.applyNodeStandbyTaint(ctx, node); err != nil {
+			return TransitionResult{Outcome: OutcomeFailed}, err
+		}
+		utilstandby.SetNodeTaint(node, true)
+		return TransitionResult{Outcome: OutcomeRecovered, Node: node, NodeClaim: nodeClaim}, nil
+	}
 	empty, err := NodeEmpty(ctx, c.reader, node)
 	if err != nil {
 		return TransitionResult{Outcome: OutcomeFailed}, err
 	}
 	if empty {
-		return TransitionResult{Outcome: OutcomeSkipped}, nil
+		if StandbyEntryComplete(node, nodeClaim) {
+			return TransitionResult{Outcome: OutcomeUnchanged, Node: node, NodeClaim: nodeClaim}, nil
+		}
+		return TransitionResult{Outcome: OutcomeSkipped, Node: node, NodeClaim: nodeClaim}, nil
 	}
 	recovered, err := c.recoverOccupiedStandbyPair(ctx, node, nodeClaim)
 	if err != nil {
