@@ -227,14 +227,10 @@ func replacementsFromNodeClaims(newNodeClaims ...*pscheduling.NodeClaim) []*Repl
 type Command struct {
 	Method
 
-	Succeeded bool
-	Action    CommandAction
-	// BeforeDelete runs immediately before delete; may refresh candidates for conditional deletion.
-	BeforeDelete func(context.Context, []*Candidate) error
-	// DeleteWithPreconditions deletes using UID and resourceVersion so concurrent updates invalidate the delete.
-	DeleteWithPreconditions bool
-	OnSuccess               func(context.Context) error
-	OnDeleteSuccess         func(context.Context, *Candidate) error
+	Succeeded       bool
+	Action          CommandAction
+	OnSuccess       func(context.Context) error
+	OnDeleteSuccess func(context.Context, *Candidate) error
 
 	deletionExecution   *deletionExecutionState
 	evacuationExecution *evacuationExecutionState

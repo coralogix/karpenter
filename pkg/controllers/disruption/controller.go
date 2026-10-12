@@ -51,7 +51,6 @@ import (
 type Controller struct {
 	queue            *Queue
 	kubeClient       client.Client
-	apiReader        client.Reader
 	cluster          *state.Cluster
 	provisioner      *provisioning.Provisioner
 	recorder         events.Recorder
@@ -70,7 +69,6 @@ const pollingPeriod = 10 * time.Second
 type ControllerOptions struct {
 	methods          []Method
 	disruptionPacing *DisruptionPacing
-	apiReader        client.Reader
 }
 
 func WithMethods(methods ...Method) option.Function[ControllerOptions] {
@@ -81,10 +79,6 @@ func WithMethods(methods ...Method) option.Function[ControllerOptions] {
 
 func WithDisruptionPacing(pace *DisruptionPacing) option.Function[ControllerOptions] {
 	return func(o *ControllerOptions) { o.disruptionPacing = pace }
-}
-
-func WithAPIReader(reader client.Reader) option.Function[ControllerOptions] {
-	return func(o *ControllerOptions) { o.apiReader = reader }
 }
 
 func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provisioning.Provisioner,
@@ -99,15 +93,10 @@ func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provi
 	if methods == nil {
 		methods = NewMethods(clk, cluster, kubeClient, provisioner, cp, recorder, queue, pace)
 	}
-	apiReader := o.apiReader
-	if apiReader == nil {
-		apiReader = kubeClient
-	}
 	return &Controller{
 		queue:            queue,
 		clock:            clk,
 		kubeClient:       kubeClient,
-		apiReader:        apiReader,
 		cluster:          cluster,
 		provisioner:      provisioner,
 		recorder:         recorder,
@@ -174,7 +163,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{}, fmt.Errorf("refreshing disruption pacing policy, %w", err)
 	}
 
-	if err := c.cleanupStaleDisruptionState(ctx); err != nil {
+	if err := c.queue.cleanupStaleDisruptionState(ctx); err != nil {
 		if errors.IsConflict(err) {
 			return reconciler.Result{Requeue: true}, nil
 		}

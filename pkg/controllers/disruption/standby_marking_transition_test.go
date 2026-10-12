@@ -68,8 +68,7 @@ func TestCleanupRecoversOccupiedStandbyNodeWithDoNotDisruptPod(t *testing.T) {
 	kubeClient, cluster, clk, storedNode, storedClaim := occupiedStandbyRecoveryFixture(t, ctx)
 	coordinator := standbypkg.NewCoordinator(kubeClient, kubeClient, clk)
 	queue := NewQueue(kubeClient, kubeClient, events.NewRecorder(record.NewFakeRecorder(1)), cluster, clk, nil, coordinator)
-	controller := &Controller{queue: queue, kubeClient: kubeClient, apiReader: kubeClient, cluster: cluster}
-	if err := controller.cleanupStaleDisruptionState(ctx); err != nil {
+	if err := queue.cleanupStaleDisruptionState(ctx); err != nil {
 		t.Fatalf("recovering occupied standby node: %v", err)
 	}
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(storedNode), storedNode); err != nil {

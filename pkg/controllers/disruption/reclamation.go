@@ -112,13 +112,11 @@ func (s *Reclamation) computeReclamationCommand(ctx context.Context, candidates 
 	}
 
 	cmd := Command{
-		Method:     s,
-		Action:     DeleteAction,
-		Candidates: selected,
+		Method:          s,
+		Action:          DeleteAction,
+		Candidates:      selected,
+		OnDeleteSuccess: s.reclamationDeleteSucceeded,
 	}
-	cmd.BeforeDelete = s.reclamationBeforeDelete
-	cmd.DeleteWithPreconditions = true
-	cmd.OnDeleteSuccess = s.reclamationDeleteSucceeded
 
 	validated, err := s.validateReclamationCommand(ctx, cmd)
 	if err != nil || validated == nil {
@@ -270,63 +268,6 @@ func (s *Reclamation) emptyReclamationNodeInventory(ctx context.Context, node *s
 	return nodePool, poolName, isStandby, empty, nil
 }
 
-func (s *Reclamation) reclamationBeforeDelete(ctx context.Context, candidates []*Candidate) error {
-	for _, candidate := range candidates {
-		if err := s.reclamationCandidateBeforeDelete(ctx, candidate); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-//nolint:gocyclo // The final pre-delete validation keeps the ordered safety checks and refreshes together.
-func (s *Reclamation) reclamationCandidateBeforeDelete(ctx context.Context, candidate *Candidate) error {
-	if candidate == nil || candidate.NodeClaim == nil || candidate.Node == nil || candidate.NodePool == nil {
-		return NewUnrecoverableError(fmt.Errorf("reclamation candidate is missing its Node, NodeClaim, or NodePool"))
-	}
-	nodeClaim := &v1.NodeClaim{}
-	if err := s.executionReader().Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
-		if apierrors.IsNotFound(err) {
-			// NotFound is OK: conditional delete cannot remove a same-name replacement.
-			return nil
-		}
-		return fmt.Errorf("getting reclamation candidate NodeClaim before deletion, %w", err)
-	}
-	if nodeClaim.UID != candidate.NodeClaim.UID {
-		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q was replaced", candidate.Name()))
-	}
-	if !nodeClaim.DeletionTimestamp.IsZero() {
-		candidate.NodeClaim = nodeClaim
-		return nil
-	}
-	if nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
-		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q is terminating", candidate.Name()))
-	}
-	if standby.IsNodeClaimActivating(nodeClaim) || s.cluster.IsNodeNominated(candidate.ProviderID()) {
-		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q is activating or nominated", candidate.Name()))
-	}
-	if nodeClaim.Annotations[v1.DoNotDisruptAnnotationKey] == "true" {
-		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q is do-not-disrupt", candidate.Name()))
-	}
-	if !standby.IsNodeClaimStandby(nodeClaim) {
-		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q is no longer standby", candidate.Name()))
-	}
-	if !standbyReclamationSoakElapsed(candidate.NodePool, nodeClaim, s.clock.Now()) {
-		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q has not completed the standby soak", candidate.Name()))
-	}
-	if nodeClaim.Labels[v1.NodePoolLabelKey] != candidate.NodePool.Name {
-		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q changed NodePool", candidate.Name()))
-	}
-	if err := s.reclamationNodePoolStillManaged(ctx, candidate.NodePool.Name); err != nil {
-		return err
-	}
-	if err := s.reclamationNodeStillEmpty(ctx, candidate); err != nil {
-		return err
-	}
-	candidate.NodeClaim = nodeClaim
-	return nil
-}
-
 func (s *Reclamation) reclamationCandidateNodeClaim(ctx context.Context, candidate *Candidate) (*v1.NodeClaim, bool, error) {
 	nodeClaim := &v1.NodeClaim{}
 	if err := s.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.NodeClaim), nodeClaim); err != nil {
@@ -355,51 +296,12 @@ func (s *Reclamation) reclamationNodePoolStillManaged(ctx context.Context, nodeP
 	return nil
 }
 
-//nolint:gocyclo // These live Node checks form one final identity, standby, and emptiness validation.
-func (s *Reclamation) reclamationNodeStillEmpty(ctx context.Context, candidate *Candidate) error {
-	node := &corev1.Node{}
-	if err := s.executionReader().Get(ctx, types.NamespacedName{Name: candidate.Node.Name}, node); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("getting reclamation candidate Node, %w", err)
-	}
-	if node.Spec.ProviderID != candidate.ProviderID() {
-		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q changed provider ID", candidate.Name()))
-	}
-	if !node.DeletionTimestamp.IsZero() {
-		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q is deleting", candidate.Name()))
-	}
-	if node.UID != candidate.Node.UID || !standby.HasNodeTaint(node) || node.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" {
-		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q is no longer tainted standby", candidate.Name()))
-	}
-	if node.Annotations[v1.DoNotDisruptAnnotationKey] == "true" || node.Labels[v1.NodeInitializedLabelKey] != "true" {
-		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q is no longer eligible", candidate.Name()))
-	}
-	empty, err := nodeEmpty(ctx, s.executionReader(), node)
-	if err != nil {
-		return fmt.Errorf("checking reclamation candidate emptiness, %w", err)
-	}
-	if !empty {
-		return NewUnrecoverableError(fmt.Errorf("reclamation candidate %q is no longer empty", candidate.Name()))
-	}
-	candidate.Node = node
-	return nil
-}
-
 func (s *Reclamation) reclamationDeleteSucceeded(_ context.Context, candidate *Candidate) error {
 	if candidate == nil || candidate.NodePool == nil {
 		return fmt.Errorf("reclamation candidate is missing its NodePool")
 	}
 	ReclamationNodeRemovalsTotal.Inc(map[string]string{metrics.NodePoolLabel: candidate.NodePool.Name})
 	return nil
-}
-
-func (s *Reclamation) executionReader() client.Reader {
-	if s.queue != nil {
-		return s.queue.apiReader
-	}
-	return s.kubeClient
 }
 
 //nolint:gocyclo // Keep the candidate's live NodeClaim, Node, and pod safety checks in one predicate.

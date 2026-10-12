@@ -475,22 +475,23 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 	kubeClient := reclamationTestClient(nodePool, nodeClaim, node)
 	clk := clocktesting.NewFakeClock(now)
 	cluster := state.NewCluster(clk, kubeClient, nil)
-	consolidator := MakeConsolidation(clk, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
+	queue := NewTestQueue(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cluster, clk, nil)
+	consolidator := MakeConsolidation(clk, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), queue, nil)
 	reclamation := NewReclamation(consolidator)
 	stateNode := state.NewNode()
 	stateNode.Node = node
 	stateNode.NodeClaim = nodeClaim
 	candidate := &Candidate{StateNode: stateNode, NodePool: nodePool}
-	if err := reclamation.reclamationBeforeDelete(ctx, []*Candidate{candidate}); err != nil {
-		t.Fatalf("BeforeDelete() error for an empty node = %v", err)
+	if err := queue.reclamationCandidateBeforeDelete(ctx, reclamation, candidate); err != nil {
+		t.Fatalf("reclamationCandidateBeforeDelete() error for an empty node = %v", err)
 	}
 
 	workload := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "late-pod", Namespace: "default"}, Spec: corev1.PodSpec{NodeName: node.Name}}
 	if err := kubeClient.Create(ctx, workload); err != nil {
 		t.Fatal(err)
 	}
-	if err := reclamation.reclamationBeforeDelete(ctx, []*Candidate{candidate}); !IsUnrecoverableError(err) {
-		t.Fatalf("BeforeDelete() error with a newly bound pod = %v, want unrecoverable", err)
+	if err := queue.reclamationCandidateBeforeDelete(ctx, reclamation, candidate); !IsUnrecoverableError(err) {
+		t.Fatalf("reclamationCandidateBeforeDelete() error with a newly bound pod = %v, want unrecoverable", err)
 	}
 	if err := kubeClient.Delete(ctx, workload); err != nil {
 		t.Fatal(err)
@@ -500,8 +501,8 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 		t.Fatal(err)
 	}
 	cluster.NominateNodeForPod(ctx, candidate.ProviderID())
-	if err := reclamation.reclamationBeforeDelete(ctx, []*Candidate{candidate}); !IsUnrecoverableError(err) {
-		t.Fatalf("BeforeDelete() error for a nominated node = %v, want unrecoverable", err)
+	if err := queue.reclamationCandidateBeforeDelete(ctx, reclamation, candidate); !IsUnrecoverableError(err) {
+		t.Fatalf("reclamationCandidateBeforeDelete() error for a nominated node = %v, want unrecoverable", err)
 	}
 	candidate.ClearNomination()
 
@@ -513,8 +514,8 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 	if err := kubeClient.Update(ctx, storedNodeClaim); err != nil {
 		t.Fatal(err)
 	}
-	if err := reclamation.reclamationBeforeDelete(ctx, []*Candidate{candidate}); !IsUnrecoverableError(err) {
-		t.Fatalf("BeforeDelete() error for an activating node = %v, want unrecoverable", err)
+	if err := queue.reclamationCandidateBeforeDelete(ctx, reclamation, candidate); !IsUnrecoverableError(err) {
+		t.Fatalf("reclamationCandidateBeforeDelete() error for an activating node = %v, want unrecoverable", err)
 	}
 }
 

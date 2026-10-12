@@ -86,8 +86,8 @@ func (q *Queue) deleteCandidate(ctx context.Context, cmd *Command, progress *del
 	default:
 		return NewUnrecoverableError(fmt.Errorf("unknown deletion phase %d", phase))
 	}
-	if cmd.BeforeDelete != nil {
-		if err := cmd.BeforeDelete(ctx, []*Candidate{candidate}); err != nil {
+	if reclamation, ok := cmd.Method.(*Reclamation); ok {
+		if err := q.reclamationCandidateBeforeDelete(ctx, reclamation, candidate); err != nil {
 			return fmt.Errorf("validating node before deletion, %w", err)
 		}
 	}
@@ -108,7 +108,7 @@ func (q *Queue) deleteCandidate(ctx context.Context, cmd *Command, progress *del
 }
 
 func (q *Queue) deleteNodeClaim(ctx context.Context, cmd *Command, candidate *Candidate) error {
-	if cmd.DeleteWithPreconditions {
+	if _, ok := cmd.Method.(*Reclamation); ok {
 		if candidate.NodeClaim == nil || candidate.NodeClaim.UID == "" || candidate.NodeClaim.ResourceVersion == "" {
 			return NewUnrecoverableError(fmt.Errorf("conditional deletion requires a fresh NodeClaim UID and resourceVersion"))
 		}

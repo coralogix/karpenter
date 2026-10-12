@@ -44,9 +44,9 @@ import (
 func TestReclamationConditionalDeleteRevalidatesConcurrentActivation(t *testing.T) {
 	h := newReclamationDeleteRaceHarness(t, false, activateNodeClaimBeforeConditionalDelete)
 	requireReconciliationRequeues(t, h)
-	requireDeleteAndValidationCalls(t, h, 1, 1)
+	requireDeleteCalls(t, h, 1)
 	requireReconciliationCompletes(t, h)
-	requireDeleteAndValidationCalls(t, h, 1, 2)
+	requireDeleteCalls(t, h, 1)
 	require.True(t, standby.IsNodeClaimActivating(getRaceNodeClaim(t, h)))
 	require.False(t, h.queue.HasAny(h.claim.Status.ProviderID), "rejected command should complete after fresh activation validation")
 }
@@ -98,7 +98,7 @@ func TestReclamationRetriesDeleteForAlreadyTerminatingClaim(t *testing.T) {
 	h := newReclamationDeleteRaceHarness(t, true, updateTerminatingClaimBeforeConditionalDelete)
 	requireReconciliationRequeues(t, h)
 	requireReconciliationCompletes(t, h)
-	requireDeleteAndValidationCalls(t, h, 2, 2)
+	requireDeleteCalls(t, h, 2)
 	require.False(t, h.queue.HasAny(h.claim.Status.ProviderID), "successfully retried deletion should complete the queue command")
 	require.False(t, getRaceNodeClaim(t, h).DeletionTimestamp.IsZero(), "retry should preserve the already-started termination")
 }
@@ -157,10 +157,9 @@ func requireReconciliationCompletes(t *testing.T, h *reclamationDeleteRaceHarnes
 	require.Zero(t, result.RequeueAfter)
 }
 
-func requireDeleteAndValidationCalls(t *testing.T, h *reclamationDeleteRaceHarness, deletes, validations int) {
+func requireDeleteCalls(t *testing.T, h *reclamationDeleteRaceHarness, deletes int) {
 	t.Helper()
 	require.Equal(t, deletes, h.client.deleteCalls)
-	require.Equal(t, validations, h.beforeDeleteCalls)
 }
 
 func getRaceNodeClaim(t *testing.T, h *reclamationDeleteRaceHarness) *v1.NodeClaim {
@@ -225,11 +224,10 @@ func TestReclamationDoesNotDeleteWhenNodeClaimReceivesDoNotDisrupt(t *testing.T)
 }
 
 type reclamationDeleteRaceHarness struct {
-	ctx               context.Context
-	claim             *v1.NodeClaim
-	queue             *Queue
-	client            *reclamationConditionalDeleteClient
-	beforeDeleteCalls int
+	ctx    context.Context
+	claim  *v1.NodeClaim
+	queue  *Queue
+	client *reclamationConditionalDeleteClient
 }
 
 type reclamationConditionalDeleteClient struct {
@@ -307,13 +305,9 @@ func newReclamationDeleteRaceHarness(t *testing.T, deleting bool, interference f
 	h := &reclamationDeleteRaceHarness{ctx: ctx, claim: storedClaim, queue: queue, client: kubeClient}
 	cmd := &Command{
 		Method:            reclamation,
+		Action:            DeleteAction,
 		CreationTimestamp: clk.Now(),
 		Candidates:        []*Candidate{candidate},
-		BeforeDelete: func(ctx context.Context, candidates []*Candidate) error {
-			h.beforeDeleteCalls++
-			return reclamation.reclamationBeforeDelete(ctx, candidates)
-		},
-		DeleteWithPreconditions: true,
 	}
 	queue.ProviderIDToCommand[storedClaim.Status.ProviderID] = cmd
 	return h
