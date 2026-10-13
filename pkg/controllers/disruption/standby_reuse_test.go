@@ -28,6 +28,8 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	"sigs.k8s.io/karpenter/pkg/controllers/disruption/testsupport"
+	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
@@ -58,6 +60,7 @@ var _ = Describe("Disruption", func() {
 		}
 
 		It("activates a standby destination before evacuating the source", func() {
+			queue = testsupport.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov, terminator.NewQueue(env.Client, recorder))
 			scoreBasedNodePool := test.NodePool(v1.NodePool{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "standby-reuse-pool",

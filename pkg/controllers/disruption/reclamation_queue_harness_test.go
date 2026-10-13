@@ -95,7 +95,6 @@ func newReclamationQueueHarness(t *testing.T, candidateCount int, kubeClient cli
 	reclamation := NewReclamation(consolidationMethod)
 	cmd := &Command{
 		Method:            reclamation,
-		Action:            DeleteAction,
 		CreationTimestamp: clk.Now(),
 		Candidates:        candidates,
 	}

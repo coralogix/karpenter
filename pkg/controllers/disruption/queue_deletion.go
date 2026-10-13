@@ -37,62 +37,58 @@ import (
 
 const maxConcurrentCandidateDeletes = 16
 
-type deletionExecutionState struct {
-	completed map[string]struct{}
-	deleted   []*Candidate
+type deletionProgress struct {
+	done    bool
+	deleted bool
 }
 
-func (q *Queue) deleteCandidates(ctx, callbackCtx context.Context, cmd *Command) error {
-	q.Lock()
-	if cmd.deletionExecution == nil {
-		cmd.deletionExecution = &deletionExecutionState{}
+func (q *Queue) deleteCandidates(ctx context.Context, cmd *Command) error {
+	if cmd.deletionProgress == nil {
+		cmd.deletionProgress = make([]deletionProgress, len(cmd.Candidates))
 	}
-	progress := cmd.deletionExecution
-	if progress.completed == nil {
-		progress.completed = map[string]struct{}{}
-	}
-	q.Unlock()
 
-	workers := len(cmd.Candidates)
-	if workers > maxConcurrentCandidateDeletes {
-		workers = maxConcurrentCandidateDeletes
-	}
+	workers := min(len(cmd.Candidates), maxConcurrentCandidateDeletes)
 	errs := make([]error, len(cmd.Candidates))
 	workqueue.ParallelizeUntil(ctx, workers, len(cmd.Candidates), func(i int) {
-		if err := q.deleteCandidate(ctx, cmd, progress, cmd.Candidates[i]); err != nil {
+		if err := q.deleteCandidate(ctx, cmd, &cmd.deletionProgress[i], cmd.Candidates[i]); err != nil {
 			errs[i] = err
 		}
 	})
 	if err := multierr.Combine(errs...); err != nil {
 		return err
 	}
-	if _, ok := cmd.Method.(*Reclamation); ok && len(progress.deleted) > 0 {
-		q.reportReclamationBatchSucceeded(callbackCtx, progress.deleted)
+	if _, ok := cmd.Method.(*Reclamation); ok {
+		deleted := make([]*Candidate, 0, len(cmd.Candidates))
+		for i := range cmd.deletionProgress {
+			if cmd.deletionProgress[i].deleted {
+				deleted = append(deleted, cmd.Candidates[i])
+			}
+		}
+		if len(deleted) > 0 {
+			q.reportReclamationBatchSucceeded(ctx, deleted)
+		}
 	}
 	return nil
 }
 
-func (q *Queue) deleteCandidate(ctx context.Context, cmd *Command, progress *deletionExecutionState, candidate *Candidate) error {
-	providerID := candidate.ProviderID()
-	q.Lock()
-	_, done := progress.completed[providerID]
-	q.Unlock()
-	if done {
+func (q *Queue) deleteCandidate(ctx context.Context, cmd *Command, progress *deletionProgress, candidate *Candidate) error {
+	if progress.done {
 		return nil
 	}
 	if _, ok := cmd.Method.(*Reclamation); ok {
-		if err := q.reclamationCandidateBeforeDelete(ctx, candidate); err != nil {
-			if IsUnrecoverableError(err) {
-				q.cleanupSkippedReclamationCandidate(ctx, candidate)
-				q.markDeletionComplete(progress, providerID)
-				return nil
-			}
+		eligible, err := q.reclamationCandidateBeforeDelete(ctx, candidate)
+		if err != nil {
 			return fmt.Errorf("validating node before deletion, %w", err)
+		}
+		if !eligible {
+			q.cleanupSkippedReclamationCandidate(ctx, candidate)
+			progress.done = true
+			return nil
 		}
 	}
 	if err := q.deleteNodeClaim(ctx, cmd, candidate); err != nil {
 		if apierrors.IsNotFound(err) {
-			q.markDeletionComplete(progress, providerID)
+			progress.done = true
 			return nil
 		}
 		return err
@@ -106,21 +102,9 @@ func (q *Queue) deleteCandidate(ctx context.Context, cmd *Command, progress *del
 	if _, ok := cmd.Method.(*Reclamation); ok {
 		q.reportReclamationCandidateDeleted(candidate)
 	}
-	q.markDeletionComplete(progress, providerID)
-	q.markDeletionDeleted(progress, candidate)
+	progress.done = true
+	progress.deleted = true
 	return nil
-}
-
-func (q *Queue) markDeletionComplete(progress *deletionExecutionState, providerID string) {
-	q.Lock()
-	progress.completed[providerID] = struct{}{}
-	q.Unlock()
-}
-
-func (q *Queue) markDeletionDeleted(progress *deletionExecutionState, candidate *Candidate) {
-	q.Lock()
-	progress.deleted = append(progress.deleted, candidate)
-	q.Unlock()
 }
 
 func (q *Queue) cleanupSkippedReclamationCandidate(ctx context.Context, candidate *Candidate) {

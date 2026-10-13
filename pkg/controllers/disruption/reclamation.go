@@ -75,7 +75,6 @@ func (s *Reclamation) computeReclamationCommand(ctx context.Context, candidates 
 	logReclamationBatchSelected(ctx, selected)
 	return &Command{
 		Method:     s,
-		Action:     DeleteAction,
 		Candidates: selected,
 	}
 }

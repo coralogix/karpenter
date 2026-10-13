@@ -449,7 +449,11 @@ var _ = Describe("Queue", func() {
 			ExpectMetricCounterValue(disruption.NodeClaimsEvacuatedTotal, 2, labels)
 		})
 		It("should count evacuation failures without replacements", func() {
+			evictionQueue := terminator.NewQueue(env.Client, recorder)
+			*queue = lo.FromPtr(testsupport.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov, evictionQueue))
+			pod := test.Pod(test.PodOptions{NodeName: node1.Name})
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1)
+			ExpectApplied(ctx, env.Client, pod)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
 			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
 			cmd := &disruption.Command{
@@ -462,6 +466,10 @@ var _ = Describe("Queue", func() {
 			Expect(queue.StartCommand(ctx, cmd)).To(Succeed())
 
 			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
+			Expect(evictionQueue.Has(pod)).To(BeTrue())
+
+			env.Clock.Step(11 * time.Minute)
+			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
 
 			ExpectMetricCounterValue(disruption.EvacuationCommandsTotal, 1, map[string]string{
 				"outcome":           "failed",
@@ -473,6 +481,8 @@ var _ = Describe("Queue", func() {
 				metrics.CapacityTypeLabel: nodeClaim1.Labels[v1.CapacityTypeLabelKey],
 			})
 			Expect(evacuatedMetricExists).To(BeFalse(), "failed evacuations should not create an evacuated NodeClaim metric")
+			Expect(evictionQueue.Has(pod)).To(BeFalse())
+			Expect(queue.HasAny(stateNode.ProviderID())).To(BeFalse())
 			ExpectMetricHistogramSampleCountValue("karpenter_voluntary_disruption_evacuation_duration_seconds", 1, map[string]string{
 				metrics.ReasonLabel: "drifted",
 			})

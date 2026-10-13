@@ -157,10 +157,9 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 		log.FromContext(ctx).Error(fmt.Errorf("no command found"), "")
 		return reconcile.Result{}, nil
 	}
-	baseLogContext := ctx
 	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues(cmd.LogValues()...))
 
-	if err := q.waitOrTerminate(ctx, baseLogContext, cmd); err != nil {
+	if err := q.waitOrTerminate(ctx, cmd); err != nil {
 		// If recoverable, re-queue and try again.
 		if !IsUnrecoverableError(err) {
 			return reconcile.Result{RequeueAfter: queueBaseDelay}, nil
@@ -177,35 +176,27 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 			metrics.ReasonLabel:    pretty.ToSnakeCase(string(cmd.Reason())),
 			ConsolidationTypeLabel: string(cmd.Decision()),
 		})
-		q.handleCommandFailure(ctx, baseLogContext, cmd, err)
+		if cmd.Action == EvacuateAction {
+			q.handleEvacuationFailure(ctx, cmd, err)
+		} else {
+			q.handleDeletionFailure(ctx, cmd, err)
+		}
 	} else {
 		cmd.Succeeded = true
-		q.handleCommandSuccess(ctx, baseLogContext, cmd)
+		if cmd.Action == EvacuateAction {
+			q.recordEvacuationOutcome(ctx, cmd, evacuationOutcomeCompleted, nil)
+		} else {
+			log.FromContext(ctx).V(1).Info("command succeeded")
+		}
 	}
 	q.CompleteCommand(cmd)
 	return reconcile.Result{}, nil
 }
 
-func (q *Queue) handleCommandFailure(ctx, callbackCtx context.Context, cmd *Command, err error) {
-	if cmd.Action == EvacuateAction {
-		q.handleEvacuationFailure(ctx, callbackCtx, cmd, err)
-		return
-	}
-	q.handleDeletionFailure(ctx, cmd, err)
-}
-
-func (q *Queue) handleCommandSuccess(ctx, callbackCtx context.Context, cmd *Command) {
-	if cmd.Action == EvacuateAction {
-		q.handleEvacuationSuccess(callbackCtx, cmd)
-		return
-	}
-	log.FromContext(ctx).V(1).Info("command succeeded")
-}
-
 // waitOrTerminate will wait until launched nodeclaims are ready.
 // Once the replacements are ready, it will terminate the candidates.
 // nolint:gocyclo
-func (q *Queue) waitOrTerminate(ctx context.Context, callbackCtx context.Context, cmd *Command) (err error) {
+func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	// We use the number of commands in the queue as a proxy for cloud provider traffic.
 	// As the number of commands increase, we expect more delays and scale the retry duration accordingly.
 	retryDuration := q.GetMaxRetryDuration()
@@ -251,7 +242,7 @@ func (q *Queue) waitOrTerminate(ctx context.Context, callbackCtx context.Context
 	if cmd.Action == EvacuateAction {
 		return q.evacuate(ctx, cmd)
 	}
-	return q.deleteCandidates(ctx, callbackCtx, cmd)
+	return q.deleteCandidates(ctx, cmd)
 }
 
 // markDisrupted taints the node and adds the Disrupted condition to the NodeClaim for a candidate that is about to be disrupted
@@ -332,10 +323,7 @@ func (q *Queue) activateStandbyDestinations(ctx context.Context, cmd *Command) e
 	return err
 }
 
-func (q *Queue) rollbackStart(ctx context.Context, cmd *Command, candidates []*Candidate, cause error) error {
-	if cmd.Action == EvacuateAction {
-		q.cancelEvacuationPods(cmd)
-	}
+func (q *Queue) rollbackStart(ctx context.Context, candidates []*Candidate, cause error) error {
 	stateNodes := lo.Map(candidates, func(c *Candidate, _ int) *state.StateNode { return c.StateNode })
 	rollbackErr := multierr.Combine(
 		state.RequireNoScheduleTaint(ctx, q.kubeClient, false, stateNodes...),
@@ -373,7 +361,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// If we get a failure marking some nodes as disrupted, if we are launching replacements, we shouldn't continue
 	// with disrupting the candidates. If it's just a delete operation, we can proceed
 	if markDisruptedErr != nil && (len(cmd.Replacements) > 0 || len(markedCandidates) == 0) {
-		return q.rollbackStart(ctx, cmd, markedCandidates, serrors.Wrap(fmt.Errorf("marking disrupted, %w", markDisruptedErr), "command-id", cmd.ID))
+		return q.rollbackStart(ctx, markedCandidates, serrors.Wrap(fmt.Errorf("marking disrupted, %w", markDisruptedErr), "command-id", cmd.ID))
 	}
 
 	// Update the command to only consider the successfully MarkDisrupted candidates
@@ -382,7 +370,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	if err := q.createReplacementNodeClaims(ctx, cmd); err != nil {
 		// If we failed to launch the replacement, don't disrupt.  If this is some permanent failure,
 		// we don't want to disrupt workloads with no way to provision new nodes for them.
-		return q.rollbackStart(ctx, cmd, cmd.Candidates, serrors.Wrap(fmt.Errorf("launching replacement nodeclaim, %w", err), "command-id", cmd.ID))
+		return q.rollbackStart(ctx, cmd.Candidates, serrors.Wrap(fmt.Errorf("launching replacement nodeclaim, %w", err), "command-id", cmd.ID))
 	}
 	// IMPORTANT
 	// We must MarkForDeletion AFTER we launch the replacements and not before
@@ -408,8 +396,8 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 		q.ProviderIDToCommand[c.ProviderID()] = cmd
 	}
 	// IMPORTANT
-	// We are adding the first nodeclaim in the list of candidates into the reconciliation queue
-	// This invariant SHOULD NOT be relied on anywhere else besides within this file.
+	// Reconciliation is scheduled through the first candidate. This is a private Queue implementation invariant;
+	// callers outside the Queue must not rely on it.
 	q.source <- event.TypedGenericEvent[*v1.NodeClaim]{Object: cmd.Candidates[0].NodeClaim}
 	q.Unlock()
 

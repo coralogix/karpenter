@@ -34,7 +34,7 @@ import (
 func TestReclamationExecutionSkipsBufferReservedCandidateInBatch(t *testing.T) {
 	h := newReclamationExecutionHarness(t, 2)
 	h.queue.cluster.UpdateBufferPodCounts(map[string]int{h.candidates[0].ProviderID(): 1})
-	require.NoError(t, h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd))
+	require.NoError(t, h.queue.deleteCandidates(h.ctx, h.cmd))
 	require.Equal(t, 1, h.tracker.deleteCallCount())
 }
 
@@ -42,7 +42,7 @@ func TestReclamationExecutionSkipsInvalidCandidateInBatch(t *testing.T) {
 	h := newReclamationExecutionHarness(t, 2)
 	workload := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "late-pod", Namespace: "default"}, Spec: corev1.PodSpec{NodeName: h.candidates[0].Node.Name}}
 	require.NoError(t, h.kubeClient.Create(h.ctx, workload))
-	require.NoError(t, h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd))
+	require.NoError(t, h.queue.deleteCandidates(h.ctx, h.cmd))
 	require.Equal(t, 1, h.tracker.deleteCallCount())
 }
 
@@ -61,7 +61,7 @@ func runBlockedReclamationDeletes(t *testing.T, h *reclamationExecutionHarness) 
 	done := make(chan struct{})
 	var execErr error
 	go func() {
-		execErr = h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd)
+		execErr = h.queue.deleteCandidates(h.ctx, h.cmd)
 		close(done)
 	}()
 	waitForReclamationDeleteGate(t, h.tracker, len(h.cmd.Candidates))
@@ -119,7 +119,7 @@ func TestReclamationExecutionContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(h.ctx)
 	done := make(chan error, 1)
 	go func() {
-		done <- h.queue.deleteCandidates(ctx, h.ctx, h.cmd)
+		done <- h.queue.deleteCandidates(ctx, h.cmd)
 	}()
 	select {
 	case <-gate:

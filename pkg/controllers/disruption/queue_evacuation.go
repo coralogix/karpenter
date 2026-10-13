@@ -37,24 +37,13 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-type evacuationExecutionState struct {
-	evictionPods []*corev1.Pod
-}
-
-func (q *Queue) handleEvacuationFailure(ctx, callbackCtx context.Context, cmd *Command, err error) {
+func (q *Queue) handleEvacuationFailure(ctx context.Context, cmd *Command, err error) {
 	q.cancelEvacuationPods(cmd)
 	rollbackErr := q.rollbackEvacuation(ctx, cmd.Candidates)
-	q.recordEvacuationOutcome(callbackCtx, cmd, evacuationOutcomeFailed, multierr.Combine(err, rollbackErr))
-}
-
-func (q *Queue) handleEvacuationSuccess(ctx context.Context, cmd *Command) {
-	q.recordEvacuationOutcome(ctx, cmd, evacuationOutcomeCompleted, nil)
+	q.recordEvacuationOutcome(ctx, cmd, evacuationOutcomeFailed, multierr.Combine(err, rollbackErr))
 }
 
 func (q *Queue) evacuate(ctx context.Context, cmd *Command) error {
-	if q.evictionQueue == nil {
-		return NewUnrecoverableError(fmt.Errorf("evacuation requires the shared pod eviction queue"))
-	}
 	waiting, err := q.queueEvacuationPods(ctx, cmd)
 	if err != nil {
 		return err
@@ -68,63 +57,31 @@ func (q *Queue) evacuate(ctx context.Context, cmd *Command) error {
 
 func (q *Queue) queueEvacuationPods(ctx context.Context, cmd *Command) (int, error) {
 	var waiting int
-	queued := map[terminator.QueueKey]struct{}{}
-	for _, pod := range q.evacuationPods(cmd) {
-		queued[terminator.NewQueueKey(pod)] = struct{}{}
-	}
 	for _, candidate := range cmd.Candidates {
-		if candidate.Node == nil || candidate.NodeClaim == nil {
-			return 0, NewUnrecoverableError(fmt.Errorf("evacuation requires a registered node and NodeClaim"))
-		}
 		occupyingPods, err := nodeOccupyingPods(ctx, q.apiReader, candidate.Node)
 		if err != nil {
 			return 0, fmt.Errorf("listing pods on evacuation node, %w", err)
 		}
 		waiting += len(occupyingPods)
 		evictable := lo.Filter(occupyingPods, func(p *corev1.Pod, _ int) bool { return pod.IsEvictable(p, q.clock, q.recorder) })
-		q.addEvictablePods(cmd, queued, evictable)
+		q.evictionQueue.Add(evictable...)
+		for _, pod := range evictable {
+			key := terminator.NewQueueKey(pod)
+			if cmd.evacuationPods == nil {
+				cmd.evacuationPods = map[terminator.QueueKey]*corev1.Pod{}
+			}
+			if _, exists := cmd.evacuationPods[key]; !exists {
+				cmd.evacuationPods[key] = pod
+			}
+		}
 	}
 	return waiting, nil
 }
 
-func (q *Queue) addEvictablePods(cmd *Command, queued map[terminator.QueueKey]struct{}, pods []*corev1.Pod) {
-	if len(pods) == 0 {
-		return
-	}
-	q.evictionQueue.Add(pods...)
-	var newlyQueued []*corev1.Pod
-	for _, pod := range pods {
-		key := terminator.NewQueueKey(pod)
-		if _, exists := queued[key]; exists {
-			continue
-		}
-		newlyQueued = append(newlyQueued, pod)
-		queued[key] = struct{}{}
-	}
-	if len(newlyQueued) == 0 {
-		return
-	}
-	q.Lock()
-	if cmd.evacuationExecution == nil {
-		cmd.evacuationExecution = &evacuationExecutionState{}
-	}
-	cmd.evacuationExecution.evictionPods = append(cmd.evacuationExecution.evictionPods, newlyQueued...)
-	q.Unlock()
-}
-
 func (q *Queue) cancelEvacuationPods(cmd *Command) {
-	if q.evictionQueue != nil {
-		q.evictionQueue.Cancel(q.evacuationPods(cmd)...)
+	if len(cmd.evacuationPods) > 0 {
+		q.evictionQueue.Cancel(lo.Values(cmd.evacuationPods)...)
 	}
-}
-
-func (q *Queue) evacuationPods(cmd *Command) []*corev1.Pod {
-	q.RLock()
-	defer q.RUnlock()
-	if cmd.evacuationExecution == nil {
-		return nil
-	}
-	return append([]*corev1.Pod(nil), cmd.evacuationExecution.evictionPods...)
 }
 
 func (q *Queue) completeEvacuation(ctx context.Context, cmd *Command) error {

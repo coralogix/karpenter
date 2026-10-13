@@ -482,17 +482,17 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 	stateNode.Node = node
 	stateNode.NodeClaim = nodeClaim
 	candidate := &Candidate{StateNode: stateNode, NodePool: nodePool}
-	if err := queue.reclamationCandidateBeforeDelete(ctx, candidate); err != nil {
-		t.Fatalf("reclamationCandidateBeforeDelete() error for an empty node = %v", err)
-	}
+	eligible, err := queue.reclamationCandidateBeforeDelete(ctx, candidate)
+	require.NoError(t, err)
+	require.True(t, eligible, "empty node should be eligible for reclamation")
 
 	workload := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "late-pod", Namespace: "default"}, Spec: corev1.PodSpec{NodeName: node.Name}}
 	if err := kubeClient.Create(ctx, workload); err != nil {
 		t.Fatal(err)
 	}
-	if err := queue.reclamationCandidateBeforeDelete(ctx, candidate); !IsUnrecoverableError(err) {
-		t.Fatalf("reclamationCandidateBeforeDelete() error with a newly bound pod = %v, want unrecoverable", err)
-	}
+	eligible, err = queue.reclamationCandidateBeforeDelete(ctx, candidate)
+	require.NoError(t, err)
+	require.False(t, eligible, "newly bound pod should make node ineligible for reclamation")
 	if err := kubeClient.Delete(ctx, workload); err != nil {
 		t.Fatal(err)
 	}
@@ -501,9 +501,9 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 		t.Fatal(err)
 	}
 	cluster.NominateNodeForPod(ctx, candidate.ProviderID())
-	if err := queue.reclamationCandidateBeforeDelete(ctx, candidate); !IsUnrecoverableError(err) {
-		t.Fatalf("reclamationCandidateBeforeDelete() error for a nominated node = %v, want unrecoverable", err)
-	}
+	eligible, err = queue.reclamationCandidateBeforeDelete(ctx, candidate)
+	require.NoError(t, err)
+	require.False(t, eligible, "nominated node should be ineligible for reclamation")
 	candidate.ClearNomination()
 
 	storedNodeClaim := &v1.NodeClaim{}
@@ -514,9 +514,9 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 	if err := kubeClient.Update(ctx, storedNodeClaim); err != nil {
 		t.Fatal(err)
 	}
-	if err := queue.reclamationCandidateBeforeDelete(ctx, candidate); !IsUnrecoverableError(err) {
-		t.Fatalf("reclamationCandidateBeforeDelete() error for an activating node = %v, want unrecoverable", err)
-	}
+	eligible, err = queue.reclamationCandidateBeforeDelete(ctx, candidate)
+	require.NoError(t, err)
+	require.False(t, eligible, "activating node should be ineligible for reclamation")
 }
 
 func TestReclamationRejectsBufferReservedNode(t *testing.T) {
@@ -540,8 +540,8 @@ func TestReclamationRejectsBufferReservedNode(t *testing.T) {
 		t.Fatal("ShouldDisrupt() = true, want false for buffer-reserved standby node")
 	}
 	queue := newTestQueue(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cluster, clk, nil)
-	if err := queue.reclamationCandidateBeforeDelete(ctx, candidate); !IsUnrecoverableError(err) {
-		t.Fatalf("reclamationCandidateBeforeDelete() error = %v, want unrecoverable for buffer reservation", err)
+	if eligible, err := queue.reclamationCandidateBeforeDelete(ctx, candidate); err != nil || eligible {
+		t.Fatalf("reclamationCandidateBeforeDelete() = (%t, %v), want (false, nil) for buffer reservation", eligible, err)
 	}
 }
 

@@ -37,6 +37,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -230,8 +231,10 @@ type Command struct {
 	Succeeded bool
 	Action    CommandAction
 
-	deletionExecution   *deletionExecutionState
-	evacuationExecution *evacuationExecutionState
+	// The queue schedules a command through its first candidate and serializes that request.
+	// Deletion workers own distinct progress entries and join before the next retry.
+	deletionProgress []deletionProgress
+	evacuationPods   map[terminator.QueueKey]*corev1.Pod
 
 	staticNodeCountReservationHandedOff bool
 
@@ -263,7 +266,6 @@ var (
 	EvacuateDecision Decision = "evacuate"
 	StandbyDecision  Decision = "standby"
 
-	DeleteAction   CommandAction = "delete"
 	EvacuateAction CommandAction = "evacuate"
 	StandbyAction  CommandAction = "standby"
 )
@@ -274,9 +276,6 @@ func (c Command) Decision() Decision {
 	}
 	if c.Action == EvacuateAction && len(c.Candidates) > 0 {
 		return EvacuateDecision
-	}
-	if c.Action == DeleteAction && len(c.Candidates) > 0 {
-		return DeleteDecision
 	}
 	switch {
 	case len(c.Candidates) > 0 && len(c.Replacements) > 0:

@@ -35,33 +35,9 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-//nolint:gocyclo // Reservation, transition, and per-candidate reporting form one synchronous command.
 func (q *Queue) startStandbyCommand(ctx context.Context, cmd *Command) error {
-	providerIDs := lo.Map(cmd.Candidates, func(candidate *Candidate, _ int) string { return candidate.ProviderID() })
-	q.Lock()
-	for _, providerID := range providerIDs {
-		if _, exists := q.ProviderIDToCommand[providerID]; exists {
-			q.Unlock()
-			return fmt.Errorf("standby candidate is already being disrupted")
-		}
-	}
-	for _, providerID := range providerIDs {
-		q.ProviderIDToCommand[providerID] = cmd
-	}
-	q.Unlock()
-	defer func() {
-		q.Lock()
-		defer q.Unlock()
-		for _, providerID := range providerIDs {
-			if q.ProviderIDToCommand[providerID] == cmd {
-				delete(q.ProviderIDToCommand, providerID)
-			}
-		}
-	}()
-
-	if _, ok := cmd.Method.(*StandbyMarking); !ok {
-		return fmt.Errorf("standby action requires StandbyMarking method")
-	}
+	// The singleton controller cleans stale state before dispatch, and candidate discovery excludes registered commands.
+	// Standby marking emits one synchronous command per pass; the coordinator rechecks live state during each transition.
 	var transitioned []*Candidate
 	var errs []error
 	for _, candidate := range cmd.Candidates {
@@ -128,9 +104,6 @@ func (q *Queue) markEmptyNodeStandby(ctx context.Context, candidate *Candidate) 
 
 //nolint:gocyclo // Identity, cached policy, nomination, and live occupancy checks are one transition precondition.
 func (q *Queue) standbyCandidateEligibleForTransition(ctx context.Context, candidate *Candidate, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
-	if candidate == nil || candidate.Node == nil || candidate.NodeClaim == nil || candidate.NodePool == nil {
-		return false, fmt.Errorf("standby candidate is missing its Node, NodeClaim, or NodePool")
-	}
 	if !node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() || nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() ||
 		standby.IsNodeClaimStandby(nodeClaim) || standby.IsNodeClaimActivating(nodeClaim) || standby.HasNodeTaint(node) ||
 		node.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" ||
