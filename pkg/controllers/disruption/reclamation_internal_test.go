@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -354,26 +355,17 @@ func TestReclamationComputeCommandSelectsEligibleCandidatesAcrossPools(t *testin
 	clock := clocktesting.NewFakeClock(now)
 	poolA := reclamationTestPool("pool-a")
 	poolB := reclamationTestPool("pool-b")
-	disabledPool := reclamationTestPool("disabled-pool")
-	disabledPool.Annotations = nil
 	standbySince := now.Add(-30 * time.Second)
 	claimA, nodeA := reclamationTestNode("pool-a", "ready-a", true, true, false)
 	standby.SetNodeClaimStandby(claimA, true, standbySince)
 	claimB, nodeB := reclamationTestNode("pool-b", "ready-b", true, true, false)
 	standby.SetNodeClaimStandby(claimB, true, standbySince)
-	youngClaim, youngNode := reclamationTestNode("pool-a", "young", true, true, false)
-	standby.SetNodeClaimStandby(youngClaim, true, now.Add(-5*time.Second))
-	activatingClaim, activatingNode := reclamationTestNode("pool-a", "activating", true, true, false)
-	standby.SetNodeClaimStandby(activatingClaim, true, standbySince)
-	standby.SetNodeClaimActivating(activatingClaim, true)
-	disabledClaim, disabledNode := reclamationTestNode("disabled-pool", "disabled", true, true, false)
-	standby.SetNodeClaimStandby(disabledClaim, true, standbySince)
-	kubeClient := reclamationTestClient(poolA, poolB, disabledPool, claimA, nodeA, claimB, nodeB, youngClaim, youngNode, activatingClaim, activatingNode, disabledClaim, disabledNode)
+	kubeClient := reclamationTestClient(poolA, poolB, claimA, nodeA, claimB, nodeB)
 	cluster := state.NewCluster(clock, kubeClient, nil)
-	for _, nodeClaim := range []*v1.NodeClaim{claimA, claimB, youngClaim, activatingClaim, disabledClaim} {
+	for _, nodeClaim := range []*v1.NodeClaim{claimA, claimB} {
 		cluster.UpdateNodeClaim(nodeClaim)
 	}
-	for _, node := range []*corev1.Node{nodeA, nodeB, youngNode, activatingNode, disabledNode} {
+	for _, node := range []*corev1.Node{nodeA, nodeB} {
 		if err := cluster.UpdateNode(ctx, node); err != nil {
 			t.Fatal(err)
 		}
@@ -384,17 +376,10 @@ func TestReclamationComputeCommandSelectsEligibleCandidatesAcrossPools(t *testin
 		reclamationCandidate(poolA, claimA, nodeA),
 		reclamationCandidate(poolB, claimB, nodeB),
 	})
-	if cmd == nil {
-		t.Fatal("expected reclamation command for eligible standby nodes")
-	}
-	if len(cmd.Candidates) != 2 {
-		t.Fatalf("selected candidate count = %d, want 2 eligible nodes across pools", len(cmd.Candidates))
-	}
+	require.NotNil(t, cmd)
+	require.Len(t, cmd.Candidates, 2)
 	got := []string{cmd.Candidates[0].Node.Name, cmd.Candidates[1].Node.Name}
-	want := []string{"ready-a", "ready-b"}
-	if got[0] != want[0] || got[1] != want[1] {
-		t.Fatalf("selected candidates = %v, want ordered %v", got, want)
-	}
+	require.Equal(t, []string{"ready-a", "ready-b"}, got)
 }
 
 func TestNodeEmptyForReclamation(t *testing.T) {

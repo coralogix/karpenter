@@ -238,8 +238,9 @@ func GetCandidates(ctx context.Context, cluster *state.Cluster, kubeClient clien
 	return candidates, err
 }
 
-// GetCandidatesWithTotals returns candidates and NodePoolTotals computed from all
-// candidates before filtering, so balanced scoring normalizes against the full pool.
+// GetCandidatesWithTotals returns structurally complete candidates constructed by NewCandidate and
+// admitted by shouldDisrupt, plus NodePoolTotals computed before filtering so balanced scoring
+// normalizes against the full pool.
 // When clusterCost is non-nil, TotalCost is read from precomputed cluster state
 // rather than re-summed from candidates.
 func GetCandidatesWithTotals(ctx context.Context, cluster *state.Cluster, kubeClient client.Client, recorder events.Recorder, clk clock.Clock,

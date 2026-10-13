@@ -27,6 +27,6 @@ import (
 )
 
 func newTestQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clk clock.Clock, provisioner *provisioning.Provisioner) *Queue {
-	coordinator := standby.TestCoordinator(kubeClient, clk)
+	coordinator := standby.NewCoordinator(kubeClient, kubeClient)
 	return NewQueue(kubeClient, kubeClient, recorder, cluster, clk, provisioner, coordinator, nil)
 }

@@ -20,24 +20,15 @@ import (
 	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/tools/record"
-	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
-	"sigs.k8s.io/karpenter/pkg/events"
-	"sigs.k8s.io/karpenter/pkg/operator/options"
-	"sigs.k8s.io/karpenter/pkg/test"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
@@ -52,9 +43,9 @@ func TestReclamationConditionalDeleteRevalidatesConcurrentActivation(t *testing.
 }
 
 func TestReclamationConditionalDeleteProtectsSameNameReplacement(t *testing.T) {
-	h := newReclamationDeleteRaceHarness(t, false, func(ctx context.Context, kubeClient client.Client, _ client.Object) error {
+	h := newReclamationDeleteRaceHarness(t, false, func(ctx context.Context, kubeClient client.Client, object client.Object) error {
 		oldClaim := &v1.NodeClaim{}
-		key := types.NamespacedName{Name: "race-claim"}
+		key := client.ObjectKeyFromObject(object)
 		if err := kubeClient.Get(ctx, key, oldClaim); err != nil {
 			return err
 		}
@@ -68,30 +59,16 @@ func TestReclamationConditionalDeleteProtectsSameNameReplacement(t *testing.T) {
 	})
 
 	result, err := h.queue.Reconcile(h.ctx, h.claim)
-	if err != nil {
-		t.Fatalf("first reconcile error = %v", err)
-	}
-	if result.RequeueAfter == 0 {
-		t.Fatal("first reconcile should retry when the claim is replaced after validation")
-	}
-	if h.client.deleteCalls != 1 {
-		t.Fatalf("conditional delete attempts after replacement race = %d, want 1", h.client.deleteCalls)
-	}
+	require.NoError(t, err)
+	require.NotZero(t, result.RequeueAfter)
+	require.Equal(t, 1, h.client.deleteCalls)
 
 	_, err = h.queue.Reconcile(h.ctx, h.claim)
-	if err != nil {
-		t.Fatalf("second reconcile error = %v", err)
-	}
-	if h.client.deleteCalls != 1 {
-		t.Fatalf("conditional delete attempts after replacement was observed = %d, want no retry", h.client.deleteCalls)
-	}
+	require.NoError(t, err)
+	require.Equal(t, 1, h.client.deleteCalls)
 	stored := &v1.NodeClaim{}
-	if err := h.client.Get(h.ctx, types.NamespacedName{Name: "race-claim"}, stored); err != nil {
-		t.Fatalf("getting replacement NodeClaim: %v", err)
-	}
-	if stored.UID != types.UID("replacement-uid") {
-		t.Fatalf("stored NodeClaim UID = %q, want replacement UID", stored.UID)
-	}
+	require.NoError(t, h.client.Get(h.ctx, client.ObjectKeyFromObject(h.claim), stored))
+	require.Equal(t, types.UID("replacement-uid"), stored.UID)
 }
 
 func TestReclamationRetriesDeleteForAlreadyTerminatingClaim(t *testing.T) {
@@ -103,9 +80,9 @@ func TestReclamationRetriesDeleteForAlreadyTerminatingClaim(t *testing.T) {
 	require.False(t, getRaceNodeClaim(t, h).DeletionTimestamp.IsZero(), "retry should preserve the already-started termination")
 }
 
-func activateNodeClaimBeforeConditionalDelete(ctx context.Context, kubeClient client.Client, _ client.Object) error {
+func activateNodeClaimBeforeConditionalDelete(ctx context.Context, kubeClient client.Client, object client.Object) error {
 	claim := &v1.NodeClaim{}
-	if err := kubeClient.Get(ctx, types.NamespacedName{Name: "race-claim"}, claim); err != nil {
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(object), claim); err != nil {
 		return err
 	}
 	oldResourceVersion := claim.ResourceVersion
@@ -123,9 +100,9 @@ func activateNodeClaimBeforeConditionalDelete(ctx context.Context, kubeClient cl
 	return nil
 }
 
-func updateTerminatingClaimBeforeConditionalDelete(ctx context.Context, kubeClient client.Client, _ client.Object) error {
+func updateTerminatingClaimBeforeConditionalDelete(ctx context.Context, kubeClient client.Client, object client.Object) error {
 	claim := &v1.NodeClaim{}
-	if err := kubeClient.Get(ctx, types.NamespacedName{Name: "race-claim"}, claim); err != nil {
+	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(object), claim); err != nil {
 		return err
 	}
 	oldResourceVersion := claim.ResourceVersion
@@ -172,61 +149,38 @@ func getRaceNodeClaim(t *testing.T, h *reclamationDeleteRaceHarness) *v1.NodeCla
 func TestReclamationDoesNotDeleteWhenLiveNodeStartsTerminating(t *testing.T) {
 	h := newReclamationDeleteRaceHarness(t, false, nil)
 	node := &corev1.Node{}
-	if err := h.client.Get(h.ctx, types.NamespacedName{Name: "race"}, node); err != nil {
-		t.Fatalf("getting live Node: %v", err)
-	}
+	require.NoError(t, h.client.Get(h.ctx, client.ObjectKeyFromObject(h.cmd.Candidates[0].Node), node))
 	node.Finalizers = []string{"test.karpenter.sh/finalizer"}
-	if err := h.client.Update(h.ctx, node); err != nil {
-		t.Fatalf("adding Node finalizer: %v", err)
-	}
-	if err := h.client.Client.Delete(h.ctx, node); err != nil {
-		t.Fatalf("starting live Node deletion: %v", err)
-	}
+	require.NoError(t, h.client.Update(h.ctx, node))
+	require.NoError(t, h.client.Client.Delete(h.ctx, node))
 
 	_, err := h.queue.Reconcile(h.ctx, h.claim)
-	if err != nil {
-		t.Fatalf("reconcile error = %v", err)
-	}
-	if h.client.deleteCalls != 0 {
-		t.Fatalf("conditional delete attempts = %d, want 0 for a deleting Node", h.client.deleteCalls)
-	}
+	require.NoError(t, err)
+	require.Zero(t, h.client.deleteCalls)
 	storedClaim := &v1.NodeClaim{}
-	if err := h.client.Get(h.ctx, client.ObjectKeyFromObject(h.claim), storedClaim); err != nil {
-		t.Fatalf("getting NodeClaim after rejecting deleting Node: %v", err)
-	}
+	require.NoError(t, h.client.Get(h.ctx, client.ObjectKeyFromObject(h.claim), storedClaim))
 }
 
 func TestReclamationDoesNotDeleteWhenNodeClaimReceivesDoNotDisrupt(t *testing.T) {
 	h := newReclamationDeleteRaceHarness(t, false, nil)
 	claim := &v1.NodeClaim{}
-	if err := h.client.Get(h.ctx, client.ObjectKeyFromObject(h.claim), claim); err != nil {
-		t.Fatalf("getting live NodeClaim: %v", err)
-	}
+	require.NoError(t, h.client.Get(h.ctx, client.ObjectKeyFromObject(h.claim), claim))
 	claim.Annotations = map[string]string{v1.DoNotDisruptAnnotationKey: "true"}
-	if err := h.client.Update(h.ctx, claim); err != nil {
-		t.Fatalf("setting live NodeClaim do-not-disrupt annotation: %v", err)
-	}
+	require.NoError(t, h.client.Update(h.ctx, claim))
 
 	_, err := h.queue.Reconcile(h.ctx, h.claim)
-	if err != nil {
-		t.Fatalf("reconcile error = %v", err)
-	}
-	if h.client.deleteCalls != 0 {
-		t.Fatalf("conditional delete attempts = %d, want 0 for a protected NodeClaim", h.client.deleteCalls)
-	}
+	require.NoError(t, err)
+	require.Zero(t, h.client.deleteCalls)
 	storedClaim := &v1.NodeClaim{}
-	if err := h.client.Get(h.ctx, client.ObjectKeyFromObject(h.claim), storedClaim); err != nil {
-		t.Fatalf("getting protected NodeClaim after rejecting reclamation: %v", err)
-	}
-	if storedClaim.Annotations[v1.DoNotDisruptAnnotationKey] != "true" {
-		t.Fatal("do-not-disrupt annotation was lost")
-	}
+	require.NoError(t, h.client.Get(h.ctx, client.ObjectKeyFromObject(h.claim), storedClaim))
+	require.Equal(t, "true", storedClaim.Annotations[v1.DoNotDisruptAnnotationKey])
 }
 
 type reclamationDeleteRaceHarness struct {
 	ctx    context.Context
 	claim  *v1.NodeClaim
 	queue  *Queue
+	cmd    *Command
 	client *reclamationConditionalDeleteClient
 }
 
@@ -264,51 +218,15 @@ func (c *reclamationConditionalDeleteClient) Delete(ctx context.Context, object 
 
 func newReclamationDeleteRaceHarness(t *testing.T, deleting bool, interference func(context.Context, client.Client, client.Object) error) *reclamationDeleteRaceHarness {
 	t.Helper()
-	ctx := options.ToContext(context.Background(), test.Options())
-	now := time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC)
-	clk := clocktesting.NewFakeClock(now)
-	nodePool := reclamationTestPool("reclamation-race-pool")
-	claim, node := reclamationTestNode(nodePool.Name, "race", true, true, deleting)
-	claim.UID = types.UID("original-uid")
-	node.UID = types.UID("race-node-uid")
-	baseClient := fake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithObjects(nodePool, claim, node).
-		WithIndex(&corev1.Pod{}, "spec.nodeName", func(object client.Object) []string {
-			pod := object.(*corev1.Pod)
-			if pod.Spec.NodeName == "" {
-				return nil
-			}
-			return []string{pod.Spec.NodeName}
-		}).Build()
-	kubeClient := &reclamationConditionalDeleteClient{Client: baseClient, interference: interference}
-	storedClaim := &v1.NodeClaim{}
-	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(claim), storedClaim); err != nil {
-		t.Fatalf("getting test NodeClaim: %v", err)
+	kubeClient := &reclamationConditionalDeleteClient{interference: interference}
+	harness := newReclamationQueueHarness(t, 1, kubeClient)
+	if deleting {
+		claim := &v1.NodeClaim{}
+		require.NoError(t, kubeClient.Get(harness.ctx, client.ObjectKeyFromObject(harness.claim), claim))
+		claim.Finalizers = []string{"test.karpenter.sh/finalizer"}
+		require.NoError(t, kubeClient.Update(harness.ctx, claim))
+		require.NoError(t, kubeClient.Client.Delete(harness.ctx, claim))
+		require.NoError(t, kubeClient.Get(harness.ctx, client.ObjectKeyFromObject(harness.claim), harness.claim))
 	}
-	storedNode := &corev1.Node{}
-	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(node), storedNode); err != nil {
-		t.Fatalf("getting test Node: %v", err)
-	}
-	cluster := state.NewCluster(clk, kubeClient, nil)
-	cluster.UpdateNodeClaim(storedClaim)
-	if err := cluster.UpdateNode(ctx, storedNode); err != nil {
-		t.Fatalf("adding test Node to cluster state: %v", err)
-	}
-	stateNode := state.NewNode()
-	stateNode.Node = storedNode
-	stateNode.NodeClaim = storedClaim
-	candidate := &Candidate{StateNode: stateNode, NodePool: nodePool}
-	queue := newTestQueue(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cluster, clk, nil)
-	consolidationMethod := MakeConsolidation(clk, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), queue, nil)
-	reclamation := NewReclamation(consolidationMethod)
-	h := &reclamationDeleteRaceHarness{ctx: ctx, claim: storedClaim, queue: queue, client: kubeClient}
-	cmd := &Command{
-		Method:            reclamation,
-		Action:            DeleteAction,
-		CreationTimestamp: clk.Now(),
-		Candidates:        []*Candidate{candidate},
-	}
-	queue.ProviderIDToCommand[storedClaim.Status.ProviderID] = cmd
-	return h
+	return &reclamationDeleteRaceHarness{ctx: harness.ctx, claim: harness.claim, queue: harness.queue, cmd: harness.cmd, client: kubeClient}
 }

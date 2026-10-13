@@ -22,109 +22,23 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes/scheme"
-	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	utilstandby "sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-type activationSurfaceState struct {
-	claimAnnotations map[string]string
-	nodeAnnotations  map[string]string
-	nodeTaints       []corev1.Taint
-}
-
-func captureActivationSurface(node *corev1.Node, claim *karpv1.NodeClaim) activationSurfaceState {
-	return activationSurfaceState{
-		claimAnnotations: copyStringMap(claim.Annotations),
-		nodeAnnotations:  copyStringMap(node.Annotations),
-		nodeTaints:       append([]corev1.Taint(nil), node.Spec.Taints...),
-	}
-}
-
-func captureNodeSurface(node *corev1.Node) activationSurfaceState {
-	return activationSurfaceState{
-		nodeAnnotations: copyStringMap(node.Annotations),
-		nodeTaints:      append([]corev1.Taint(nil), node.Spec.Taints...),
-	}
-}
-
-func activationSurfaceEqual(a, b activationSurfaceState) bool {
-	return mapsEqual(a.claimAnnotations, b.claimAnnotations) &&
-		mapsEqual(a.nodeAnnotations, b.nodeAnnotations) &&
-		taintsEqual(a.nodeTaints, b.nodeTaints)
-}
-
-func copyStringMap(in map[string]string) map[string]string {
-	if in == nil {
-		return nil
-	}
-	out := map[string]string{}
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
-}
-
-func mapsEqual(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for key, value := range a {
-		if b[key] != value {
-			return false
-		}
-	}
-	return true
-}
-
-func taintsEqual(a, b []corev1.Taint) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].Key != b[i].Key || a[i].Value != b[i].Value || a[i].Effect != b[i].Effect {
-			return false
-		}
-	}
-	return true
-}
-
-func newStandbyActivationFixture(t *testing.T, nodeName string) (*patchHookClient, *Coordinator, *state.StateNode, *corev1.Node, *karpv1.NodeClaim) {
+func newStandbyActivationFixture(t *testing.T, nodeName string) *coordinatorTestFixture {
 	t.Helper()
-	ctx := context.Background()
-	providerID := "provider://" + nodeName
-	claim := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
-		Name: nodeName + "-claim",
-		UID:  types.UID(nodeName + "-claim-uid"),
-		Labels: map[string]string{
-			karpv1.NodePoolLabelKey:        "standby-pool",
-			corev1.LabelInstanceTypeStable: "m5.large",
-		},
-	}}
-	utilstandby.SetNodeClaimStandby(claim, true, time.Date(2026, time.October, 12, 12, 0, 0, 0, time.UTC))
-	claim.Status.ProviderID = providerID
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
-		Name: nodeName,
-		UID:  types.UID(nodeName + "-node-uid"),
-		Labels: map[string]string{
-			karpv1.NodePoolLabelKey: "standby-pool",
-		},
-	}, Spec: corev1.NodeSpec{ProviderID: providerID, Taints: []corev1.Taint{utilstandby.NodeTaint()}}}
-	base := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(claim, node).Build()
-	wrapped := &patchHookClient{Client: base}
-	coordinator := NewCoordinator(base, wrapped, clocktesting.NewFakeClock(time.Date(2026, time.October, 12, 12, 0, 0, 0, time.UTC)))
-	stateNode := &state.StateNode{Node: node.DeepCopy(), NodeClaim: claim.DeepCopy()}
-	_ = ctx
-	return wrapped, coordinator, stateNode, node, claim
+	return newCoordinatorTestFixture(t, nodeName, nodeName+"-claim", func(node *corev1.Node, claim *karpv1.NodeClaim) {
+		utilstandby.SetNodeClaimStandby(claim, true, time.Date(2026, time.October, 12, 12, 0, 0, 0, time.UTC))
+		utilstandby.SetNodeTaint(node, true)
+	})
 }
 
 func replaceNodeSameName(ctx context.Context, kubeClient client.Client, node *corev1.Node, newNodeUID types.UID) error {
@@ -209,85 +123,103 @@ func TestActivateRejectsReplacedObjectsBeforeMutation(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			kubeClient, coordinator, stateNode, node, claim := newStandbyActivationFixture(t, "pre-"+strings.ToLower(tc.name))
-			if err := tc.replace(ctx, kubeClient, node, claim); err != nil {
+			h := newStandbyActivationFixture(t, "pre-"+strings.ToLower(tc.name))
+			stateNode := &state.StateNode{Node: h.node.DeepCopy(), NodeClaim: h.nodeClaim.DeepCopy()}
+			if err := tc.replace(ctx, h.client, h.node, h.nodeClaim); err != nil {
 				t.Fatalf("replacing object: %v", err)
 			}
-			liveNode, liveClaim := readActivationObjects(ctx, kubeClient, node.Name, claim.Name)
-			before := captureActivationSurface(liveNode, liveClaim)
+			liveNode, liveClaim := readActivationObjects(ctx, h.client, h.node.Name, h.nodeClaim.Name)
+			beforeNode, beforeClaim := liveNode.DeepCopy(), liveClaim.DeepCopy()
 
-			_, err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode)
+			_, err := h.coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode)
 			if err == nil {
 				t.Fatal("expected activation to fail for a replaced object")
 			}
-			afterNode, afterClaim := readActivationObjects(ctx, kubeClient, node.Name, claim.Name)
-			after := captureActivationSurface(afterNode, afterClaim)
-			if !activationSurfaceEqual(before, after) {
-				t.Fatalf("replacement object changed during failed activation:\nbefore=%+v\nafter=%+v", before, after)
-			}
+			afterNode, afterClaim := readActivationObjects(ctx, h.client, h.node.Name, h.nodeClaim.Name)
+			require.Equal(t, beforeNode, afterNode)
+			require.Equal(t, beforeClaim, afterClaim)
 		})
 	}
 }
 
 func TestActivateRejectsProviderIDMismatchBeforeMutation(t *testing.T) {
 	ctx := context.Background()
-	kubeClient, coordinator, stateNode, node, claim := newStandbyActivationFixture(t, "provider-mismatch")
-	liveNode, liveClaim := readActivationObjects(ctx, kubeClient, node.Name, claim.Name)
-	liveNode.Spec.ProviderID = "provider://other"
-	if err := kubeClient.Update(ctx, liveNode); err != nil {
-		t.Fatalf("updating node provider ID: %v", err)
-	}
-	before := captureActivationSurface(liveNode, liveClaim)
+	for _, tc := range []struct {
+		name                      string
+		mutateNodeProviderID      bool
+		mutateNodeClaimProviderID bool
+		mutateSnapshotProviderID  bool
+	}{
+		{name: "Node provider ID", mutateNodeProviderID: true},
+		{name: "NodeClaim provider ID", mutateNodeClaimProviderID: true},
+		{name: "requested provider ID", mutateSnapshotProviderID: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newStandbyActivationFixture(t, "provider-mismatch")
+			stateNode := &state.StateNode{Node: h.node.DeepCopy(), NodeClaim: h.nodeClaim.DeepCopy()}
+			liveNode, liveClaim := readActivationObjects(ctx, h.client, h.node.Name, h.nodeClaim.Name)
+			if tc.mutateNodeProviderID {
+				liveNode.Spec.ProviderID = "provider://other"
+				require.NoError(t, h.client.Update(ctx, liveNode))
+			}
+			if tc.mutateNodeClaimProviderID {
+				liveClaim.Status.ProviderID = "provider://other"
+				require.NoError(t, h.client.Status().Update(ctx, liveClaim))
+			}
+			if tc.mutateSnapshotProviderID {
+				stateNode.Node.Spec.ProviderID = "provider://other"
+			}
+			beforeNode, beforeClaim := liveNode.DeepCopy(), liveClaim.DeepCopy()
 
-	_, err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode)
-	if err == nil {
-		t.Fatal("expected activation to fail for provider ID mismatch")
-	}
-	afterNode, afterClaim := readActivationObjects(ctx, kubeClient, node.Name, claim.Name)
-	if !activationSurfaceEqual(before, captureActivationSurface(afterNode, afterClaim)) {
-		t.Fatal("live objects changed during provider ID mismatch rejection")
+			_, err := h.coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode)
+			require.Error(t, err)
+			afterNode, afterClaim := readActivationObjects(ctx, h.client, h.node.Name, h.nodeClaim.Name)
+			require.Equal(t, beforeNode, afterNode)
+			require.Equal(t, beforeClaim, afterClaim)
+		})
 	}
 }
 
 func TestActivateRejectsReplacementAfterTaintRemoval(t *testing.T) {
 	ctx := context.Background()
-	kubeClient, coordinator, stateNode, node, claim := newStandbyActivationFixture(t, "mid-replace")
+	h := newStandbyActivationFixture(t, "mid-replace")
+	stateNode := &state.StateNode{Node: h.node.DeepCopy(), NodeClaim: h.nodeClaim.DeepCopy()}
 	swapped := false
-	var replacementBefore activationSurfaceState
-	kubeClient.afterPatch = func(patchCtx context.Context, object client.Object) error {
+	var replacementBefore *corev1.Node
+	h.client.afterPatch = func(patchCtx context.Context, object client.Object) error {
 		patchedNode, ok := object.(*corev1.Node)
 		if !ok || swapped || utilstandby.HasNodeTaint(patchedNode) {
 			return nil
 		}
 		swapped = true
-		if err := replaceNodeSameName(patchCtx, kubeClient, node, types.UID("replacement-node-uid")); err != nil {
+		if err := replaceNodeSameName(patchCtx, h.client, h.node, types.UID("replacement-node-uid")); err != nil {
 			return err
 		}
-		replacementNode, _ := readActivationObjects(patchCtx, kubeClient, node.Name, claim.Name)
-		replacementBefore = captureNodeSurface(replacementNode)
+		replacementNode, _ := readActivationObjects(patchCtx, h.client, h.node.Name, h.nodeClaim.Name)
+		replacementBefore = replacementNode.DeepCopy()
 		return nil
 	}
 
-	_, err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode)
+	_, err := h.coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode)
 	if err == nil {
 		t.Fatal("expected activation to fail after the node was replaced mid-protocol")
 	}
-	replacementNode, _ := readActivationObjects(ctx, kubeClient, node.Name, claim.Name)
-	if replacementNode.UID == node.UID {
+	replacementNode, _ := readActivationObjects(ctx, h.client, h.node.Name, h.nodeClaim.Name)
+	if replacementNode.UID == h.node.UID {
 		t.Fatal("expected the live node to be a same-name replacement")
 	}
-	if !activationSurfaceEqual(replacementBefore, captureNodeSurface(replacementNode)) {
-		t.Fatal("replacement node was mutated after mid-protocol identity rejection")
-	}
+	require.Equal(t, replacementBefore, replacementNode)
 }
 
 func TestActivateRetryAfterConflictPreservesExpectedIdentity(t *testing.T) {
 	ctx := context.Background()
-	kubeClient, coordinator, stateNode, node, claim := newStandbyActivationFixture(t, "conflict-replace")
+	h := newStandbyActivationFixture(t, "conflict-replace")
+	stateNode := &state.StateNode{Node: h.node.DeepCopy(), NodeClaim: h.nodeClaim.DeepCopy()}
 	conflicts := 0
 	swapped := false
-	var replacementBefore activationSurfaceState
-	kubeClient.beforeNodePatch = func(patchedNode *corev1.Node) error {
+	var replacementNodeBefore *corev1.Node
+	var replacementClaimBefore *karpv1.NodeClaim
+	h.client.beforeNodePatch = func(patchedNode *corev1.Node) error {
 		if !utilstandby.HasNodeActivationMarker(patchedNode) || utilstandby.HasNodeTaint(patchedNode) {
 			return nil
 		}
@@ -297,33 +229,34 @@ func TestActivateRetryAfterConflictPreservesExpectedIdentity(t *testing.T) {
 		}
 		if !swapped {
 			swapped = true
-			if err := replaceSameName(ctx, kubeClient, node, claim, types.UID("replacement-node-uid"), claim.UID); err != nil {
+			if err := replaceSameName(ctx, h.client, h.node, h.nodeClaim, types.UID("replacement-node-uid"), h.nodeClaim.UID); err != nil {
 				t.Fatalf("replacing node after conflict: %v", err)
 			}
-			replacementNode, replacementClaim := readActivationObjects(ctx, kubeClient, node.Name, claim.Name)
-			replacementBefore = captureActivationSurface(replacementNode, replacementClaim)
+			replacementNode, replacementClaim := readActivationObjects(ctx, h.client, h.node.Name, h.nodeClaim.Name)
+			replacementNodeBefore = replacementNode.DeepCopy()
+			replacementClaimBefore = replacementClaim.DeepCopy()
 		}
 		return nil
 	}
 
-	_, err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode)
+	_, err := h.coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode)
 	if err == nil {
 		t.Fatal("expected activation to fail once the replacement is observed on retry")
 	}
 	if conflicts < 1 {
 		t.Fatal("expected at least one optimistic-lock conflict before identity rejection")
 	}
-	afterNode, afterClaim := readActivationObjects(ctx, kubeClient, node.Name, claim.Name)
-	if !activationSurfaceEqual(replacementBefore, captureActivationSurface(afterNode, afterClaim)) {
-		t.Fatal("replacement object changed after conflict retry with identity rejection")
-	}
+	afterNode, afterClaim := readActivationObjects(ctx, h.client, h.node.Name, h.nodeClaim.Name)
+	require.Equal(t, replacementNodeBefore, afterNode)
+	require.Equal(t, replacementClaimBefore, afterClaim)
 }
 
 func TestActivateRetriesSameObjectAfterConflict(t *testing.T) {
 	ctx := context.Background()
-	kubeClient, coordinator, stateNode, _, _ := newStandbyActivationFixture(t, "conflict-retry")
+	h := newStandbyActivationFixture(t, "conflict-retry")
+	stateNode := &state.StateNode{Node: h.node.DeepCopy(), NodeClaim: h.nodeClaim.DeepCopy()}
 	conflicts := 0
-	kubeClient.beforeNodePatch = func(node *corev1.Node) error {
+	h.client.beforeNodePatch = func(node *corev1.Node) error {
 		if conflicts > 0 || !utilstandby.HasNodeTaint(node) {
 			return nil
 		}
@@ -331,7 +264,7 @@ func TestActivateRetriesSameObjectAfterConflict(t *testing.T) {
 		return apierrors.NewConflict(corev1.Resource("nodes"), node.Name, nil)
 	}
 
-	result, err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode)
+	result, err := h.coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode)
 	if err != nil {
 		t.Fatalf("activating after retriable conflict: %v", err)
 	}

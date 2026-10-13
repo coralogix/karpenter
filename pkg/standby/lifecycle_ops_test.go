@@ -40,7 +40,7 @@ func TestEnsureStandbyTaintForClaimConflictsWithConcurrentActivation(t *testing.
 		Annotations: map[string]string{utilstandby.NodeClaimAnnotationKey: "true"},
 	}}
 	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(node, nodeClaim).Build()
-	coordinator := NewCoordinator(activationRaceReader{Reader: kubeClient, writer: kubeClient}, kubeClient, nil)
+	coordinator := NewCoordinator(activationRaceReader{Reader: kubeClient, writer: kubeClient}, kubeClient)
 
 	err := coordinator.EnsureStandbyTaintForClaim(ctx, node, nodeClaim)
 	if !apierrors.IsConflict(err) {

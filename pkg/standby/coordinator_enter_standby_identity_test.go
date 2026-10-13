@@ -59,7 +59,7 @@ func TestEnterStandbyEmptyMarkingSkipsWhenNodeReplacedAfterMarker(t *testing.T) 
 func TestEnterStandbyPostEvacuationSkipsWhenNodeReplacedAfterMarker(t *testing.T) {
 	ctx := context.Background()
 	standbySince := time.Date(2026, time.October, 3, 10, 0, 0, 0, time.UTC)
-	h := newCoordinatorTestFixture(t, "evac-node", "evac-claim", time.Date(2026, time.October, 12, 12, 0, 0, 0, time.UTC))
+	h := newCoordinatorTestFixture(t, "evac-node", "evac-claim", nil)
 	swapped := false
 	h.client.afterPatch = func(patchCtx context.Context, object client.Object) error {
 		claim, ok := object.(*karpv1.NodeClaim)

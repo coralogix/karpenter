@@ -22,11 +22,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
-	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -39,45 +39,27 @@ import (
 
 func TestActivateStandbyNode(t *testing.T) {
 	ctx := context.Background()
-	providerID := "provider://standby-node"
-	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{Name: "standby-node", UID: types.UID("standby-node-uid")},
-		Spec: corev1.NodeSpec{
-			ProviderID: providerID,
-			Taints:     []corev1.Taint{utilstandby.NodeTaint()},
-		},
-	}
-	nodeClaim := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
-		Name: "standby-node",
-		UID:  types.UID("standby-node-claim-uid"),
-		Labels: map[string]string{
-			karpv1.NodePoolLabelKey:        "standby-observability-test",
-			corev1.LabelInstanceTypeStable: "m6i.large",
-		},
-		Annotations: map[string]string{utilstandby.NodeClaimAnnotationKey: "true"},
-	}}
-	nodeClaim.Status.ProviderID = providerID
-	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(node, nodeClaim).Build()
-	coordinator := TestCoordinator(kubeClient, nil)
-	stateNode := &state.StateNode{Node: node.DeepCopy(), NodeClaim: nodeClaim.DeepCopy()}
+	h := newCoordinatorTestFixture(t, "standby-node", "standby-node-claim", func(node *corev1.Node, nodeClaim *karpv1.NodeClaim) {
+		nodeClaim.Labels[karpv1.NodePoolLabelKey] = "standby-observability-test"
+		nodeClaim.Labels[corev1.LabelInstanceTypeStable] = "m6i.large"
+		utilstandby.SetNodeClaimStandby(nodeClaim, true, time.Date(2026, time.October, 12, 12, 0, 0, 0, time.UTC))
+		utilstandby.SetNodeTaint(node, true)
+	})
+	stateNode := &state.StateNode{Node: h.node.DeepCopy(), NodeClaim: h.nodeClaim.DeepCopy()}
 
-	actResult, err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode)
-	if err != nil {
-		t.Fatalf("activating standby node: %v", err)
-	}
-	if len(actResult.Activated) != 1 {
-		t.Fatalf("activated pair count = %d, want 1", len(actResult.Activated))
-	}
+	actResult, err := h.coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode)
+	require.NoError(t, err)
+	require.Len(t, actResult.Activated, 1)
 	pair := actResult.Activated[0]
-	if pair.ProviderID != nodeClaim.Status.ProviderID || pair.NodeClaim.Name != nodeClaim.Name || !ActivationComplete(pair.Node, pair.NodeClaim) {
-		t.Fatalf("unexpected activation result: %+v", pair)
-	}
+	require.Equal(t, h.nodeClaim.Status.ProviderID, pair.ProviderID)
+	require.Equal(t, h.nodeClaim.Name, pair.NodeClaim.Name)
+	require.True(t, ActivationComplete(pair.Node, pair.NodeClaim))
 
-	assertActivatedStandbyNode(t, ctx, kubeClient, node, nodeClaim)
+	assertActivatedStandbyNode(t, ctx, h.client, h.node, h.nodeClaim)
 	if got := standbyActivationCount(t, "standby-observability-test", "m6i.large", string(utilstandby.ActivationSourceProvisioning)); got != 1 {
 		t.Fatalf("expected one standby activation, got %v", got)
 	}
-	if _, err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode); err != nil {
+	if _, err := h.coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateNode); err != nil {
 		t.Fatalf("retrying activation: %v", err)
 	}
 	if got := standbyActivationCount(t, "standby-observability-test", "m6i.large", string(utilstandby.ActivationSourceProvisioning)); got != 1 {
@@ -105,8 +87,7 @@ func assertActivatedStandbyNode(t *testing.T, ctx context.Context, kubeClient cl
 
 func TestActivatePartialSuccessSurvivesLaterFailure(t *testing.T) {
 	ctx := context.Background()
-	clk := clocktesting.NewFakeClock(time.Date(2026, time.October, 12, 12, 0, 0, 0, time.UTC))
-	since := clk.Now()
+	since := time.Date(2026, time.October, 12, 12, 0, 0, 0, time.UTC)
 	claimA := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "claim-a", UID: types.UID("claim-a-uid"), Labels: map[string]string{karpv1.NodePoolLabelKey: "pool"}}}
 	claimB := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "claim-b", UID: types.UID("claim-b-uid"), Labels: map[string]string{karpv1.NodePoolLabelKey: "pool"}}}
 	utilstandby.SetNodeClaimStandby(claimA, true, since)
@@ -125,7 +106,7 @@ func TestActivatePartialSuccessSurvivesLaterFailure(t *testing.T) {
 		}
 		return nil
 	}
-	coordinator := NewCoordinator(base, wrapped, clk)
+	coordinator := NewCoordinator(base, wrapped)
 	stateA := &state.StateNode{Node: nodeA.DeepCopy(), NodeClaim: claimA.DeepCopy()}
 	stateB := &state.StateNode{Node: nodeB.DeepCopy(), NodeClaim: claimB.DeepCopy()}
 	actResult, err := coordinator.Activate(ctx, utilstandby.ActivationSourceProvisioning, stateA, stateB)
@@ -186,25 +167,14 @@ func TestActivateRecordsStandbyMetricsForRecoveryPaths(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			providerID := "provider://" + tc.nodeName
-			node := &corev1.Node{
-				ObjectMeta: metav1.ObjectMeta{Name: tc.nodeName, UID: types.UID(tc.nodeName + "-node-uid")},
-				Spec: corev1.NodeSpec{
-					ProviderID: providerID,
-					Taints:     []corev1.Taint{utilstandby.NodeTaint()},
-				},
-			}
-			nodeClaim := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
-				Name:        tc.nodeName,
-				UID:         types.UID(tc.nodeName + "-claim-uid"),
-				Labels:      map[string]string{karpv1.NodePoolLabelKey: tc.nodePool},
-				Annotations: tc.annotations,
-			}}
-			nodeClaim.Status.ProviderID = providerID
-			kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(node, nodeClaim).Build()
-			coordinator := TestCoordinator(kubeClient, nil)
-			stateNode := &state.StateNode{Node: node.DeepCopy(), NodeClaim: nodeClaim.DeepCopy()}
-			if _, err := coordinator.Activate(ctx, tc.activateWith, stateNode); err != nil {
+			h := newCoordinatorTestFixture(t, tc.nodeName, tc.nodeName+"-claim", func(node *corev1.Node, nodeClaim *karpv1.NodeClaim) {
+				nodeClaim.Labels[karpv1.NodePoolLabelKey] = tc.nodePool
+				delete(nodeClaim.Labels, corev1.LabelInstanceTypeStable)
+				nodeClaim.Annotations = tc.annotations
+				utilstandby.SetNodeTaint(node, true)
+			})
+			stateNode := &state.StateNode{Node: h.node.DeepCopy(), NodeClaim: h.nodeClaim.DeepCopy()}
+			if _, err := h.coordinator.Activate(ctx, tc.activateWith, stateNode); err != nil {
 				t.Fatalf("activating standby node: %v", err)
 			}
 			if got := standbyActivationCount(t, tc.nodePool, "unknown", tc.wantSource); got != 1 {
@@ -216,83 +186,40 @@ func TestActivateRecordsStandbyMetricsForRecoveryPaths(t *testing.T) {
 
 func TestRepairStandbyNodeResumesEmptyInterruptedActivation(t *testing.T) {
 	ctx := context.Background()
-	providerID := "provider://standby-node"
-	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "standby-node",
-			UID:  types.UID("standby-node-uid"),
-			Annotations: map[string]string{
-				utilstandby.NodeClaimActivatingAnnotationKey: "true",
-			},
-		},
-		Spec: corev1.NodeSpec{
-			ProviderID: providerID,
-			Taints:     []corev1.Taint{utilstandby.NodeTaint()},
-		},
-	}
-	nodeClaim := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
-		Name: "standby-node",
-		UID:  types.UID("standby-node-claim-uid"),
-		Labels: map[string]string{
-			karpv1.NodePoolLabelKey:        "standby-pool",
-			corev1.LabelInstanceTypeStable: "m6i.large",
-		},
-		Annotations: map[string]string{
+	h := newCoordinatorTestFixture(t, "standby-node", "standby-node-claim", func(node *corev1.Node, nodeClaim *karpv1.NodeClaim) {
+		node.Annotations = map[string]string{utilstandby.NodeClaimActivatingAnnotationKey: "true"}
+		nodeClaim.Labels[corev1.LabelInstanceTypeStable] = "m6i.large"
+		nodeClaim.Annotations = map[string]string{
 			utilstandby.NodeClaimAnnotationKey:           "true",
 			utilstandby.NodeClaimActivatingAnnotationKey: "true",
-		},
-	}}
-	nodeClaim.Status.ProviderID = providerID
-	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(node, nodeClaim).Build()
-	coordinator := TestCoordinator(kubeClient, nil)
-	result, err := coordinator.RepairStandbyNode(ctx, RepairRequest{
-		NodeRef:      node,
-		NodeClaimRef: nodeClaim,
-		ProviderID:   providerID,
+		}
+		utilstandby.SetNodeTaint(node, true)
 	})
-	if err != nil {
-		t.Fatalf("RepairStandbyNode() error = %v", err)
-	}
-	if result.Outcome != OutcomeRecovered {
-		t.Fatalf("RepairStandbyNode() outcome = %q, want recovered", result.Outcome)
-	}
-	assertActivatedStandbyNode(t, ctx, kubeClient, node, nodeClaim)
+	result, err := h.coordinator.RepairStandbyNode(ctx, RepairRequest{
+		NodeRef:      h.node,
+		NodeClaimRef: h.nodeClaim,
+		ProviderID:   h.nodeClaim.Status.ProviderID,
+	})
+	require.NoError(t, err)
+	require.Equal(t, OutcomeRecovered, result.Outcome)
+	assertActivatedStandbyNode(t, ctx, h.client, h.node, h.nodeClaim)
 }
 
 func TestRepairStandbyNodeRestoresMissingStandbyTaint(t *testing.T) {
 	ctx := context.Background()
-	providerID := "provider://standby-node"
-	node := &corev1.Node{
-		ObjectMeta: metav1.ObjectMeta{Name: "standby-node", UID: types.UID("standby-node-uid")},
-		Spec:       corev1.NodeSpec{ProviderID: providerID},
-	}
-	nodeClaim := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
-		Name:        "standby-node",
-		UID:         types.UID("standby-node-claim-uid"),
-		Labels:      map[string]string{karpv1.NodePoolLabelKey: "standby-pool"},
-		Annotations: map[string]string{utilstandby.NodeClaimAnnotationKey: "true"},
-	}}
-	nodeClaim.Status.ProviderID = providerID
-	kubeClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(node, nodeClaim).Build()
-	coordinator := TestCoordinator(kubeClient, nil)
-	result, err := coordinator.RepairStandbyNode(ctx, RepairRequest{
-		NodeRef:      node,
-		NodeClaimRef: nodeClaim,
-		ProviderID:   providerID,
+	h := newCoordinatorTestFixture(t, "standby-node", "standby-node-claim", func(_ *corev1.Node, nodeClaim *karpv1.NodeClaim) {
+		nodeClaim.Annotations = map[string]string{utilstandby.NodeClaimAnnotationKey: "true"}
 	})
-	if err != nil {
-		t.Fatalf("RepairStandbyNode() error = %v", err)
-	}
-	if result.Outcome != OutcomeRecovered {
-		t.Fatalf("RepairStandbyNode() outcome = %q, want recovered", result.Outcome)
-	}
+	result, err := h.coordinator.RepairStandbyNode(ctx, RepairRequest{
+		NodeRef:      h.node,
+		NodeClaimRef: h.nodeClaim,
+		ProviderID:   h.nodeClaim.Status.ProviderID,
+	})
+	require.NoError(t, err)
+	require.Equal(t, OutcomeRecovered, result.Outcome)
 	storedNode := &corev1.Node{}
-	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(node), storedNode); err != nil {
-		t.Fatalf("getting Node: %v", err)
-	}
-	if !utilstandby.HasNodeTaint(storedNode) {
-		t.Fatal("expected missing standby taint to be restored")
-	}
+	require.NoError(t, h.client.Get(ctx, client.ObjectKeyFromObject(h.node), storedNode))
+	require.True(t, utilstandby.HasNodeTaint(storedNode))
 }
 
 func standbyActivationCount(t *testing.T, nodePool, instanceType, source string) float64 {

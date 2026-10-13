@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -64,9 +65,7 @@ type enterStandbyTestHarness struct {
 
 func newEnterStandbyTestHarness(t *testing.T) *enterStandbyTestHarness {
 	t.Helper()
-	return &enterStandbyTestHarness{coordinatorTestFixture: newCoordinatorTestFixture(
-		t, "standby-node", "standby-claim", time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC),
-	)}
+	return &enterStandbyTestHarness{coordinatorTestFixture: newCoordinatorTestFixture(t, "standby-node", "standby-claim", nil)}
 }
 
 func (h *enterStandbyTestHarness) request() EnterStandbyRequest {
@@ -75,7 +74,7 @@ func (h *enterStandbyTestHarness) request() EnterStandbyRequest {
 
 func (h *enterStandbyTestHarness) options() EnterStandbyOptions {
 	return EnterStandbyOptions{
-		Since: h.coordinator.clock.Now(),
+		Since: time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC),
 		Eligibility: func(context.Context, *corev1.Node, *karpv1.NodeClaim) (bool, error) {
 			return true, nil
 		},
@@ -99,22 +98,6 @@ func (h *enterStandbyTestHarness) assertNodeActive(t *testing.T) {
 	if err := h.client.Get(h.ctx, client.ObjectKeyFromObject(h.nodeClaim), claim); err != nil {
 		t.Fatalf("getting NodeClaim: %v", err)
 	}
-	assertNoStandbyAPIState(t, node, claim)
-}
-
-func (h *enterStandbyTestHarness) assertWorkloadPresent(t *testing.T, name string) {
-	t.Helper()
-	pod := &corev1.Pod{}
-	if err := h.client.Get(h.ctx, client.ObjectKey{Namespace: "default", Name: name}, pod); err != nil {
-		t.Fatalf("getting workload Pod: %v", err)
-	}
-	if pod.Spec.NodeName != h.node.Name {
-		t.Fatalf("workload bound to Node %q, want %q", pod.Spec.NodeName, h.node.Name)
-	}
-}
-
-func assertNoStandbyAPIState(t *testing.T, node *corev1.Node, claim *karpv1.NodeClaim) {
-	t.Helper()
 	if utilstandby.IsNodeClaimStandby(claim) || utilstandby.IsNodeClaimActivating(claim) || utilstandby.HasNodeTaint(node) {
 		t.Fatalf("active Node still has standby state: claimAnnotations=%v nodeTaints=%v", claim.Annotations, node.Spec.Taints)
 	}
@@ -175,23 +158,16 @@ func TestEnterStandbyEmptyMarkingRecoversWhenWorkloadAppears(t *testing.T) {
 					return nil
 				}
 				didInject, err := tc.afterPatch(ctx, h, object)
-				if err != nil {
-					return err
-				}
-				if didInject {
-					injected = true
-				}
-				return nil
+				injected = injected || (err == nil && didInject)
+				return err
 			}
 			result, err := h.coordinator.EnterStandby(ctx, h.request(), h.options())
-			if err != nil {
-				t.Fatalf("EnterStandby() error = %v", err)
-			}
-			if result.Outcome != OutcomeRecovered {
-				t.Fatalf("EnterStandby() outcome = %q, want %q", result.Outcome, OutcomeRecovered)
-			}
+			require.NoError(t, err)
+			require.Equal(t, OutcomeRecovered, result.Outcome)
 			h.assertNodeActive(t)
-			h.assertWorkloadPresent(t, "late-workload")
+			pod := &corev1.Pod{}
+			require.NoError(t, h.client.Get(ctx, client.ObjectKey{Namespace: "default", Name: "late-workload"}, pod))
+			require.Equal(t, h.node.Name, pod.Spec.NodeName)
 		})
 	}
 }

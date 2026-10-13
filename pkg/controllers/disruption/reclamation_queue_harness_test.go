@@ -42,7 +42,6 @@ type reclamationQueueHarness struct {
 	kubeClient client.Client
 	queue      *Queue
 	cmd        *Command
-	candidate  *Candidate
 	claim      *v1.NodeClaim
 }
 
@@ -63,18 +62,16 @@ func newReclamationQueueHarness(t *testing.T, candidateCount int, kubeClient cli
 		objects = append(objects, claim, node)
 		candidates = append(candidates, reclamationCandidate(pool, claim, node))
 	}
-	if tracker, ok := kubeClient.(*reclamationExecutionDeleteTracker); ok && tracker.Client == nil {
-		tracker.Client = fake.NewClientBuilder().
-			WithScheme(scheme.Scheme).
-			WithObjects(objects...).
-			WithIndex(&corev1.Pod{}, "spec.nodeName", reclamationPodNodeIndex).
-			Build()
-	} else if kubeClient == nil {
-		kubeClient = fake.NewClientBuilder().
-			WithScheme(scheme.Scheme).
-			WithObjects(objects...).
-			WithIndex(&corev1.Pod{}, "spec.nodeName", reclamationPodNodeIndex).
-			Build()
+	baseClient := fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(objects...).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", reclamationPodNodeIndex).
+		Build()
+	switch wrapped := kubeClient.(type) {
+	case *reclamationExecutionDeleteTracker:
+		wrapped.Client = baseClient
+	case *reclamationConditionalDeleteClient:
+		wrapped.Client = baseClient
 	}
 	cluster := state.NewCluster(clk, kubeClient, nil)
 	for _, candidate := range candidates {
@@ -107,6 +104,6 @@ func newReclamationQueueHarness(t *testing.T, candidateCount int, kubeClient cli
 	}
 	return &reclamationQueueHarness{
 		ctx: ctx, kubeClient: kubeClient, queue: queue, cmd: cmd,
-		candidate: candidates[0], claim: candidates[0].NodeClaim,
+		claim: candidates[0].NodeClaim,
 	}
 }

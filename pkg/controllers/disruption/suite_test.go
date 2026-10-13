@@ -107,7 +107,7 @@ var _ = BeforeSuite(func() {
 	nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
 	recorder = test.NewEventRecorder()
 	draController = deviceallocation.NewController(env.Client)
-	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), standby.TestCoordinator(env.Client, env.Clock))
+	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), standby.NewCoordinator(env.Client, env.Client))
 	queue = testsupport.NewTestQueue(env.Client, recorder, cluster, env.Clock, prov, nil)
 })
 
@@ -127,7 +127,7 @@ var _ = BeforeEach(func() {
 	// (which the controller accumulates across reconciles and never resets) doesn't leak between specs. This must
 	// happen before the disruptionController and queue below, which capture prov. Mirrors the provisioning suite.
 	draController = deviceallocation.NewController(env.Client)
-	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), standby.TestCoordinator(env.Client, env.Clock))
+	prov = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, env.Clock, draController, virtualpods.NewVirtualPodCache(env.Client), standby.NewCoordinator(env.Client, env.Client))
 
 	// Ensure that we reset the disruption controller's methods after each test run
 	disruptionPacing = disruption.NewDisruptionPacing(env.Clock)
@@ -479,7 +479,7 @@ var _ = Describe("Simulate Scheduling", func() {
 		hangCreateClient := newHangCreateClient(env.Client)
 		defer hangCreateClient.Stop()
 
-		p := provisioning.NewProvisioner(hangCreateClient, recorder, cloudProvider, cluster, env.Clock, deviceallocation.NewController(hangCreateClient), virtualpods.NewVirtualPodCache(hangCreateClient), standby.TestCoordinator(hangCreateClient, env.Clock))
+		p := provisioning.NewProvisioner(hangCreateClient, recorder, cloudProvider, cluster, env.Clock, deviceallocation.NewController(hangCreateClient), virtualpods.NewVirtualPodCache(hangCreateClient), standby.NewCoordinator(hangCreateClient, hangCreateClient))
 		q := testsupport.NewTestQueue(hangCreateClient, recorder, cluster, env.Clock, p, nil)
 		dc := disruption.NewController(env.Clock, hangCreateClient, p, cloudProvider, recorder, cluster, q, clusterCost)
 

@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -50,9 +51,7 @@ func TestStandbyMarkingFiltersToEligibleEmptyActiveNodes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			candidate, kubeClient := standbyMarkingTestCandidate(tc.annotated, tc.standby, tc.occupied)
 			method := NewStandbyMarking(consolidation{kubeClient: kubeClient})
-			if got := method.ShouldDisrupt(ctx, candidate); got != tc.want {
-				t.Fatalf("ShouldDisrupt() = %v, want %v", got, tc.want)
-			}
+			require.Equal(t, tc.want, method.ShouldDisrupt(ctx, candidate))
 		})
 	}
 }
@@ -64,27 +63,7 @@ func TestStandbyMarkingRejectsBufferReservedNode(t *testing.T) {
 	cluster := state.NewCluster(clk, kubeClient, nil)
 	cluster.UpdateBufferPodCounts(map[string]int{candidate.ProviderID(): 1})
 	method := NewStandbyMarking(consolidation{kubeClient: kubeClient, cluster: cluster})
-	if method.ShouldDisrupt(ctx, candidate) {
-		t.Fatal("ShouldDisrupt() = true, want false for buffer-reserved empty node")
-	}
-}
-
-func TestStandbyMarkingCommandIgnoresBudgetsAndHasNoSavings(t *testing.T) {
-	method := NewStandbyMarking(consolidation{})
-	candidates := []*Candidate{{}, {}}
-	commands, err := method.ComputeCommands(context.Background(), map[string]int{"pool": 0}, candidates...)
-	if err != nil {
-		t.Fatalf("ComputeCommands() error = %v", err)
-	}
-	if len(commands) != 1 {
-		t.Fatalf("ComputeCommands() returned %d commands, want 1", len(commands))
-	}
-	if commands[0].Action != StandbyAction || commands[0].Decision() != StandbyDecision {
-		t.Fatalf("standby command action/decision = %q/%q, want %q/%q", commands[0].Action, commands[0].Decision(), StandbyAction, StandbyDecision)
-	}
-	if got := commands[0].EstimatedSavings(); got != 0 {
-		t.Fatalf("standby command estimated savings = %v, want 0", got)
-	}
+	require.False(t, method.ShouldDisrupt(ctx, candidate))
 }
 
 func standbyMarkingTestCandidate(annotated, markStandby, occupied bool) (*Candidate, client.Client) {

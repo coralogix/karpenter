@@ -100,18 +100,6 @@ func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candida
 }
 
 func (s *ScoreBasedConsolidation) shouldCompact(_ context.Context, cn *Candidate) bool {
-	if !s.compactionCandidateEligible(cn) {
-		return false
-	}
-	return lo.SomeBy(cn.reschedulablePods, func(pod *corev1.Pod) bool {
-		return podutils.IsActive(pod) && podutils.IsReschedulable(pod)
-	})
-}
-
-func (s *ScoreBasedConsolidation) compactionCandidateEligible(cn *Candidate) bool {
-	if cn == nil || cn.Node == nil || cn.NodeClaim == nil || cn.NodePool == nil {
-		return false
-	}
 	if !NodePoolUsesScoreBasedConsolidation(cn.NodePool) {
 		return false
 	}
@@ -121,14 +109,20 @@ func (s *ScoreBasedConsolidation) compactionCandidateEligible(cn *Candidate) boo
 	if standby.IsNodeClaimActivating(cn.NodeClaim) || standby.IsNodeClaimStandby(cn.NodeClaim) || standby.HasNodeTaint(cn.Node) {
 		return false
 	}
-	return s.compactionConsolidationMetadataEligible(cn)
+	if !s.compactionConsolidationMetadataEligible(cn) {
+		return false
+	}
+	return lo.SomeBy(cn.reschedulablePods, func(pod *corev1.Pod) bool {
+		return podutils.IsActive(pod) && podutils.IsReschedulable(pod)
+	})
 }
 
-// compactionConsolidationMetadataEligible duplicates the static-pool, label, and consolidation-policy
-// checks at the start of consolidation.ShouldDisrupt in consolidation.go so score-based compaction
-// does not call into that upstream type. It omits consolidateAfter (including Never), empty-node
-// exclusion (standby/reclamation own empties), and ConditionTypeConsolidatable (score-based pools
-// ignore consolidateAfter timing in the nodeclaim disruption controller).
+// compactionConsolidationMetadataEligible duplicates the static-pool and label checks at the start
+// of consolidation.ShouldDisrupt in consolidation.go so score-based compaction does not call into
+// that upstream type. The caller enforces consolidation policy. It omits consolidateAfter
+// (including Never), empty-node exclusion (standby/reclamation own empties), and
+// ConditionTypeConsolidatable (score-based pools ignore consolidateAfter timing in the nodeclaim
+// disruption controller).
 func (s *ScoreBasedConsolidation) compactionConsolidationMetadataEligible(cn *Candidate) bool {
 	if cn.OwnedByStaticNodePool() {
 		return false
@@ -143,11 +137,6 @@ func (s *ScoreBasedConsolidation) compactionConsolidationMetadataEligible(cn *Ca
 	}
 	if _, ok := cn.Labels()[corev1.LabelTopologyZone]; !ok {
 		s.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("Node does not have label %q", corev1.LabelTopologyZone))...)
-		return false
-	}
-	policy := cn.NodePool.Spec.Disruption.ConsolidationPolicy
-	if policy != v1.ConsolidationPolicyWhenEmptyOrUnderutilized && !policy.IsBalanced() {
-		s.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("NodePool %q has non-empty consolidation disabled", cn.NodePool.Name))...)
 		return false
 	}
 	return true
@@ -167,9 +156,6 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	candidates = s.SortCandidates(candidates)
 	var validCandidates []*Candidate
 	for _, candidate := range candidates {
-		if candidate == nil || candidate.NodePool == nil {
-			continue
-		}
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			constrainedByBudgets = true
 			continue
@@ -339,18 +325,13 @@ func moveSetPriorityScore(moveSet moveSet) float64 {
 	return maxScore
 }
 
-func selectFirstStillValidCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation, checks ...func(context.Context, *Command) error) (Command, error) {
+func selectFirstStillValidCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation, check func(context.Context, *Command) error) (Command, error) {
 	var firstValidationReason string
 
 	for i, eval := range evals {
 		validated, err := validator.Validate(ctx, eval.Command, 0)
-		if err == nil && len(checks) > 0 {
-			for _, check := range checks {
-				if checkErr := check(ctx, &validated); checkErr != nil {
-					err = checkErr
-					break
-				}
-			}
+		if err == nil && check != nil {
+			err = check(ctx, &validated)
 		}
 		if err != nil {
 			if IsValidationError(err) {

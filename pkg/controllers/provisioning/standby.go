@@ -64,10 +64,8 @@ func (p *Provisioner) solveWithStandbyActivation(
 	if len(selected) == 0 {
 		return results, nil
 	}
-	actResult, actErr := p.activateScheduledStandbyNodes(ctx, selected)
-	if actErr != nil {
-		_ = standbypkg.ApplyActivationResult(ctx, p.cluster, selected, actResult)
-		return pscheduling.Results{}, fmt.Errorf("activating standby capacity, %w", actErr)
+	if err := p.activateScheduledStandbyNodes(ctx, selected); err != nil {
+		return pscheduling.Results{}, fmt.Errorf("activating standby capacity, %w", err)
 	}
 	return results, nil
 }
@@ -94,13 +92,13 @@ func selectedStandbyNodes(results pscheduling.Results) []*state.StateNode {
 	})
 }
 
-func (p *Provisioner) activateScheduledStandbyNodes(ctx context.Context, nodes []*state.StateNode) (standbypkg.ActivationResult, error) {
+func (p *Provisioner) activateScheduledStandbyNodes(ctx context.Context, nodes []*state.StateNode) error {
 	if len(nodes) == 0 {
-		return standbypkg.ActivationResult{}, nil
+		return nil
 	}
 	actResult, err := p.standbyCoordinator.Activate(ctx, standby.ActivationSourceProvisioning, nodes...)
 	if applyErr := standbypkg.ApplyActivationResult(ctx, p.cluster, nodes, actResult); applyErr != nil && err == nil {
 		err = applyErr
 	}
-	return actResult, err
+	return err
 }

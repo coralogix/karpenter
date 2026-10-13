@@ -26,7 +26,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/util/retry"
-	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -38,18 +37,10 @@ import (
 type Coordinator struct {
 	reader client.Reader
 	writer client.Client
-	clock  clock.Clock
 }
 
-func NewCoordinator(reader client.Reader, writer client.Client, clk clock.Clock) *Coordinator {
-	if clk == nil {
-		clk = clock.RealClock{}
-	}
-	return &Coordinator{reader: reader, writer: writer, clock: clk}
-}
-
-func TestCoordinator(c client.Client, clk clock.Clock) *Coordinator {
-	return NewCoordinator(c, c, clk)
+func NewCoordinator(reader client.Reader, writer client.Client) *Coordinator {
+	return &Coordinator{reader: reader, writer: writer}
 }
 
 func (c *Coordinator) Activate(ctx context.Context, source utilstandby.ActivationSource, nodes ...*state.StateNode) (ActivationResult, error) {
@@ -373,10 +364,6 @@ func (c *Coordinator) repairOrphanStandbyTaint(ctx context.Context, node *corev1
 
 func (c *Coordinator) EnsureStandbyTaintForClaim(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) error {
 	return c.ensureStandbyTaintForClaim(ctx, node, nodeClaim)
-}
-
-func (c *Coordinator) RemoveDisruptionTaint(ctx context.Context, nodeName string) error {
-	return removeDisruptionTaint(ctx, c.reader, c.writer, nodeName)
 }
 
 func ActivationComplete(node *corev1.Node, nodeClaim *v1.NodeClaim) bool {

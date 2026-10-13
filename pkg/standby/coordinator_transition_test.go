@@ -30,7 +30,7 @@ import (
 func TestStandbyTransitionPostEvacuationRepairsPartialMarkerWrite(t *testing.T) {
 	ctx := context.Background()
 	standbySince := time.Date(2026, time.October, 1, 9, 30, 0, 0, time.UTC)
-	h := newCoordinatorTestFixture(t, "evac-node", "evac-claim", time.Date(2026, time.October, 12, 12, 0, 0, 0, time.UTC))
+	h := newCoordinatorTestFixture(t, "evac-node", "evac-claim", nil)
 	failTaintOnce := true
 	h.client.beforeNodePatch = func(node *corev1.Node) error {
 		if !utilstandby.IsNodeClaimStandby(h.readClaim(h.ctx)) || !utilstandby.HasNodeTaint(node) {
@@ -64,13 +64,13 @@ func TestStandbyTransitionPostEvacuationRepairsPartialMarkerWrite(t *testing.T) 
 func TestStandbyTransitionPostEvacuationPreservesStandbySinceAfterRestart(t *testing.T) {
 	ctx := context.Background()
 	standbySince := time.Date(2026, time.October, 2, 14, 0, 0, 0, time.UTC)
-	h := newCoordinatorTestFixture(t, "evac-node", "evac-claim", time.Date(2026, time.October, 12, 12, 0, 0, 0, time.UTC))
+	h := newCoordinatorTestFixture(t, "evac-node", "evac-claim", nil)
 	claim := h.readClaim(ctx)
 	utilstandby.SetNodeClaimStandby(claim, true, standbySince)
 	if err := h.client.Update(ctx, claim); err != nil {
 		t.Fatalf("seeding partial standby marker: %v", err)
 	}
-	restarted := NewCoordinator(h.client, h.client, h.coordinator.clock)
+	restarted := NewCoordinator(h.client, h.client)
 	result, err := restarted.EnterStandby(ctx, h.enterStandbyRequest(), EnterStandbyOptions{BarrierTaintPresent: true, Since: standbySince})
 	if err != nil {
 		t.Fatalf("EnterStandby() error = %v", err)

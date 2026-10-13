@@ -149,9 +149,7 @@ func (c *Coordinator) activateNode(ctx context.Context, source utilstandby.Activ
 	if err != nil {
 		return nil, err
 	}
-	if err := c.runActivation(ctx, identity, nodeSnapshot, source, func(resolvedSource utilstandby.ActivationSource) {
-		standbymetrics.RecordActivation(ctx, stateNode, resolvedSource)
-	}); err != nil {
+	if err := c.runActivation(ctx, identity, source, stateNode); err != nil {
 		return nil, err
 	}
 	return c.confirmedActivationPair(ctx, nodeSnapshot, nodeClaimSnapshot, providerID)
@@ -174,7 +172,8 @@ func (c *Coordinator) confirmedActivationPair(ctx context.Context, nodeRef *core
 	return &ActivationPair{ProviderID: providerID, Node: node, NodeClaim: nodeClaim}, nil
 }
 
-func (c *Coordinator) runActivation(ctx context.Context, id activationIdentity, nodeSnapshot *corev1.Node, requestedSource utilstandby.ActivationSource, onActivated func(utilstandby.ActivationSource)) error {
+func (c *Coordinator) runActivation(ctx context.Context, id activationIdentity, requestedSource utilstandby.ActivationSource, stateNode *state.StateNode) error {
+	nodeSnapshot := stateNode.Node
 	_, _, matches, err := c.readLivePair(ctx, id.nodeRef(), id.nodeClaimRef(), id.providerID)
 	if err != nil {
 		return err
@@ -199,8 +198,8 @@ func (c *Coordinator) runActivation(ctx context.Context, id activationIdentity, 
 	if err != nil {
 		return fmt.Errorf("removing standby taint, %w", err)
 	}
-	if activated && onActivated != nil {
-		onActivated(source)
+	if activated {
+		standbymetrics.RecordActivation(ctx, stateNode, source)
 	}
 	return c.completeActivation(ctx, id)
 }

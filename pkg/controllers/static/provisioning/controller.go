@@ -64,7 +64,7 @@ func NewController(kubeClient client.Client, cluster *state.Cluster, recorder ev
 		kubeClient:    kubeClient,
 		cloudProvider: cloudProvider,
 		cluster:       cluster,
-		provisioner:   provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache, standby.NewCoordinator(kubeClient, kubeClient, clock)),
+		provisioner:   provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache, standby.NewCoordinator(kubeClient, kubeClient)),
 	}
 }
 

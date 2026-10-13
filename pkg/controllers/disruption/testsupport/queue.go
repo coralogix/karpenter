@@ -31,6 +31,6 @@ import (
 
 // NewTestQueue builds a disruption queue wired with a test standby coordinator.
 func NewTestQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clk clock.Clock, provisioner *provisioning.Provisioner, evictionQueue *terminator.Queue) *disruption.Queue {
-	coordinator := standby.TestCoordinator(kubeClient, clk)
+	coordinator := standby.NewCoordinator(kubeClient, kubeClient)
 	return disruption.NewQueue(kubeClient, kubeClient, recorder, cluster, clk, provisioner, coordinator, evictionQueue)
 }

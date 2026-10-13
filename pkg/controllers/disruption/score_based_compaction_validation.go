@@ -71,9 +71,6 @@ func (s *ScoreBasedConsolidation) validateCompactionCandidate(ctx context.Contex
 
 func (s *ScoreBasedConsolidation) validateCompactionCommand(ctx context.Context, cmd *Command) error {
 	for _, candidate := range cmd.Candidates {
-		if candidate == nil || candidate.NodePool == nil {
-			return NewChurnValidationError(fmt.Errorf("score-based compaction candidate is missing its NodePool"))
-		}
 		if err := s.validateCompactionCandidate(ctx, candidate, candidate.NodePool.Name); err != nil {
 			return err
 		}

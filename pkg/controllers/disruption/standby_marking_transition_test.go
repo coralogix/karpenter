@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -32,7 +33,6 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator"
@@ -53,27 +53,47 @@ func TestStandbyMarkingQueueRecoversWhenPodBindsDuringTransition(t *testing.T) {
 		injected = true
 		return h.createWorkload(ctx, "late-workload", nil)
 	}
-	if err := h.start(); err != nil {
-		t.Fatalf("starting empty-node standby transition: %v", err)
-	}
-	h.assertNodeActive(t)
-	if !injected {
-		t.Fatal("expected the workload to bind after the temporary disruption taint was added")
-	}
-	h.assertWorkloadPresent(t, "late-workload")
-	if h.eventCount() != 0 {
-		t.Fatal("a transition recovered to active capacity must not emit a standby-marked event")
-	}
+	command := Command{Method: h.method, Action: StandbyAction, Candidates: []*Candidate{{
+		StateNode: &state.StateNode{Node: h.node.DeepCopy(), NodeClaim: h.nodeClaim.DeepCopy()},
+		NodePool:  &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: h.node.Labels[v1.NodePoolLabelKey], Annotations: map[string]string{v1.ScoreBasedConsolidationAnnotationKey: ""}}},
+	}}}
+	require.NoError(t, h.queue.StartCommand(h.ctx, &command))
+	node := &corev1.Node{}
+	claim := &v1.NodeClaim{}
+	require.NoError(t, h.apiReader.Get(h.ctx, client.ObjectKeyFromObject(h.node), node))
+	require.NoError(t, h.apiReader.Get(h.ctx, client.ObjectKeyFromObject(h.nodeClaim), claim))
+	require.False(t, standby.IsNodeClaimStandby(claim) || standby.IsNodeClaimActivating(claim) || standby.HasNodeTaint(node))
+	require.False(t, hasDisruptionNoScheduleTaint(node))
+	require.False(t, h.queue.HasAny(h.nodeClaim.Status.ProviderID))
+	require.True(t, injected, "expected the workload to bind after the temporary disruption taint was added")
+	pod := &corev1.Pod{}
+	require.NoError(t, h.apiReader.Get(h.ctx, client.ObjectKey{Namespace: "default", Name: "late-workload"}, pod))
+	require.Equal(t, h.node.Name, pod.Spec.NodeName)
+	require.Zero(t, h.eventCount(), "a transition recovered to active capacity must not emit a standby-marked event")
 }
 
 func TestEvacuationQueueRetainsBarrierUntilStandbyPersistenceCompletes(t *testing.T) {
 	h := newEvacuationBarrierHarness(t)
 	result, err := h.queue.Reconcile(h.ctx, h.nodeClaim)
-	h.assertEvacuationRetrying(t, result, err)
+	require.NoError(t, err)
+	require.NotZero(t, result.RequeueAfter)
+	require.False(t, h.cmd.Succeeded)
+	liveNode := &corev1.Node{}
+	liveClaim := &v1.NodeClaim{}
+	require.NoError(t, h.base.Get(h.ctx, client.ObjectKeyFromObject(h.node), liveNode))
+	require.NoError(t, h.base.Get(h.ctx, client.ObjectKeyFromObject(h.nodeClaim), liveClaim))
+	require.True(t, hasDisruptionNoScheduleTaint(liveNode), "disruption barrier taint must remain until evacuation completes")
+	require.False(t, standbypkg.StandbyEntryComplete(liveNode, liveClaim), "standby entry must remain incomplete while persistence is failing")
 
-	h.allowStandbyPersistence()
+	h.allow()
 	result, err = h.queue.Reconcile(h.ctx, h.nodeClaim)
-	h.assertEvacuationCompleted(t, result, err)
+	require.NoError(t, err)
+	require.Zero(t, result.RequeueAfter)
+	require.True(t, h.cmd.Succeeded)
+	require.NoError(t, h.base.Get(h.ctx, client.ObjectKeyFromObject(h.node), liveNode))
+	require.NoError(t, h.base.Get(h.ctx, client.ObjectKeyFromObject(h.nodeClaim), liveClaim))
+	require.False(t, hasDisruptionNoScheduleTaint(liveNode))
+	require.True(t, standbypkg.StandbyEntryComplete(liveNode, liveClaim), "evacuation should release the barrier and finish standby entry")
 }
 
 type evacuationBarrierHarness struct {
@@ -90,21 +110,8 @@ func newEvacuationBarrierHarness(t *testing.T) *evacuationBarrierHarness {
 	t.Helper()
 	ctx := context.Background()
 	clk := clocktesting.NewFakeClock(time.Date(2026, time.October, 5, 10, 0, 0, 0, time.UTC))
-	nodePool := &v1.NodePool{
-		ObjectMeta: metav1.ObjectMeta{Name: "standby-pool", Annotations: map[string]string{v1.ScoreBasedConsolidationAnnotationKey: ""}},
-		Spec:       v1.NodePoolSpec{Disruption: v1.Disruption{ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized}},
-	}
-	nodeClaim := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
-		Name: "evac-claim", UID: types.UID("evac-claim-uid"),
-		Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.CapacityTypeLabelKey: v1.CapacityTypeOnDemand, corev1.LabelInstanceTypeStable: "m5.large"},
-	}}
-	nodeClaim.Status.ProviderID = "provider-evac"
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
-		Name: "evac-node", UID: types.UID("evac-node-uid"),
-		Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name, v1.NodeInitializedLabelKey: "true"},
-	}, Spec: corev1.NodeSpec{ProviderID: nodeClaim.Status.ProviderID, Taints: []corev1.Taint{v1.DisruptedNoScheduleTaint}}}
-	base := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(nodePool, nodeClaim, node).
-		WithIndex(&corev1.Pod{}, "spec.nodeName", standbyMarkingPodNodeIndex).Build()
+	nodePool, nodeClaim, node := newStandbyTransitionObjects("evac-node", "evac-claim", "provider-evac", v1.DisruptedNoScheduleTaint)
+	base := newStandbyTransitionClient(nodePool, nodeClaim, node)
 	wrapped := &standbyTransitionClient{Client: base}
 	blockTaintWrites := true
 	wrapped.beforeNodePatch = func(node *corev1.Node) error {
@@ -120,12 +127,10 @@ func newEvacuationBarrierHarness(t *testing.T) *evacuationBarrierHarness {
 		}
 		return nil
 	}
-	coordinator := standbypkg.NewCoordinator(base, wrapped, clk)
+	coordinator := standbypkg.NewCoordinator(base, wrapped)
 	cluster := state.NewCluster(clk, wrapped, nil)
 	cluster.UpdateNodeClaim(nodeClaim.DeepCopy())
-	if err := cluster.UpdateNode(ctx, node.DeepCopy()); err != nil {
-		t.Fatalf("initializing cluster state: %v", err)
-	}
+	require.NoError(t, cluster.UpdateNode(ctx, node.DeepCopy()))
 	recorder := events.NewRecorder(record.NewFakeRecorder(1))
 	queue := NewQueue(wrapped, base, recorder, cluster, clk, nil, coordinator, terminator.NewQueue(base, recorder))
 	cmd := &Command{
@@ -139,126 +144,40 @@ func newEvacuationBarrierHarness(t *testing.T) *evacuationBarrierHarness {
 	}
 }
 
-func (h *evacuationBarrierHarness) allowStandbyPersistence() { h.allow() }
-
-func (h *evacuationBarrierHarness) assertEvacuationRetrying(t *testing.T, result reconcile.Result, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatalf("first Reconcile() error = %v", err)
-	}
-	if result.RequeueAfter == 0 {
-		t.Fatal("first Reconcile() should requeue while standby persistence is incomplete")
-	}
-	if h.cmd.Succeeded {
-		t.Fatal("evacuation command must not succeed before standby persistence completes")
-	}
-	liveNode := &corev1.Node{}
-	if err := h.base.Get(h.ctx, client.ObjectKeyFromObject(h.node), liveNode); err != nil {
-		t.Fatalf("getting Node: %v", err)
-	}
-	if !hasDisruptionNoScheduleTaint(liveNode) {
-		t.Fatal("disruption barrier taint must remain until evacuation completes")
-	}
-	liveClaim := &v1.NodeClaim{}
-	if err := h.base.Get(h.ctx, client.ObjectKeyFromObject(h.nodeClaim), liveClaim); err != nil {
-		t.Fatalf("getting NodeClaim: %v", err)
-	}
-	if standbypkg.StandbyEntryComplete(liveNode, liveClaim) {
-		t.Fatal("standby entry must remain incomplete while persistence is failing")
-	}
-}
-
-func (h *evacuationBarrierHarness) assertEvacuationCompleted(t *testing.T, result reconcile.Result, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatalf("second Reconcile() error = %v", err)
-	}
-	if result.RequeueAfter != 0 || !h.cmd.Succeeded {
-		t.Fatalf("second Reconcile() = (%v, succeeded=%v), want completion", result.RequeueAfter, h.cmd.Succeeded)
-	}
-	liveNode := &corev1.Node{}
-	if err := h.base.Get(h.ctx, client.ObjectKeyFromObject(h.node), liveNode); err != nil {
-		t.Fatalf("getting Node after success: %v", err)
-	}
-	liveClaim := &v1.NodeClaim{}
-	if err := h.base.Get(h.ctx, client.ObjectKeyFromObject(h.nodeClaim), liveClaim); err != nil {
-		t.Fatalf("getting NodeClaim after success: %v", err)
-	}
-	if hasDisruptionNoScheduleTaint(liveNode) || !standbypkg.StandbyEntryComplete(liveNode, liveClaim) {
-		t.Fatalf("evacuation should release the barrier and finish standby entry: node=%v claim=%v", liveNode.Spec.Taints, liveClaim.Annotations)
-	}
-}
-
 func TestCleanupRecoversOccupiedStandbyNodeWithDoNotDisruptPod(t *testing.T) {
 	ctx := context.Background()
 	kubeClient, cluster, clk, storedNode, storedClaim := occupiedStandbyRecoveryFixture(t, ctx)
-	coordinator := standbypkg.NewCoordinator(kubeClient, kubeClient, clk)
+	coordinator := standbypkg.NewCoordinator(kubeClient, kubeClient)
 	queue := NewQueue(kubeClient, kubeClient, events.NewRecorder(record.NewFakeRecorder(1)), cluster, clk, nil, coordinator, nil)
-	if err := queue.cleanupStaleDisruptionState(ctx); err != nil {
-		t.Fatalf("recovering occupied standby node: %v", err)
-	}
-	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(storedNode), storedNode); err != nil {
-		t.Fatalf("getting Node after recovery: %v", err)
-	}
-	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(storedClaim), storedClaim); err != nil {
-		t.Fatalf("getting NodeClaim after recovery: %v", err)
-	}
-	if standby.IsNodeClaimStandby(storedClaim) || standby.HasNodeTaint(storedNode) {
-		t.Fatal("occupied standby recovery left standby markers on active capacity")
-	}
+	require.NoError(t, queue.cleanupStaleDisruptionState(ctx))
+	require.NoError(t, kubeClient.Get(ctx, client.ObjectKeyFromObject(storedNode), storedNode))
+	require.NoError(t, kubeClient.Get(ctx, client.ObjectKeyFromObject(storedClaim), storedClaim))
+	require.False(t, standby.IsNodeClaimStandby(storedClaim) || standby.HasNodeTaint(storedNode))
 }
 
 func occupiedStandbyRecoveryFixture(t *testing.T, ctx context.Context) (client.Client, *state.Cluster, clock.Clock, *corev1.Node, *v1.NodeClaim) {
 	t.Helper()
 	clk := clocktesting.NewFakeClock(time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC))
-	nodeClaim := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
-		Name:   "standby-claim",
-		UID:    types.UID("standby-claim-uid"),
-		Labels: map[string]string{v1.NodePoolLabelKey: "standby-pool"},
-	}, Status: v1.NodeClaimStatus{ProviderID: "provider-id"}}
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
-		Name: "standby-node",
-		UID:  types.UID("standby-node-uid"),
-		Labels: map[string]string{
-			v1.NodePoolLabelKey:        nodeClaim.Labels[v1.NodePoolLabelKey],
-			v1.NodeInitializedLabelKey: "true",
-		},
-	}, Spec: corev1.NodeSpec{ProviderID: nodeClaim.Status.ProviderID}}
-	kubeClient := fake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithObjects(nodeClaim, node).
-		WithIndex(&corev1.Pod{}, "spec.nodeName", standbyMarkingPodNodeIndex).
-		Build()
+	nodePool, nodeClaim, node := newStandbyTransitionObjects("standby-node", "standby-claim", "provider-id")
+	kubeClient := newStandbyTransitionClient(nodePool, nodeClaim, node)
 	storedClaim := &v1.NodeClaim{}
-	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(nodeClaim), storedClaim); err != nil {
-		t.Fatalf("getting NodeClaim: %v", err)
-	}
+	require.NoError(t, kubeClient.Get(ctx, client.ObjectKeyFromObject(nodeClaim), storedClaim))
 	standby.SetNodeClaimStandby(storedClaim, true, clk.Now())
-	if err := kubeClient.Update(ctx, storedClaim); err != nil {
-		t.Fatalf("marking NodeClaim standby: %v", err)
-	}
+	require.NoError(t, kubeClient.Update(ctx, storedClaim))
 	storedNode := &corev1.Node{}
-	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(node), storedNode); err != nil {
-		t.Fatalf("getting Node: %v", err)
-	}
+	require.NoError(t, kubeClient.Get(ctx, client.ObjectKeyFromObject(node), storedNode))
 	standby.SetNodeTaint(storedNode, true)
-	if err := kubeClient.Update(ctx, storedNode); err != nil {
-		t.Fatalf("tainting standby Node: %v", err)
-	}
-	if err := kubeClient.Create(ctx, &corev1.Pod{
+	require.NoError(t, kubeClient.Update(ctx, storedNode))
+	require.NoError(t, kubeClient.Create(ctx, &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "protected-workload", Namespace: "default",
 			Annotations: map[string]string{v1.DoNotDisruptAnnotationKey: "true"},
 		},
 		Spec: corev1.PodSpec{NodeName: storedNode.Name},
-	}); err != nil {
-		t.Fatalf("creating protected workload: %v", err)
-	}
+	}))
 	cluster := state.NewCluster(clk, kubeClient, nil)
 	cluster.UpdateNodeClaim(storedClaim)
-	if err := cluster.UpdateNode(ctx, storedNode); err != nil {
-		t.Fatalf("refreshing cluster Node: %v", err)
-	}
+	require.NoError(t, cluster.UpdateNode(ctx, storedNode))
 	return kubeClient, cluster, clk, storedNode, storedClaim
 }
 
@@ -268,7 +187,6 @@ type standbyQueueHarness struct {
 	apiReader client.Reader
 	node      *corev1.Node
 	nodeClaim *v1.NodeClaim
-	cluster   *state.Cluster
 	queue     *Queue
 	method    *StandbyMarking
 	recorder  *record.FakeRecorder
@@ -298,51 +216,57 @@ func (c *standbyTransitionClient) Patch(ctx context.Context, object client.Objec
 func newStandbyQueueHarness(t *testing.T) *standbyQueueHarness {
 	t.Helper()
 	ctx := context.Background()
-	nodePool := &v1.NodePool{
-		ObjectMeta: metav1.ObjectMeta{Name: "standby-pool", Annotations: map[string]string{v1.ScoreBasedConsolidationAnnotationKey: ""}},
-		Spec:       v1.NodePoolSpec{Disruption: v1.Disruption{ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized}},
-	}
-	nodeClaim := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
-		Name: "standby-claim",
-		UID:  types.UID("standby-claim-uid"),
-		Labels: map[string]string{
-			v1.NodePoolLabelKey:            nodePool.Name,
-			v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
-			corev1.LabelInstanceTypeStable: "m5.large",
-		},
-	}}
-	nodeClaim.Status.ProviderID = "provider-id"
-	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
-		Name: "standby-node",
-		UID:  types.UID("standby-node-uid"),
-		Labels: map[string]string{
-			v1.NodePoolLabelKey:            nodePool.Name,
-			v1.NodeInitializedLabelKey:     "true",
-			v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
-			corev1.LabelInstanceTypeStable: "m5.large",
-		},
-	}, Spec: corev1.NodeSpec{ProviderID: nodeClaim.Status.ProviderID}}
-	base := fake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithObjects(nodePool, nodeClaim, node).
-		WithIndex(&corev1.Pod{}, "spec.nodeName", standbyMarkingPodNodeIndex).
-		Build()
+	nodePool, nodeClaim, node := newStandbyTransitionObjects("standby-node", "standby-claim", "provider-id")
+	base := newStandbyTransitionClient(nodePool, nodeClaim, node)
 	wrapped := &standbyTransitionClient{Client: base}
 	clk := clocktesting.NewFakeClock(time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC))
 	fakeRecorder := record.NewFakeRecorder(20)
 	ctxRecorder := events.NewRecorder(fakeRecorder)
 	cluster := state.NewCluster(clk, base, nil)
 	cluster.UpdateNodeClaim(nodeClaim.DeepCopy())
-	if err := cluster.UpdateNode(ctx, node.DeepCopy()); err != nil {
-		t.Fatalf("initializing cluster state: %v", err)
-	}
-	coordinator := standbypkg.NewCoordinator(base, wrapped, clk)
+	require.NoError(t, cluster.UpdateNode(ctx, node.DeepCopy()))
+	coordinator := standbypkg.NewCoordinator(base, wrapped)
 	queue := NewQueue(wrapped, base, ctxRecorder, cluster, clk, nil, coordinator, nil)
 	method := NewStandbyMarking(MakeConsolidation(clk, cluster, wrapped, nil, nil, ctxRecorder, queue, nil))
 	return &standbyQueueHarness{
 		ctx: ctx, client: wrapped, apiReader: base, node: node.DeepCopy(), nodeClaim: nodeClaim.DeepCopy(),
-		cluster: cluster, queue: queue, method: method, recorder: fakeRecorder,
+		queue: queue, method: method, recorder: fakeRecorder,
 	}
+}
+
+func newStandbyTransitionObjects(nodeName, claimName, providerID string, taints ...corev1.Taint) (*v1.NodePool, *v1.NodeClaim, *corev1.Node) {
+	nodePool := &v1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "standby-pool", Annotations: map[string]string{v1.ScoreBasedConsolidationAnnotationKey: ""}},
+		Spec:       v1.NodePoolSpec{Disruption: v1.Disruption{ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized}},
+	}
+	nodeClaim := &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: claimName,
+		UID:  types.UID(claimName + "-uid"),
+		Labels: map[string]string{
+			v1.NodePoolLabelKey:            nodePool.Name,
+			v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
+			corev1.LabelInstanceTypeStable: "m5.large",
+		},
+	}, Status: v1.NodeClaimStatus{ProviderID: providerID}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+		Name: nodeName,
+		UID:  types.UID(nodeName + "-uid"),
+		Labels: map[string]string{
+			v1.NodePoolLabelKey:            nodePool.Name,
+			v1.NodeInitializedLabelKey:     "true",
+			v1.CapacityTypeLabelKey:        v1.CapacityTypeOnDemand,
+			corev1.LabelInstanceTypeStable: "m5.large",
+		},
+	}, Spec: corev1.NodeSpec{ProviderID: providerID, Taints: taints}}
+	return nodePool, nodeClaim, node
+}
+
+func newStandbyTransitionClient(objects ...client.Object) client.Client {
+	return fake.NewClientBuilder().
+		WithScheme(scheme.Scheme).
+		WithObjects(objects...).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", standbyMarkingPodNodeIndex).
+		Build()
 }
 
 func standbyMarkingPodNodeIndex(object client.Object) []string {
@@ -353,53 +277,8 @@ func standbyMarkingPodNodeIndex(object client.Object) []string {
 	return []string{pod.Spec.NodeName}
 }
 
-func (h *standbyQueueHarness) start() error {
-	command := Command{Method: h.method, Action: StandbyAction, Candidates: []*Candidate{{
-		StateNode: &state.StateNode{Node: h.node.DeepCopy(), NodeClaim: h.nodeClaim.DeepCopy()},
-		NodePool:  &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: h.node.Labels[v1.NodePoolLabelKey], Annotations: map[string]string{v1.ScoreBasedConsolidationAnnotationKey: ""}}},
-	}}}
-	return h.queue.StartCommand(h.ctx, &command)
-}
-
 func (h *standbyQueueHarness) createWorkload(ctx context.Context, name string, annotations map[string]string) error {
 	return h.client.Create(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Annotations: annotations}, Spec: corev1.PodSpec{NodeName: h.node.Name}})
-}
-
-func (h *standbyQueueHarness) assertNodeActive(t *testing.T) {
-	t.Helper()
-	node := &corev1.Node{}
-	if err := h.apiReader.Get(h.ctx, client.ObjectKeyFromObject(h.node), node); err != nil {
-		t.Fatalf("getting Node: %v", err)
-	}
-	claim := &v1.NodeClaim{}
-	if err := h.apiReader.Get(h.ctx, client.ObjectKeyFromObject(h.nodeClaim), claim); err != nil {
-		t.Fatalf("getting NodeClaim: %v", err)
-	}
-	assertNoStandbyState(t, node, claim)
-	if h.queue.HasAny(h.nodeClaim.Status.ProviderID) {
-		t.Fatal("standby transition left an in-progress queue reservation")
-	}
-}
-
-func assertNoStandbyState(t *testing.T, node *corev1.Node, claim *v1.NodeClaim) {
-	t.Helper()
-	if standby.IsNodeClaimStandby(claim) || standby.IsNodeClaimActivating(claim) || standby.HasNodeTaint(node) {
-		t.Fatalf("active Node still has standby state: claimAnnotations=%v nodeTaints=%v", claim.Annotations, node.Spec.Taints)
-	}
-	if hasDisruptionNoScheduleTaint(node) {
-		t.Fatal("late workload left the temporary disruption taint on the active node")
-	}
-}
-
-func (h *standbyQueueHarness) assertWorkloadPresent(t *testing.T, name string) {
-	t.Helper()
-	pod := &corev1.Pod{}
-	if err := h.apiReader.Get(h.ctx, client.ObjectKey{Namespace: "default", Name: name}, pod); err != nil {
-		t.Fatalf("getting workload Pod: %v", err)
-	}
-	if pod.Spec.NodeName != h.node.Name {
-		t.Fatalf("workload bound to Node %q, want %q", pod.Spec.NodeName, h.node.Name)
-	}
 }
 
 func (h *standbyQueueHarness) eventCount() int {

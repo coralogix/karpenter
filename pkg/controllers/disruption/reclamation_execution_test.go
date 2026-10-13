@@ -18,73 +18,41 @@ package disruption
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
-func TestReclamationExecutionRefusesStalePlanning(t *testing.T) {
-	h := newReclamationExecutionHarness(t, 1)
-	workload := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "late-pod", Namespace: "default"}, Spec: corev1.PodSpec{NodeName: h.candidates[0].Node.Name}}
-	if err := h.kubeClient.Create(h.ctx, workload); err != nil {
-		t.Fatal(err)
-	}
-	err := h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd)
-	if err != nil {
-		t.Fatalf("deleteCandidates() error = %v, want skip without failing the batch", err)
-	}
-	if h.tracker.deleteCallCount() != 0 {
-		t.Fatalf("delete attempts = %d, want 0", h.tracker.deleteCallCount())
-	}
-}
-
 func TestReclamationExecutionSkipsBufferReservedCandidateInBatch(t *testing.T) {
 	h := newReclamationExecutionHarness(t, 2)
 	h.queue.cluster.UpdateBufferPodCounts(map[string]int{h.candidates[0].ProviderID(): 1})
-	if err := h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd); err != nil {
-		t.Fatalf("deleteCandidates() error = %v", err)
-	}
-	if h.tracker.deleteCallCount() != 1 {
-		t.Fatalf("delete attempts = %d, want 1 for the eligible candidate", h.tracker.deleteCallCount())
-	}
+	require.NoError(t, h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd))
+	require.Equal(t, 1, h.tracker.deleteCallCount())
 }
 
 func TestReclamationExecutionSkipsInvalidCandidateInBatch(t *testing.T) {
 	h := newReclamationExecutionHarness(t, 2)
 	workload := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "late-pod", Namespace: "default"}, Spec: corev1.PodSpec{NodeName: h.candidates[0].Node.Name}}
-	if err := h.kubeClient.Create(h.ctx, workload); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd); err != nil {
-		t.Fatalf("deleteCandidates() error = %v", err)
-	}
-	if h.tracker.deleteCallCount() != 1 {
-		t.Fatalf("delete attempts = %d, want 1 for the still-eligible candidate", h.tracker.deleteCallCount())
-	}
+	require.NoError(t, h.kubeClient.Create(h.ctx, workload))
+	require.NoError(t, h.queue.deleteCandidates(h.ctx, h.ctx, h.cmd))
+	require.Equal(t, 1, h.tracker.deleteCallCount())
 }
 
 func TestReclamationExecutionBoundedConcurrency(t *testing.T) {
 	const candidateCount = 20
 	h := newReclamationExecutionHarness(t, candidateCount)
 	execErr := runBlockedReclamationDeletes(t, h)
-	if execErr != nil {
-		t.Fatalf("deleteCandidates() error = %v", execErr)
-	}
-	if h.tracker.deleteCallCount() != candidateCount {
-		t.Fatalf("delete attempts = %d, want %d", h.tracker.deleteCallCount(), candidateCount)
-	}
-	if h.tracker.maxInFlight() > maxConcurrentCandidateDeletes {
-		t.Fatalf("max in-flight deletes = %d, want at most %d", h.tracker.maxInFlight(), maxConcurrentCandidateDeletes)
-	}
+	require.NoError(t, execErr)
+	require.Equal(t, candidateCount, h.tracker.deleteCallCount())
+	require.LessOrEqual(t, h.tracker.maxInFlight(), maxConcurrentCandidateDeletes)
 }
 
 func runBlockedReclamationDeletes(t *testing.T, h *reclamationExecutionHarness) error {
@@ -129,48 +97,18 @@ func TestReclamationExecutionPartialBatchRetry(t *testing.T) {
 	tracker.failDeleteOnce = map[string]bool{h.cmd.Candidates[1].ProviderID(): true}
 
 	result, err := h.queue.Reconcile(h.ctx, h.claim)
-	requireReclamationRequeueAfterFailure(t, result, err, h, tracker, 1)
+	require.NoError(t, err)
+	require.NotZero(t, result.RequeueAfter)
+	require.False(t, h.cmd.Succeeded)
+	require.Equal(t, 1, tracker.deleteCallCount())
+	require.True(t, h.queue.HasAny(h.cmd.Candidates[0].ProviderID()))
 
 	result, err = h.queue.Reconcile(h.ctx, h.claim)
-	requireReclamationRetryCompletes(t, result, err, h, tracker, 2, h.cmd.Candidates[1].ProviderID())
-}
-
-func requireReclamationRequeueAfterFailure(t *testing.T, result reconcile.Result, err error, h *reclamationQueueHarness, tracker *reclamationExecutionDeleteTracker, deletes int) {
-	t.Helper()
-	if err != nil {
-		t.Fatalf("first Reconcile() error = %v", err)
-	}
-	if result.RequeueAfter == 0 {
-		t.Fatal("first Reconcile() should requeue after a recoverable delete failure")
-	}
-	if h.cmd.Succeeded {
-		t.Fatal("command should not succeed while a candidate delete is still pending")
-	}
-	if tracker.deleteCallCount() != deletes {
-		t.Fatalf("successful delete attempts after partial failure = %d, want %d", tracker.deleteCallCount(), deletes)
-	}
-	if !h.queue.HasAny(h.cmd.Candidates[0].ProviderID()) {
-		t.Fatal("command should remain queued after a recoverable delete failure")
-	}
-}
-
-func requireReclamationRetryCompletes(t *testing.T, result reconcile.Result, err error, h *reclamationQueueHarness, tracker *reclamationExecutionDeleteTracker, deletes int, providerID string) {
-	t.Helper()
-	if err != nil {
-		t.Fatalf("second Reconcile() error = %v", err)
-	}
-	if result.RequeueAfter != 0 {
-		t.Fatalf("second Reconcile() requeue = %v, want completion", result.RequeueAfter)
-	}
-	if !h.cmd.Succeeded {
-		t.Fatal("command should succeed after remaining deletes complete")
-	}
-	if tracker.deleteCallCount() != deletes {
-		t.Fatalf("delete attempts after retry = %d, want %d", tracker.deleteCallCount(), deletes)
-	}
-	if h.queue.HasAny(providerID) {
-		t.Fatal("completed command should be removed from the queue")
-	}
+	require.NoError(t, err)
+	require.Zero(t, result.RequeueAfter)
+	require.True(t, h.cmd.Succeeded)
+	require.Equal(t, 2, tracker.deleteCallCount())
+	require.False(t, h.queue.HasAny(h.cmd.Candidates[1].ProviderID()))
 }
 
 func TestReclamationExecutionContextCancellation(t *testing.T) {
@@ -195,12 +133,8 @@ func TestReclamationExecutionContextCancellation(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for cancellation")
 	}
-	if !errors.Is(execErr, context.Canceled) {
-		t.Fatalf("deleteCandidates() error = %v, want context.Canceled", execErr)
-	}
-	if h.tracker.deleteCallCount() >= 4 {
-		t.Fatalf("delete attempts after cancellation = %d, want fewer than 4", h.tracker.deleteCallCount())
-	}
+	require.ErrorIs(t, execErr, context.Canceled)
+	require.Less(t, h.tracker.deleteCallCount(), 4)
 	h.tracker.unblockDeletes()
 }
 

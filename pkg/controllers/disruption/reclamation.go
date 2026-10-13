@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -91,25 +90,19 @@ func logReclamationBatchSelected(ctx context.Context, candidates []*Candidate) {
 func reclamationCandidateCounts(candidates []*Candidate) map[string]int {
 	counts := map[string]int{}
 	for _, candidate := range candidates {
-		if candidate == nil || candidate.NodePool == nil {
-			continue
-		}
 		counts[candidate.NodePool.Name]++
 	}
 	return counts
 }
 
 func selectReclamationCandidates(candidates []*Candidate) []*Candidate {
-	selected := lo.Filter(candidates, func(candidate *Candidate, _ int) bool {
-		return candidate != nil && candidate.NodePool != nil
-	})
-	sort.Slice(selected, func(i, j int) bool {
-		if selected[i].NodePool.Name != selected[j].NodePool.Name {
-			return selected[i].NodePool.Name < selected[j].NodePool.Name
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].NodePool.Name != candidates[j].NodePool.Name {
+			return candidates[i].NodePool.Name < candidates[j].NodePool.Name
 		}
-		return selected[i].Name() < selected[j].Name()
+		return candidates[i].Name() < candidates[j].Name()
 	})
-	return selected
+	return candidates
 }
 
 func (s *Reclamation) refreshReclamationInventory(ctx context.Context) {
@@ -226,9 +219,6 @@ func (s *Reclamation) isReclamationCandidateAvailable(ctx context.Context, candi
 }
 
 func (s *Reclamation) reclamationCandidateEligible(candidate *Candidate) bool {
-	if candidate == nil || candidate.NodePool == nil || candidate.NodeClaim == nil || candidate.Node == nil {
-		return false
-	}
 	if standby.IsNodeClaimActivating(candidate.NodeClaim) {
 		return false
 	}

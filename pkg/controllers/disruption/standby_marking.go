@@ -36,9 +36,6 @@ func NewStandbyMarking(c consolidation) *StandbyMarking {
 
 //nolint:gocyclo // This predicate groups the complete empty-active-node eligibility gate.
 func (s *StandbyMarking) ShouldDisrupt(ctx context.Context, candidate *Candidate) bool {
-	if candidate == nil || candidate.Node == nil || candidate.NodeClaim == nil || candidate.NodePool == nil {
-		return false
-	}
 	if !standbyLifecycleEnabled(candidate.NodePool) {
 		return false
 	}
@@ -62,16 +59,10 @@ func (s *StandbyMarking) ShouldDisrupt(ctx context.Context, candidate *Candidate
 }
 
 func (s *StandbyMarking) ComputeCommands(_ context.Context, _ map[string]int, candidates ...*Candidate) ([]Command, error) {
-	var selected []*Candidate
-	for _, candidate := range candidates {
-		if candidate != nil {
-			selected = append(selected, candidate)
-		}
-	}
-	if len(selected) == 0 {
+	if len(candidates) == 0 {
 		return nil, nil
 	}
-	return []Command{{Method: s, Action: StandbyAction, Candidates: selected}}, nil
+	return []Command{{Method: s, Action: StandbyAction, Candidates: candidates}}, nil
 }
 
 func (s *StandbyMarking) Reason() v1.DisruptionReason {
