@@ -128,11 +128,8 @@ func (q *Queue) markEmptyNodeStandby(ctx context.Context, candidate *Candidate) 
 
 //nolint:gocyclo // Identity, cached policy, nomination, and live occupancy checks are one transition precondition.
 func (q *Queue) standbyCandidateEligibleForTransition(ctx context.Context, candidate *Candidate, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
-	if candidate == nil || candidate.Node == nil || candidate.NodeClaim == nil || candidate.NodePool == nil || node == nil || nodeClaim == nil {
+	if candidate == nil || candidate.Node == nil || candidate.NodeClaim == nil || candidate.NodePool == nil {
 		return false, fmt.Errorf("standby candidate is missing its Node, NodeClaim, or NodePool")
-	}
-	if !standbyPairMatchesCandidate(candidate, node, nodeClaim) {
-		return false, nil
 	}
 	if !node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() || nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() ||
 		standby.IsNodeClaimStandby(nodeClaim) || standby.IsNodeClaimActivating(nodeClaim) || standby.HasNodeTaint(node) ||
@@ -165,13 +162,7 @@ func (q *Queue) standbyCandidateEligibleForTransition(ctx context.Context, candi
 	return true, nil
 }
 
-func (q *Queue) standbyCandidateOccupiedAfterBarrier(ctx context.Context, candidate *Candidate, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
-	if candidate == nil || node == nil || nodeClaim == nil {
-		return false, fmt.Errorf("standby candidate is missing its Node or NodeClaim")
-	}
-	if !standbyPairMatchesCandidate(candidate, node, nodeClaim) {
-		return false, nil
-	}
+func (q *Queue) standbyCandidateOccupiedAfterBarrier(ctx context.Context, candidate *Candidate, node *corev1.Node, _ *v1.NodeClaim) (bool, error) {
 	if q.cluster.IsNodeNominated(candidate.ProviderID()) || q.cluster.HasBufferPods(candidate.ProviderID()) {
 		return false, nil
 	}
@@ -180,11 +171,6 @@ func (q *Queue) standbyCandidateOccupiedAfterBarrier(ctx context.Context, candid
 		return false, err
 	}
 	return true, nil
-}
-
-func standbyPairMatchesCandidate(candidate *Candidate, node *corev1.Node, nodeClaim *v1.NodeClaim) bool {
-	return node.UID == candidate.Node.UID && nodeClaim.UID == candidate.NodeClaim.UID &&
-		node.Spec.ProviderID == candidate.ProviderID() && nodeClaim.Status.ProviderID == candidate.ProviderID()
 }
 
 func (q *Queue) updateStandbyState(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) error {

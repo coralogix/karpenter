@@ -104,9 +104,7 @@ func (q *Queue) deleteCandidate(ctx context.Context, cmd *Command, progress *del
 		metrics.CapacityTypeLabel: candidate.NodeClaim.Labels[v1.CapacityTypeLabelKey],
 	})
 	if _, ok := cmd.Method.(*Reclamation); ok {
-		if err := q.reportReclamationCandidateDeleted(candidate); err != nil {
-			return err
-		}
+		q.reportReclamationCandidateDeleted(candidate)
 	}
 	q.markDeletionComplete(progress, providerID)
 	q.markDeletionDeleted(progress, candidate)

@@ -128,12 +128,8 @@ func (q *Queue) reclamationNodePoolStillManaged(ctx context.Context, nodePoolNam
 	return nil
 }
 
-func (q *Queue) reportReclamationCandidateDeleted(candidate *Candidate) error {
-	if candidate == nil || candidate.NodePool == nil {
-		return fmt.Errorf("reclamation candidate is missing its NodePool")
-	}
+func (q *Queue) reportReclamationCandidateDeleted(candidate *Candidate) {
 	ReclamationNodeRemovalsTotal.Inc(map[string]string{metrics.NodePoolLabel: candidate.NodePool.Name})
-	return nil
 }
 
 func (q *Queue) reportReclamationBatchSucceeded(ctx context.Context, candidates []*Candidate) {

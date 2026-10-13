@@ -71,9 +71,11 @@ type EnterStandbyOptions struct {
 	// BarrierTaintPresent skips applying the temporary disruption scheduling barrier.
 	BarrierTaintPresent bool
 	Since               time.Time
-	// Eligibility is evaluated on live Node and NodeClaim reads before the disruption barrier.
+	// Eligibility receives live Node and NodeClaim objects that the coordinator has already
+	// verified match EnterStandbyRequest (UIDs and provider IDs) before invoking the callback.
 	Eligibility func(context.Context, *corev1.Node, *v1.NodeClaim) (bool, error)
-	// PostBarrierEligibility is evaluated after the barrier is applied during empty marking.
+	// PostBarrierEligibility is evaluated after the barrier is applied during empty marking,
+	// with the same input guarantee as Eligibility.
 	PostBarrierEligibility func(context.Context, *corev1.Node, *v1.NodeClaim) (bool, error)
 }
 
