@@ -24,11 +24,9 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	utilstandby "sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
@@ -98,7 +96,7 @@ func (h *enterStandbyTestHarness) assertNodeActive(t *testing.T) {
 	if err := h.client.Get(h.ctx, client.ObjectKeyFromObject(h.nodeClaim), claim); err != nil {
 		t.Fatalf("getting NodeClaim: %v", err)
 	}
-	if utilstandby.IsNodeClaimStandby(claim) || utilstandby.IsNodeClaimActivating(claim) || utilstandby.HasNodeTaint(node) {
+	if utilstandby.IsNodeClaimStandby(claim) || utilstandby.HasNodeTaint(node) {
 		t.Fatalf("active Node still has standby state: claimAnnotations=%v nodeTaints=%v", claim.Annotations, node.Spec.Taints)
 	}
 	if hasDisruptionNoScheduleTaint(node) {
@@ -123,7 +121,7 @@ func podNodeNameIndex(object client.Object) []string {
 	return []string{pod.Spec.NodeName}
 }
 
-func TestEnterStandbyEmptyMarkingRecoversWhenWorkloadAppears(t *testing.T) {
+func TestEnterStandbyDefersLateWorkloadRecoveryToCleanup(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
 		name       string
@@ -163,37 +161,22 @@ func TestEnterStandbyEmptyMarkingRecoversWhenWorkloadAppears(t *testing.T) {
 			}
 			result, err := h.coordinator.EnterStandby(ctx, h.request(), h.options())
 			require.NoError(t, err)
-			require.Equal(t, OutcomeRecovered, result.Outcome)
+			require.Equal(t, OutcomeCompleted, result.Outcome)
+			standbyNode := h.readNode(ctx)
+			standbyClaim := h.readClaim(ctx)
+			require.True(t, StandbyEntryComplete(standbyNode, standbyClaim), "late binding should leave standby state until cleanup")
+
+			repair, err := h.coordinator.RepairStandbyNode(ctx, RepairRequest{
+				NodeRef:      h.node,
+				NodeClaimRef: h.nodeClaim,
+				ProviderID:   h.nodeClaim.Status.ProviderID,
+			})
+			require.NoError(t, err)
+			require.Equal(t, OutcomeRecovered, repair.Outcome)
 			h.assertNodeActive(t)
 			pod := &corev1.Pod{}
 			require.NoError(t, h.client.Get(ctx, client.ObjectKey{Namespace: "default", Name: "late-workload"}, pod))
 			require.Equal(t, h.node.Name, pod.Spec.NodeName)
 		})
 	}
-}
-
-func TestEnterStandbyEmptyMarkingDoesNotRetaintAfterConcurrentActivation(t *testing.T) {
-	ctx := context.Background()
-	h := newEnterStandbyTestHarness(t)
-	h.client.afterPatch = func(ctx context.Context, object client.Object) error {
-		claim, ok := object.(*karpv1.NodeClaim)
-		if !ok || !utilstandby.IsNodeClaimStandby(claim) {
-			return nil
-		}
-		node := &corev1.Node{}
-		if err := h.client.Get(ctx, types.NamespacedName{Name: h.node.Name}, node); err != nil {
-			return err
-		}
-		stateNode := &state.StateNode{Node: node, NodeClaim: claim.DeepCopy()}
-		_, err := h.coordinator.Activate(ctx, utilstandby.ActivationSourceRecovery, stateNode)
-		return err
-	}
-	result, err := h.coordinator.EnterStandby(ctx, h.request(), h.options())
-	if err != nil {
-		t.Fatalf("EnterStandby() error = %v", err)
-	}
-	if result.Outcome != OutcomeSkipped && result.Outcome != OutcomeRecovered {
-		t.Fatalf("EnterStandby() outcome = %q, want skipped or recovered active capacity", result.Outcome)
-	}
-	h.assertNodeActive(t)
 }

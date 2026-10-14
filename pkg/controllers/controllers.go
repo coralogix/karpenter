@@ -102,7 +102,7 @@ func NewControllers(
 	virtualPodCache := virtualpods.NewVirtualPodCache(kubeClient)
 	apiReader := mgr.GetAPIReader()
 	standbyCoordinator := standby.NewCoordinator(apiReader, kubeClient)
-	p := provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache, standbyCoordinator)
+	p := provisioning.NewProvisioner(kubeClient, recorder, cloudProvider, cluster, clock, deviceAllocationController, virtualPodCache)
 	evictionQueue := terminator.NewQueue(kubeClient, recorder)
 	disruptionQueue := disruption.NewQueue(kubeClient, apiReader, recorder, cluster, clock, p, standbyCoordinator, evictionQueue)
 	npState := nodepoolhealth.NewState()

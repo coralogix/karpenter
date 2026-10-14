@@ -114,7 +114,7 @@ func (q *Queue) rollbackEvacuation(ctx context.Context, candidates []*Candidate)
 			continue
 		}
 		if standby.IsNodeClaimStandby(current) {
-			if err := q.standbyCoordinator.EnsureStandbyTaintForClaim(ctx, candidate.Node, current); err != nil {
+			if err := q.standbyCoordinator.EnsureStandbyTaintForClaim(ctx, candidate.Node, candidate.NodeClaim, candidate.ProviderID()); err != nil {
 				errs = append(errs, fmt.Errorf("restoring standby taint before evacuation rollback, %w", err))
 				continue
 			}

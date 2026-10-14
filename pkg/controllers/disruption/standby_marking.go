@@ -41,7 +41,7 @@ func (s *StandbyMarking) ShouldDisrupt(ctx context.Context, candidate *Candidate
 	if !candidate.NodeClaim.DeletionTimestamp.IsZero() {
 		return false
 	}
-	if standby.IsNodeClaimStandby(candidate.NodeClaim) || standby.IsNodeClaimActivating(candidate.NodeClaim) || standby.HasNodeTaint(candidate.Node) {
+	if standby.IsNodeClaimStandby(candidate.NodeClaim) || standby.HasNodeTaint(candidate.Node) {
 		return false
 	}
 	if len(candidate.reschedulablePods) > 0 {

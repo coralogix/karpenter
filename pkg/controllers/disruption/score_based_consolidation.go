@@ -106,7 +106,7 @@ func (s *ScoreBasedConsolidation) shouldCompact(_ context.Context, cn *Candidate
 	if cn.NodePool.Spec.Disruption.ConsolidationPolicy != v1.ConsolidationPolicyWhenEmptyOrUnderutilized {
 		return false
 	}
-	if standby.IsNodeClaimActivating(cn.NodeClaim) || standby.IsNodeClaimStandby(cn.NodeClaim) || standby.HasNodeTaint(cn.Node) {
+	if standby.IsNodeClaimStandby(cn.NodeClaim) || standby.HasNodeTaint(cn.Node) {
 		return false
 	}
 	if !s.compactionConsolidationMetadataEligible(cn) {

@@ -28,71 +28,14 @@ import (
 const (
 	// NodeClaimAnnotationKey marks retained empty capacity on a NodeClaim. The value is the
 	// RFC3339Nano UTC time standby began, or legacy "true" when the entry time is unknown.
-	NodeClaimAnnotationKey                 = "karpenter.coralogix.net/standby"
-	legacyStandbyMarker                    = "true"
-	NodeClaimActivatingAnnotationKey       = "karpenter.coralogix.net/standby-activating"
-	NodeClaimActivationSourceAnnotationKey = "karpenter.coralogix.net/standby-activation-source"
-	NodeTaintKey                           = "karpenter.coralogix.net/standby"
-	NodeTaintValue                         = "true"
-)
-
-type ActivationSource string
-
-const (
-	ActivationSourceProvisioning ActivationSource = "provisioning"
-	ActivationSourceCompaction   ActivationSource = "compaction"
-	ActivationSourceRecovery     ActivationSource = "recovery"
+	NodeClaimAnnotationKey = "karpenter.coralogix.net/standby"
+	legacyStandbyMarker    = "true"
+	NodeTaintKey           = "karpenter.coralogix.net/standby"
+	NodeTaintValue         = "true"
 )
 
 func NodeTaint() corev1.Taint {
 	return corev1.Taint{Key: NodeTaintKey, Value: NodeTaintValue, Effect: corev1.TaintEffectNoSchedule}
-}
-
-func IsNodeClaimActivating(nodeClaim *v1.NodeClaim) bool {
-	return nodeClaim != nil && nodeClaim.Annotations[NodeClaimActivatingAnnotationKey] == "true"
-}
-
-func HasNodeActivationMarker(node *corev1.Node) bool {
-	return node != nil && node.Annotations[NodeClaimActivatingAnnotationKey] == "true"
-}
-
-func SetNodeClaimActivating(nodeClaim *v1.NodeClaim, activating bool) {
-	if nodeClaim == nil {
-		return
-	}
-	if activating {
-		if nodeClaim.Annotations == nil {
-			nodeClaim.Annotations = map[string]string{}
-		}
-		nodeClaim.Annotations[NodeClaimActivatingAnnotationKey] = "true"
-		return
-	}
-	if nodeClaim.Annotations != nil {
-		delete(nodeClaim.Annotations, NodeClaimActivatingAnnotationKey)
-	}
-}
-
-func NodeClaimActivationSource(nodeClaim *v1.NodeClaim) ActivationSource {
-	if nodeClaim == nil {
-		return ""
-	}
-	return ActivationSource(nodeClaim.Annotations[NodeClaimActivationSourceAnnotationKey])
-}
-
-func SetNodeClaimActivationSource(nodeClaim *v1.NodeClaim, source ActivationSource) {
-	if nodeClaim == nil {
-		return
-	}
-	if source == "" {
-		if nodeClaim.Annotations != nil {
-			delete(nodeClaim.Annotations, NodeClaimActivationSourceAnnotationKey)
-		}
-		return
-	}
-	if nodeClaim.Annotations == nil {
-		nodeClaim.Annotations = map[string]string{}
-	}
-	nodeClaim.Annotations[NodeClaimActivationSourceAnnotationKey] = string(source)
 }
 
 func IsNodeClaimStandby(nodeClaim *v1.NodeClaim) bool {

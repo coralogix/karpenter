@@ -104,8 +104,7 @@ func (q *Queue) markEmptyNodeStandby(ctx context.Context, candidate *Candidate) 
 //nolint:gocyclo // Identity, cached policy, nomination, and live occupancy checks are one transition precondition.
 func (q *Queue) standbyCandidateEligibleForTransition(ctx context.Context, candidate *Candidate, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
 	if !node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() || nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() ||
-		standby.IsNodeClaimStandby(nodeClaim) || standby.IsNodeClaimActivating(nodeClaim) || standby.HasNodeTaint(node) ||
-		node.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" ||
+		standby.IsNodeClaimStandby(nodeClaim) || standby.HasNodeTaint(node) ||
 		node.Annotations[v1.DoNotDisruptAnnotationKey] == "true" || nodeClaim.Annotations[v1.DoNotDisruptAnnotationKey] == "true" ||
 		q.cluster.IsNodeNominated(candidate.ProviderID()) {
 		return false, nil

@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/samber/lo"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,11 +28,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	utilstandby "sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-// Coordinator owns complete standby transitions using live API reads.
+// Coordinator owns standby entry and cleanup repair using live API reads.
 type Coordinator struct {
 	reader client.Reader
 	writer client.Client
@@ -41,20 +39,6 @@ type Coordinator struct {
 
 func NewCoordinator(reader client.Reader, writer client.Client) *Coordinator {
 	return &Coordinator{reader: reader, writer: writer}
-}
-
-func (c *Coordinator) Activate(ctx context.Context, source utilstandby.ActivationSource, nodes ...*state.StateNode) (ActivationResult, error) {
-	var result ActivationResult
-	for _, node := range nodes {
-		pair, err := c.activateNode(ctx, source, node)
-		if err != nil {
-			return result, fmt.Errorf("activating node %q, %w", node.Name(), err)
-		}
-		if pair != nil {
-			result.Activated = append(result.Activated, *pair)
-		}
-	}
-	return result, nil
 }
 
 type EnterStandbyOptions struct {
@@ -94,10 +78,6 @@ func (c *Coordinator) enterStandbyPostEvacuation(ctx context.Context, req EnterS
 		}
 		if !matches {
 			result = TransitionResult{Outcome: OutcomeSkipped}
-			return nil
-		}
-		if utilstandby.IsNodeClaimActivating(nodeClaim) || utilstandby.HasNodeActivationMarker(node) {
-			result = TransitionResult{Outcome: OutcomeSkipped, Node: node, NodeClaim: nodeClaim}
 			return nil
 		}
 		if StandbyEntryComplete(node, nodeClaim) {
@@ -191,7 +171,7 @@ func (c *Coordinator) enterStandbyEmptyMarking(ctx context.Context, req EnterSta
 		rollbackErr := removeDisruptionTaint(ctx, c.reader, c.writer, req.NodeRef.Name)
 		return TransitionResult{Outcome: OutcomeSkipped}, rollbackErr
 	}
-	if !utilstandby.IsNodeClaimStandby(nodeClaim) || utilstandby.IsNodeClaimActivating(nodeClaim) || node.Annotations[utilstandby.NodeClaimActivatingAnnotationKey] == "true" {
+	if !utilstandby.IsNodeClaimStandby(nodeClaim) {
 		if err := removeDisruptionTaint(ctx, c.reader, c.writer, node.Name); err != nil {
 			return TransitionResult{Outcome: OutcomeFailed}, err
 		}
@@ -210,15 +190,7 @@ func (c *Coordinator) enterStandbyEmptyMarking(ctx context.Context, req EnterSta
 	if !matches {
 		return TransitionResult{Outcome: OutcomeSkipped}, nil
 	}
-
-	recovered, err := c.recoverOccupiedStandby(ctx, node, nodeClaim)
-	if err != nil {
-		return TransitionResult{Outcome: OutcomeFailed}, err
-	}
-	if recovered {
-		return TransitionResult{Outcome: OutcomeRecovered, Node: node, NodeClaim: nodeClaim}, nil
-	}
-	if !utilstandby.IsNodeClaimStandby(nodeClaim) || utilstandby.IsNodeClaimActivating(nodeClaim) || !utilstandby.HasNodeTaint(node) {
+	if !StandbyEntryComplete(node, nodeClaim) {
 		return TransitionResult{Outcome: OutcomeSkipped, Node: node, NodeClaim: nodeClaim}, nil
 	}
 	return TransitionResult{Outcome: OutcomeCompleted, Node: node, NodeClaim: nodeClaim}, nil
@@ -243,138 +215,61 @@ func (c *Coordinator) readEligiblePair(ctx context.Context, req EnterStandbyRequ
 	return node, nodeClaim, eligible, err
 }
 
-func (c *Coordinator) recoverOccupiedStandby(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
-	empty, err := NodeEmpty(ctx, c.reader, node)
-	if err != nil || empty {
-		return false, err
-	}
-	return c.recoverOccupiedStandbyPair(ctx, node, nodeClaim)
-}
+type RepairRequest = EnterStandbyRequest
 
-func (c *Coordinator) recoverOccupiedStandbyPair(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
-	stateNode := &state.StateNode{Node: node.DeepCopy(), NodeClaim: nodeClaim.DeepCopy()}
-	actResult, err := c.Activate(ctx, utilstandby.ActivationSourceRecovery, stateNode)
-	if err != nil {
-		return false, fmt.Errorf("restoring occupied standby capacity, %w", err)
-	}
-	if len(actResult.Activated) == 0 {
-		return false, fmt.Errorf("occupied standby NodeClaim %q has not completed activation", nodeClaim.Name)
-	}
-	pair := actResult.Activated[0]
-	if err := removeDisruptionTaint(ctx, c.reader, c.writer, pair.Node.Name); err != nil {
-		return false, err
-	}
-	*node, *nodeClaim = *pair.Node, *pair.NodeClaim
-	return true, nil
-}
-
-type RepairRequest struct {
-	NodeRef      *corev1.Node
-	NodeClaimRef *v1.NodeClaim
-	ProviderID   string
-}
-
-//nolint:gocyclo // Repair keeps live identity, occupancy, and mutation steps in one operation.
+// RepairStandbyNode restores consistency between the standby marker and taint.
+// Occupancy is checked before restoring a missing taint so late bindings recover to active capacity.
+//
+//nolint:gocyclo // Live identity, occupancy, and optimistic writes stay together in one repair operation.
 func (c *Coordinator) RepairStandbyNode(ctx context.Context, req RepairRequest) (TransitionResult, error) {
 	node, nodeClaim, matches, err := c.readLivePair(ctx, req.NodeRef, req.NodeClaimRef, req.ProviderID)
 	if err != nil {
 		return TransitionResult{Outcome: OutcomeFailed}, err
 	}
-	if !matches ||
-		!node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() ||
+	if !matches || !node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() ||
 		nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
 		return TransitionResult{Outcome: OutcomeSkipped}, nil
 	}
-	repaired, err := c.repairOrphanStandbyTaint(ctx, node, nodeClaim)
-	if err != nil {
-		return TransitionResult{Outcome: OutcomeFailed}, err
-	}
-	if repaired {
+
+	if !utilstandby.IsNodeClaimStandby(nodeClaim) {
+		if !utilstandby.HasNodeTaint(node) {
+			return TransitionResult{Outcome: OutcomeUnchanged, Node: node, NodeClaim: nodeClaim}, nil
+		}
+		if err := c.patchNodeStandbyTaint(ctx, node, false); err != nil {
+			return TransitionResult{Outcome: OutcomeFailed}, fmt.Errorf("removing orphan standby taint from Node %q, %w", node.Name, err)
+		}
 		return TransitionResult{Outcome: OutcomeRecovered, Node: node, NodeClaim: nodeClaim}, nil
 	}
-	if utilstandby.IsNodeClaimActivating(nodeClaim) || utilstandby.HasNodeActivationMarker(node) {
-		stateNode := &state.StateNode{Node: node.DeepCopy(), NodeClaim: nodeClaim.DeepCopy()}
-		actResult, err := c.Activate(ctx, utilstandby.ActivationSourceRecovery, stateNode)
-		if err != nil {
-			return TransitionResult{Outcome: OutcomeFailed}, err
-		}
-		if len(actResult.Activated) > 0 {
-			pair := actResult.Activated[0]
-			return TransitionResult{Outcome: OutcomeRecovered, Node: pair.Node, NodeClaim: pair.NodeClaim}, nil
-		}
-		node, nodeClaim, matches, err = c.readLivePair(ctx, req.NodeRef, req.NodeClaimRef, req.ProviderID)
-		if err != nil || !matches {
-			if err != nil {
-				return TransitionResult{Outcome: OutcomeFailed}, err
-			}
-			return TransitionResult{Outcome: OutcomeSkipped}, nil
-		}
-	}
-	if utilstandby.IsNodeClaimStandby(nodeClaim) && !utilstandby.IsNodeClaimActivating(nodeClaim) &&
-		!utilstandby.HasNodeActivationMarker(node) && !utilstandby.HasNodeTaint(node) {
-		if err := c.applyNodeStandbyTaint(ctx, node); err != nil {
-			return TransitionResult{Outcome: OutcomeFailed}, err
-		}
-		utilstandby.SetNodeTaint(node, true)
-		return TransitionResult{Outcome: OutcomeRecovered, Node: node, NodeClaim: nodeClaim}, nil
-	}
+
 	empty, err := NodeEmpty(ctx, c.reader, node)
 	if err != nil {
 		return TransitionResult{Outcome: OutcomeFailed}, err
 	}
-	if empty {
-		if StandbyEntryComplete(node, nodeClaim) {
-			return TransitionResult{Outcome: OutcomeUnchanged, Node: node, NodeClaim: nodeClaim}, nil
+	if !empty {
+		if err := c.patchNodeClaimStandby(ctx, nodeClaim, false, time.Time{}); err != nil {
+			return TransitionResult{Outcome: OutcomeFailed}, fmt.Errorf("removing standby marker from occupied NodeClaim %q, %w", nodeClaim.Name, err)
 		}
-		return TransitionResult{Outcome: OutcomeSkipped, Node: node, NodeClaim: nodeClaim}, nil
-	}
-	recovered, err := c.recoverOccupiedStandbyPair(ctx, node, nodeClaim)
-	if err != nil {
-		return TransitionResult{Outcome: OutcomeFailed}, err
-	}
-	if recovered {
+		node, nodeClaim, matches, err = c.readLivePair(ctx, req.NodeRef, req.NodeClaimRef, req.ProviderID)
+		if err != nil {
+			return TransitionResult{Outcome: OutcomeFailed}, err
+		}
+		if !matches || !node.DeletionTimestamp.IsZero() || !nodeClaim.DeletionTimestamp.IsZero() ||
+			nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() || utilstandby.IsNodeClaimStandby(nodeClaim) {
+			return TransitionResult{Outcome: OutcomeSkipped}, nil
+		}
+		if utilstandby.HasNodeTaint(node) {
+			if err := c.patchNodeStandbyTaint(ctx, node, false); err != nil {
+				return TransitionResult{Outcome: OutcomeFailed}, fmt.Errorf("removing standby taint from occupied Node %q, %w", node.Name, err)
+			}
+		}
 		return TransitionResult{Outcome: OutcomeRecovered, Node: node, NodeClaim: nodeClaim}, nil
 	}
-	return TransitionResult{Outcome: OutcomeSkipped, Node: node, NodeClaim: nodeClaim}, nil
-}
 
-func (c *Coordinator) repairOrphanStandbyTaint(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) (bool, error) {
-	if node == nil || nodeClaim == nil {
-		return false, nil
-	}
-	claimStandby := utilstandby.IsNodeClaimStandby(nodeClaim)
-	claimActivating := utilstandby.IsNodeClaimActivating(nodeClaim)
-	nodeActivating := node.Annotations[utilstandby.NodeClaimActivatingAnnotationKey] == "true"
-	if claimStandby || claimActivating || nodeActivating {
-		return false, nil
-	}
 	if !utilstandby.HasNodeTaint(node) {
-		return false, nil
-	}
-	if err := c.patchNodeStandbyTaint(ctx, node, false); err != nil {
-		if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
-			return false, nil
+		if err := c.applyNodeStandbyTaint(ctx, node); err != nil {
+			return TransitionResult{Outcome: OutcomeFailed}, fmt.Errorf("restoring standby taint on Node %q, %w", node.Name, err)
 		}
-		return false, fmt.Errorf("removing orphan standby taint from Node %q, %w", node.Name, err)
+		return TransitionResult{Outcome: OutcomeRecovered, Node: node, NodeClaim: nodeClaim}, nil
 	}
-	return true, nil
-}
-
-func (c *Coordinator) EnsureStandbyTaintForClaim(ctx context.Context, node *corev1.Node, nodeClaim *v1.NodeClaim) error {
-	return c.ensureStandbyTaintForClaim(ctx, node, nodeClaim)
-}
-
-func ActivationComplete(node *corev1.Node, nodeClaim *v1.NodeClaim) bool {
-	if node == nil || nodeClaim == nil {
-		return false
-	}
-	return !utilstandby.IsNodeClaimStandby(nodeClaim) && !utilstandby.IsNodeClaimActivating(nodeClaim) &&
-		!utilstandby.HasNodeTaint(node) && node.Annotations[utilstandby.NodeClaimActivatingAnnotationKey] != "true"
-}
-
-func FilterActivating(nodes state.StateNodes) []*state.StateNode {
-	return lo.Filter(nodes, func(node *state.StateNode, _ int) bool {
-		return node != nil && !node.MarkedForDeletion() &&
-			(utilstandby.IsNodeClaimActivating(node.NodeClaim) || utilstandby.HasNodeActivationMarker(node.Node))
-	})
+	return TransitionResult{Outcome: OutcomeUnchanged, Node: node, NodeClaim: nodeClaim}, nil
 }

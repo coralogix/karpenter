@@ -168,9 +168,6 @@ func (s *Reclamation) isReclamationCandidateAvailable(ctx context.Context, candi
 	if err != nil || !exists {
 		return false
 	}
-	if standby.IsNodeClaimActivating(currentNodeClaim) {
-		return false
-	}
 	if !standby.IsNodeClaimStandby(currentNodeClaim) {
 		return false
 	}
@@ -184,7 +181,7 @@ func (s *Reclamation) isReclamationCandidateAvailable(ctx context.Context, candi
 	if err := s.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.Node), currentNode); err != nil {
 		return false
 	}
-	if currentNode.UID != candidate.Node.UID || !standby.HasNodeTaint(currentNode) || currentNode.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" {
+	if currentNode.UID != candidate.Node.UID || !standby.HasNodeTaint(currentNode) {
 		return false
 	}
 	if !currentNode.DeletionTimestamp.IsZero() || currentNode.Annotations[v1.DoNotDisruptAnnotationKey] == "true" || currentNodeClaim.Annotations[v1.DoNotDisruptAnnotationKey] == "true" {
@@ -198,9 +195,6 @@ func (s *Reclamation) isReclamationCandidateAvailable(ctx context.Context, candi
 }
 
 func (s *Reclamation) reclamationCandidateEligible(candidate *Candidate) bool {
-	if standby.IsNodeClaimActivating(candidate.NodeClaim) {
-		return false
-	}
 	if !standbyLifecycleEnabled(candidate.NodePool) {
 		return false
 	}

@@ -30,7 +30,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-//nolint:gocyclo // Identity, deletion, standby, activation, and occupancy checks jointly protect one candidate source.
+//nolint:gocyclo // Identity, deletion, standby, and occupancy checks jointly protect one candidate source.
 func (s *ScoreBasedConsolidation) validateCompactionCandidate(ctx context.Context, candidate *Candidate, nodePoolName string) error {
 	currentNode := &corev1.Node{}
 	if err := s.kubeClient.Get(ctx, client.ObjectKeyFromObject(candidate.Node), currentNode); err != nil {
@@ -40,7 +40,7 @@ func (s *ScoreBasedConsolidation) validateCompactionCandidate(ctx context.Contex
 		return fmt.Errorf("getting Node %q for score-based compaction validation, %w", candidate.Node.Name, err)
 	}
 	if currentNode.UID != candidate.Node.UID || currentNode.Spec.ProviderID != candidate.ProviderID() || !currentNode.DeletionTimestamp.IsZero() ||
-		standby.HasNodeTaint(currentNode) || currentNode.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" ||
+		standby.HasNodeTaint(currentNode) ||
 		currentNode.Labels[v1.NodePoolLabelKey] != nodePoolName {
 		return NewChurnValidationError(fmt.Errorf("score-based compaction candidate Node %q changed identity or state", candidate.Node.Name))
 	}
@@ -53,7 +53,7 @@ func (s *ScoreBasedConsolidation) validateCompactionCandidate(ctx context.Contex
 	}
 	if currentNodeClaim.UID != candidate.NodeClaim.UID || !currentNodeClaim.DeletionTimestamp.IsZero() ||
 		currentNodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() ||
-		standby.IsNodeClaimStandby(currentNodeClaim) || standby.IsNodeClaimActivating(currentNodeClaim) ||
+		standby.IsNodeClaimStandby(currentNodeClaim) ||
 		currentNodeClaim.Labels[v1.NodePoolLabelKey] != nodePoolName {
 		return NewChurnValidationError(fmt.Errorf("score-based compaction candidate NodeClaim %q changed state", candidate.NodeClaim.Name))
 	}

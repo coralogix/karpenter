@@ -51,7 +51,7 @@ func (q *Queue) reclamationCandidateBeforeDelete(ctx context.Context, candidate 
 	if nodeClaim.StatusConditions().Get(v1.ConditionTypeInstanceTerminating).IsTrue() {
 		return false, nil
 	}
-	if standby.IsNodeClaimActivating(nodeClaim) || q.cluster.IsNodeNominated(candidate.ProviderID()) {
+	if q.cluster.IsNodeNominated(candidate.ProviderID()) {
 		return false, nil
 	}
 	if q.cluster.HasBufferPods(candidate.ProviderID()) {
@@ -91,7 +91,7 @@ func (q *Queue) reclamationNodeStillEmpty(ctx context.Context, candidate *Candid
 	if !node.DeletionTimestamp.IsZero() {
 		return false, nil
 	}
-	if node.UID != candidate.Node.UID || !standby.HasNodeTaint(node) || node.Annotations[standby.NodeClaimActivatingAnnotationKey] == "true" {
+	if node.UID != candidate.Node.UID || !standby.HasNodeTaint(node) {
 		return false, nil
 	}
 	if node.Annotations[v1.DoNotDisruptAnnotationKey] == "true" || node.Labels[v1.NodeInitializedLabelKey] != "true" {

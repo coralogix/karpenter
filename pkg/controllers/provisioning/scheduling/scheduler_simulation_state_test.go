@@ -37,7 +37,33 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
+	utilstandby "sigs.k8s.io/karpenter/pkg/utils/standby"
 )
+
+func TestPreparedSchedulerStatePreservesStandbyTaint(t *testing.T) {
+	ctx := schedulerBaselineTestContext()
+	inputs := NewNodePoolInputs(ctx, events.NewRecorder(record.NewFakeRecorder(10)), []*v1.NodePool{test.NodePool(v1.NodePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool"},
+	})}, map[string][]*cloudprovider.InstanceType{})
+	node := simulationStateTestNode()
+	node.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{v1.NodePoolLabelKey: "pool"}}}
+	node.Node.Labels[v1.NodeRegisteredLabelKey] = "true"
+	node.Node.Labels[v1.NodeInitializedLabelKey] = "true"
+	node.Node.Spec.Taints = []corev1.Taint{utilstandby.NodeTaint()}
+	node.NodeClaim.Spec.Taints = []corev1.Taint{utilstandby.NodeTaint()}
+
+	prepared, err := NewPreparedSchedulerState(ctx, NewSchedulerBaseline(ctx, inputs, nil), []*state.StateNode{node})
+	if err != nil {
+		t.Fatalf("preparing scheduler state: %v", err)
+	}
+	scheduler, err := prepared.NewScheduler(ctx, nil, nil, emptyTopology(), nil, clock.RealClock{}, NewCapturedVolumeSource(nil), sets.New[string]())
+	if err != nil {
+		t.Fatalf("creating scheduler: %v", err)
+	}
+	if len(scheduler.existingNodes) != 1 || !reflect.DeepEqual(scheduler.existingNodes[0].cachedTaints, []corev1.Taint{utilstandby.NodeTaint()}) {
+		t.Fatalf("prepared taints = %v, want the standby NoSchedule taint", scheduler.existingNodes[0].cachedTaints)
+	}
+}
 
 func TestPreparedSchedulerStateMaterializesIndependentAllocationState(t *testing.T) {
 	ctx := schedulerBaselineTestContext()

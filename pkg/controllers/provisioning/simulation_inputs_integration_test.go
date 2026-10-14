@@ -28,7 +28,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
-	"sigs.k8s.io/karpenter/pkg/standby"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -96,7 +95,7 @@ var _ = It("uses captured volume and topology data across attempts", func() {
 	ExpectApplied(ctx, env.Client, nodePool, pod)
 
 	countingClient := &resourceCountingClient{Client: env.Client, gets: map[reflect.Type]int{}, lists: map[reflect.Type]int{}}
-	countingProvisioner := provisioning.NewProvisioner(countingClient, test.NewEventRecorder(), cloudProvider, cluster, env.Clock, nil, nil, standby.NewCoordinator(countingClient, countingClient))
+	countingProvisioner := provisioning.NewProvisioner(countingClient, test.NewEventRecorder(), cloudProvider, cluster, env.Clock, nil, nil)
 	inputs, err := countingProvisioner.NewPreparedSimulationInputs(ctx, []*corev1.Pod{pod}, nil)
 	Expect(err).To(Succeed())
 	podIDs, err := inputs.PodIDsFor([]*corev1.Pod{pod})

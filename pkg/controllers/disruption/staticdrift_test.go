@@ -36,7 +36,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/metrics"
-	"sigs.k8s.io/karpenter/pkg/standby"
 	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -93,7 +92,7 @@ var _ = Describe("StaticDrift", func() {
 			},
 		}
 		failedProvisioner := provisioning.NewProvisioner(failedClient, recorder, cloudProvider, cluster, env.Clock,
-			deviceallocation.NewController(failedClient), virtualpods.NewVirtualPodCache(failedClient), standby.NewCoordinator(failedClient, failedClient))
+			deviceallocation.NewController(failedClient), virtualpods.NewVirtualPodCache(failedClient))
 		failedQueue := testsupport.NewTestQueue(failedClient, recorder, cluster, env.Clock, failedProvisioner, nil)
 		method := disruption.NewStaticDrift(cluster, failedProvisioner, cloudProvider, disruptionPacing)
 		candidates, err := disruption.GetCandidates(ctx, cluster, failedClient, recorder, env.Clock, cloudProvider,

@@ -405,7 +405,7 @@ func TestNodeEmptyForReclamation(t *testing.T) {
 	})
 }
 
-func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
+func TestReclamationBeforeDeleteRechecksPodsAndStandbyMarker(t *testing.T) {
 	ctx := options.ToContext(context.Background(), test.Options())
 	now := time.Date(2026, time.September, 25, 13, 0, 0, 0, time.UTC)
 	nodePool := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{
@@ -464,13 +464,13 @@ func TestReclamationBeforeDeleteRechecksPodsAndActivation(t *testing.T) {
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(nodeClaim), storedNodeClaim); err != nil {
 		t.Fatal(err)
 	}
-	standby.SetNodeClaimActivating(storedNodeClaim, true)
+	standby.SetNodeClaimStandby(storedNodeClaim, false, time.Time{})
 	if err := kubeClient.Update(ctx, storedNodeClaim); err != nil {
 		t.Fatal(err)
 	}
 	eligible, err = queue.reclamationCandidateBeforeDelete(ctx, candidate)
 	require.NoError(t, err)
-	require.False(t, eligible, "activating node should be ineligible for reclamation")
+	require.False(t, eligible, "node with removed standby marker should be ineligible for reclamation")
 }
 
 func TestReclamationRejectsBufferReservedNode(t *testing.T) {

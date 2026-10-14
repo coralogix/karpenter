@@ -58,7 +58,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
-	"sigs.k8s.io/karpenter/pkg/standby"
 	"sigs.k8s.io/karpenter/pkg/utils/daemonset"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
@@ -85,7 +84,6 @@ func WithReason(reason string) func(*LaunchOptions) {
 type Provisioner struct {
 	cloudProvider              cloudprovider.CloudProvider
 	kubeClient                 client.Client
-	standbyCoordinator         *standby.Coordinator
 	batcher                    *Batcher[types.UID]
 	volumeTopology             *scheduler.VolumeTopology
 	cluster                    *state.Cluster
@@ -99,13 +97,11 @@ type Provisioner struct {
 func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 	cloudProvider cloudprovider.CloudProvider, cluster *state.Cluster,
 	clock clock.Clock, deviceAllocationController *deviceallocation.Controller, virtualPodCache *virtualpods.Cache,
-	standbyCoordinator *standby.Coordinator,
 ) *Provisioner {
 	p := &Provisioner{
 		batcher:                    NewBatcher[types.UID](clock),
 		cloudProvider:              cloudProvider,
 		kubeClient:                 kubeClient,
-		standbyCoordinator:         standbyCoordinator,
 		volumeTopology:             scheduler.NewVolumeTopology(kubeClient),
 		cluster:                    cluster,
 		recorder:                   recorder,
@@ -431,9 +427,6 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	// as persistent capacity for the cluster (since it will soon be removed). Additionally, we are scheduling for
 	// the pods that are on these nodes so the MarkedForDeletion node capacity can't be considered.
 	nodes := p.cluster.DeepCopyNodes()
-	if err := p.resumeStandbyActivations(ctx, nodes); err != nil {
-		return scheduler.Results{}, fmt.Errorf("resuming standby activation, %w", err)
-	}
 
 	// Get pods, exit if nothing to do
 	pendingPods, deletingNodePods, pods, err := p.schedulingPods(ctx, nodes)
@@ -455,10 +448,24 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 	if options.FromContext(ctx).PreferencePolicy == options.PreferencePolicyIgnore {
 		opts = append(opts, scheduler.IgnorePreferences)
 	}
-	results, err := p.solveWithStandbyActivation(ctx, pods, nodes, deletingPodUIDs, opts)
+	s, err := p.NewScheduler(ctx, pods, nodes.Active(), deletingPodUIDs, opts...)
 	if err != nil {
+		if errors.Is(err, ErrNodePoolsNotFound) {
+			log.FromContext(ctx).Info("no dynamic nodepools found")
+			p.cluster.MarkPodSchedulingDecisions(ctx, lo.SliceToMap(pods, func(pod *corev1.Pod) (*corev1.Pod, error) {
+				return pod, fmt.Errorf("no dynamic nodepools found")
+			}), nil, nil)
+			return scheduler.Results{}, nil
+		}
+		return scheduler.Results{}, fmt.Errorf("creating scheduler, %w", err)
+	}
+	timeoutCtx, cancel := context.WithTimeout(ctx, time.Minute)
+	results, err := s.Solve(timeoutCtx, pods)
+	cancel()
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
 		return scheduler.Results{}, err
 	}
+	results = results.TruncateInstanceTypes(ctx, scheduler.MaxInstanceTypes)
 	p.logSchedulingResults(ctx, results, pods, start)
 	// Mark in memory when these pods were marked as schedulable or when we made a decision on the pods.
 	// Virtual buffer pods are excluded — they never exist in etcd, so their entries would never be

@@ -21,12 +21,23 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	utilstandby "sigs.k8s.io/karpenter/pkg/utils/standby"
 )
+
+func replaceActiveNodeSameName(ctx context.Context, kubeClient client.Client, original *corev1.Node, uid types.UID) error {
+	if err := kubeClient.Delete(ctx, original.DeepCopy()); err != nil {
+		return err
+	}
+	replacement := original.DeepCopy()
+	replacement.UID = uid
+	replacement.ResourceVersion = ""
+	return kubeClient.Create(ctx, replacement)
+}
 
 func TestEnterStandbyEmptyMarkingSkipsWhenNodeReplacedAfterMarker(t *testing.T) {
 	ctx := context.Background()
@@ -47,7 +58,7 @@ func TestEnterStandbyEmptyMarkingSkipsWhenNodeReplacedAfterMarker(t *testing.T) 
 	if result.Outcome == OutcomeCompleted {
 		t.Fatalf("EnterStandby() outcome = %q, want skip without completing on replaced node", result.Outcome)
 	}
-	replacementNode, _ := readActivationObjects(ctx, h.client, h.node.Name, h.nodeClaim.Name)
+	replacementNode := h.readNode(ctx)
 	if replacementNode.UID == h.node.UID {
 		t.Fatal("expected a same-name node replacement")
 	}
@@ -76,7 +87,7 @@ func TestEnterStandbyPostEvacuationSkipsWhenNodeReplacedAfterMarker(t *testing.T
 	if result.Outcome == OutcomeCompleted {
 		t.Fatalf("EnterStandby() outcome = %q, want skip without completing on replaced node", result.Outcome)
 	}
-	replacementNode, _ := readActivationObjects(ctx, h.client, h.node.Name, h.nodeClaim.Name)
+	replacementNode := h.readNode(ctx)
 	if replacementNode.UID == h.node.UID {
 		t.Fatal("expected a same-name node replacement")
 	}

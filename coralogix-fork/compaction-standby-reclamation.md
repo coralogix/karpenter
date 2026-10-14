@@ -42,11 +42,9 @@ Standby capacity is visible on the cluster API:
 | Mechanism | Key / taint | Meaning |
 |-----------|-------------|---------|
 | NodeClaim annotation | `karpenter.coralogix.net/standby` | Standby entry time as **RFC3339Nano UTC**, or legacy `true` (no timestamp). |
-| NodeClaim annotation | `karpenter.coralogix.net/standby-activating` | Activation in progress (survives restarts). |
-| NodeClaim annotation | `karpenter.coralogix.net/standby-activation-source` | `provisioning`, `compaction`, or `recovery`. |
 | Node taint | `karpenter.coralogix.net/standby=true:NoSchedule` | Blocks ordinary scheduling while standby. |
 
-Activation clears the standby marker and taint when provisioning or compaction selects the node, or when the controller recovers occupied standby capacity.
+The standby marker and taint are removed during disruption cleanup after a workload is found on a standby node. Recovery is eventual and does not run synchronously with pod binding.
 
 ## What each disruption method does
 
@@ -67,20 +65,20 @@ If standby marking or reclamation starts a command, the controller finishes that
 
 ```text
 Active (empty) ──standby marking──► Standby (empty, tainted)
-Active (workloads) ──compaction evacuate──► Standby (empty after eviction)
+Active (workloads) ──compaction evacuate──► Standby (empty at completion)
 Standby ──reclamation──► Deleting / terminated
-Standby ──provisioning or compaction activate──► Active (schedulable)
+Standby ──cleanup finds occupancy──► Active (schedulable)
 ```
 
-- **Compaction** simulates placement, may activate existing standby nodes as destinations, taints sources, evicts non-daemon workloads, waits until occupying pods are gone, then persists standby on the evacuated node. It does **not** delete the NodeClaim.
+- **Compaction** simulates placement onto active nodes or new capacity, taints sources, evicts non-daemon workloads, waits until occupying pods are gone, then persists standby on the evacuated node. It does **not** delete the NodeClaim.
 - **Standby marking** applies the same standby persistence to nodes that are **already** empty, without eviction.
-- **Reclamation** selects **all** standby candidates past reclamation delay in each pool on a pass (stable sort by node name within the pool), using the same cached candidate admission as other disruption methods. At execution, each candidate is checked independently (identity, standby/activation, nomination, occupancy) and deleted with a UID/resourceVersion precondition so activation and deletion cannot both succeed. Candidates that become ineligible after selection are skipped without blocking unrelated deletions in the same batch.
+- **Reclamation** selects **all** standby candidates past reclamation delay in each pool on a pass (stable sort by node name within the pool), using the same cached candidate admission as other disruption methods. At execution, each candidate is checked independently (identity, standby marker and taint, nomination, occupancy) and deleted with a UID/resourceVersion precondition. Candidates that become ineligible after selection are skipped without blocking unrelated deletions in the same batch.
 
-A non-DaemonSet workload that tolerates `karpenter.sh/disruption:NoSchedule` can still be admitted as a compaction workload and its node can be selected as a source. During evacuation, Karpenter's `IsEvictable` check exempts that pod, while the evacuation wait still counts it as occupying. This is an accepted limitation: evacuation waits for the pod to leave on its own, and may reach the queue timeout and roll back with the source instance retained. Other workloads may already have been evicted, and replacements or activated standby destinations may remain. Upstream consolidation can ignore these pods during drain because it ultimately terminates the source instance.
+A non-DaemonSet workload that tolerates `karpenter.sh/disruption:NoSchedule` can still be admitted as a compaction workload and its node can be selected as a source. During evacuation, Karpenter's `IsEvictable` check exempts that pod, while the evacuation wait still counts it as occupying. This is an accepted limitation: evacuation waits for the pod to leave on its own, and may reach the queue timeout and roll back with the source instance retained. Other workloads may already have been evicted, and replacement capacity may remain. Upstream consolidation can ignore these pods during drain because it ultimately terminates the source instance.
 
-The eviction exemption and the strict physical-emptiness check are intentional. Compaction does not force-evict a workload that tolerates the disruption taint, and a node is not marked standby or reclaimed until its occupying workloads have actually left. This limitation does not reject the source from compaction admission.
+The eviction exemption and physical-emptiness check at each transition are intentional. Compaction does not force-evict a workload that tolerates the disruption taint, and a node is not marked standby or reclaimed while an occupying workload is present. A pod can still bind after the check; cleanup later restores the occupied node to active capacity. This limitation does not reject the source from compaction admission.
 
-Reclamation delay: standby time must be **strictly greater than** the configured delay. Legacy marker value `true` skips reclamation delay. Nodes with an in-progress activation marker are not reclaimable.
+Reclamation delay: standby time must be **strictly greater than** the configured delay. Legacy marker value `true` skips reclamation delay.
 
 ## Consistency and API reads
 
@@ -88,7 +86,7 @@ Disruption planning (candidate filtering, standby counts, score-based compaction
 
 At final reclamation validation, one cached NodePool read checks both whether the standby lifecycle is still enabled and whether the current delay has elapsed. A delay increase already visible to the cache therefore skips a candidate selected under the older delay; it is reconsidered by later candidate discovery. This uses the existing cache read and does not rebuild candidates or make NodePool policy transactional with deletion. The transient tradeoff is cache convergence plus the short interval between validation and delete: the queue honors changes it has observed, while a later policy change can still race the conditional NodeClaim delete.
 
-**Live reads** remain at execution boundaries: standby coordinator transitions (including occupancy before completing empty marking), evacuation pod polling, and the final reclamation delete safety checks (Node, NodeClaim, and pod occupancy immediately before conditional delete). UID/resourceVersion preconditions still protect NodeClaim identity and concurrent claim updates; NodePool policy is checked through the cache.
+**Live reads** remain at execution boundaries: standby coordinator transitions (including occupancy before completing empty marking and occupied-standby recovery), evacuation pod polling, and the final reclamation delete safety checks (Node, NodeClaim, and pod occupancy immediately before conditional delete). UID/resourceVersion preconditions still protect NodeClaim identity and concurrent claim updates; NodePool policy is checked through the cache.
 
 ## “Empty” and occupancy
 
@@ -99,19 +97,11 @@ The same occupancy rules apply to standby marking, evacuation completion, reclam
 
 Evacuation waits until occupying pods disappear from the API (terminating pods with finalizers still block). Accepting an eviction request alone is not enough.
 
-## Activation and recovery
+## Standby recovery
 
-**Provisioning** and **score-based compaction** decide *which* standby nodes to use; `pkg/standby.Coordinator` performs the shared activation protocol (reservation markers, taint removal, metrics).
+Provisioning and score-based compaction use each Node's actual taints during scheduling. Standby nodes remain unavailable as destinations for ordinary workloads; pods that explicitly tolerate the standby taint retain Kubernetes' normal scheduling behavior. Provisioning launches new capacity when a pod cannot use an active node. Disruption cleanup restores occupied standby nodes to active capacity after a live occupancy check.
 
-- **Provisioning** and **score-based compaction** treat eligible standby nodes as schedulable during planning by
-  applying a planning-only view that omits the controller-owned standby `NoSchedule` taint. Cluster objects are not
-  mutated for planning; activation clears persisted markers and taints through the coordinator after a standby node
-  is selected.
-- **Provisioning** activates standby nodes chosen during scheduling (`provisioning` source).
-- **Compaction** activates standby destinations before evacuating sources (`compaction` source).
-- **Recovery** runs on startup and during disruption cleanup: if a standby node has gained a workload (including after a race with the scheduler), the controller activates it back to active capacity (`recovery` source) instead of leaving it tainted standby.
-
-The disruption controller also clears stale `karpenter.sh/disruption` taints from nodes not in an in-flight queue command. During cleanup it runs one coordinator repair pass per selected node to resume interrupted activation, remove orphan standby taints, restore missing standby taints, recover occupied standby capacity, and refresh cluster state after successful repairs.
+The disruption controller also clears stale `karpenter.sh/disruption` taints from nodes not in an in-flight queue command. During cleanup it runs one coordinator repair pass per selected node to remove orphan standby taints, restore missing standby taints on empty standby nodes, recover occupied standby capacity, and refresh cluster state after successful repairs. For an occupied marked node, cleanup optimistically removes the NodeClaim marker first, then rereads the original live Node and NodeClaim pair before optimistically removing the Node taint. If the marker write fails, the next cleanup retries recovery. If marker removal succeeds but taint removal fails, the next pass removes the orphan taint even if pod listing fails. For a marked node with a missing taint, occupancy is checked before restoring the taint. A marker and taint can temporarily disagree after an API write failure; cleanup repairs that state on a later pass. Existing `standby-activating` and `standby-activation-source` annotations are ignored and remain inert; this change does not migrate or clear them.
 
 ## Observability
 
@@ -120,7 +110,6 @@ Disruption evaluation metrics label consolidation type `standby-marking`, `recla
 | Prometheus metric | When it increments / updates |
 |-------------------|------------------------------|
 | `karpenter_nodes_standby_marked_total` | Empty node successfully marked standby (label: `nodepool`). |
-| `karpenter_nodes_standby_activated_total` | Standby taint removed after successful activation (labels: `nodepool`, `instance_type`, `source`). |
 | `karpenter_nodepools_reclamation_removals_total` | Reclamation delete succeeds (label: `nodepool`). |
 | `karpenter_nodepools_standby_nodes` | Per-pool gauge refreshed during reclamation candidate discovery. |
 | `karpenter_voluntary_disruption_evacuation_commands_total` | Evacuation command completed or failed (score-based compaction). |
@@ -135,11 +124,10 @@ Standby marking does not emit evacuation or consolidation deletion metrics. Recl
 
 Historically, consolidation both moved pods and deleted source nodes in one flow. Splitting the steps allows:
 
-- Reusing **running** empty instances as cheap warm capacity instead of terminating immediately.
-- Letting compaction optimize placement while reclamation throttles removal independently (reclamation delay instead of paced batch removal).
-- Activating standby nodes for new or relocated workloads without a full launch when requirements match.
+- Letting compaction optimize placement while reclamation controls empty-capacity removal independently through a delay.
+- Letting cleanup restore capacity when a workload binds during the standby transition.
 
-The tradeoff is ongoing cost for standby instances until reclamation removes them or they are activated.
+The tradeoff is ongoing cost for standby instances until reclamation removes them or a workload binds and cleanup restores them to active capacity.
 
 ## Rollback to upstream
 

@@ -37,7 +37,7 @@ func (q *Queue) cleanupStaleDisruptionState(ctx context.Context) error {
 		log.FromContext(ctx).Error(err, "repairing standby nodes")
 	}
 	outdatedNodes := lo.Reject(q.cluster.DeepCopyNodes(), func(s *state.StateNode, _ int) bool {
-		return q.HasAny(s.ProviderID()) || s.MarkedForDeletion() || standby.IsNodeClaimActivating(s.NodeClaim)
+		return q.HasAny(s.ProviderID()) || s.MarkedForDeletion()
 	})
 	if err := state.RequireNoScheduleTaint(ctx, q.kubeClient, false, outdatedNodes...); err != nil {
 		return serrors.Wrap(fmt.Errorf("removing taint from nodes, %w", err), "taint", pretty.Taint(v1.DisruptedNoScheduleTaint))
@@ -56,8 +56,7 @@ func (q *Queue) repairStandbyNodes(ctx context.Context) error {
 		if stateNode == nil || stateNode.Node == nil || stateNode.NodeClaim == nil || stateNode.MarkedForDeletion() || q.HasAny(stateNode.ProviderID()) {
 			continue
 		}
-		if !standby.IsNodeClaimStandby(stateNode.NodeClaim) && !standby.IsNodeClaimActivating(stateNode.NodeClaim) &&
-			!standby.HasNodeTaint(stateNode.Node) && stateNode.Node.Annotations[standby.NodeClaimActivatingAnnotationKey] != "true" {
+		if !standby.IsNodeClaimStandby(stateNode.NodeClaim) && !standby.HasNodeTaint(stateNode.Node) {
 			continue
 		}
 		result, err := coordinator.RepairStandbyNode(ctx, standbypkg.RepairRequest{
@@ -72,6 +71,7 @@ func (q *Queue) repairStandbyNodes(ctx context.Context) error {
 		if result.Outcome != standbypkg.OutcomeRecovered || result.Node == nil || result.NodeClaim == nil {
 			continue
 		}
+		log.FromContext(ctx).WithValues("Node", result.Node.Name, "NodeClaim", result.NodeClaim.Name).Info("repaired standby node state")
 		if err := q.updateStandbyState(ctx, result.Node, result.NodeClaim); err != nil {
 			errs = append(errs, fmt.Errorf("refreshing Node %q after standby repair, %w", result.Node.Name, err))
 		}

@@ -27,10 +27,7 @@ func StandbyEntryComplete(node *corev1.Node, nodeClaim *v1.NodeClaim) bool {
 	if node == nil || nodeClaim == nil {
 		return false
 	}
-	if !utilstandby.IsNodeClaimStandby(nodeClaim) || utilstandby.IsNodeClaimActivating(nodeClaim) {
-		return false
-	}
-	if utilstandby.HasNodeActivationMarker(node) {
+	if !utilstandby.IsNodeClaimStandby(nodeClaim) {
 		return false
 	}
 	return utilstandby.HasNodeTaint(node)

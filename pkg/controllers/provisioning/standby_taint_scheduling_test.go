@@ -32,7 +32,7 @@ import (
 )
 
 var _ = Describe("Provisioning", func() {
-	Context("Standby reuse", func() {
+	Context("Standby capacity", func() {
 		var nodeClaimStateController *informer.NodeClaimController
 
 		BeforeEach(func() {
@@ -40,44 +40,11 @@ var _ = Describe("Provisioning", func() {
 			nodeClaimStateController = informer.NewNodeClaimController(env.Client, cloudProvider, cluster, clusterCost)
 		})
 
-		It("schedules a compatible pod onto standby capacity without launching a NodeClaim", func() {
+		It("keeps standby capacity unavailable to ordinary scheduling", func() {
 			nodePool := test.NodePool()
-			nodeClaim, node := standbyReuseNode(nodePool)
+			nodeClaim, node := standbySchedulingNode(nodePool)
 			standby.SetNodeClaimStandby(nodeClaim, true, env.Clock.Now())
 			standby.SetNodeTaint(node, true)
-			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
-			ExpectMakeNodeClaimsInitialized(ctx, env.Client, env.Clock, nodeClaim)
-			ExpectMakeNodesInitialized(ctx, env.Client, env.Clock, node)
-			ExpectReconcileSucceeded(ctx, nodeClaimStateController, client.ObjectKeyFromObject(nodeClaim))
-			ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
-
-			pod := test.UnschedulablePod()
-			ExpectApplied(ctx, env.Client, pod)
-			results, err := prov.Schedule(ctx)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(results.NewNodeClaims).To(BeEmpty())
-			Expect(results.ExistingNodeToPodMapping()[nodeClaim.Name]).To(ConsistOf(pod))
-
-			storedNode := ExpectNodeExists(ctx, env.Client, node.Name)
-			storedClaim := &v1.NodeClaim{}
-			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), storedClaim)).To(Succeed())
-			Expect(standby.IsNodeClaimStandby(storedClaim)).To(BeFalse())
-			Expect(standby.IsNodeClaimActivating(storedClaim)).To(BeFalse())
-			Expect(standby.HasNodeTaint(storedNode)).To(BeFalse())
-			Expect(storedNode.Spec.ProviderID).To(Equal(node.Spec.ProviderID))
-
-			nodeClaims := &v1.NodeClaimList{}
-			Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
-			Expect(nodeClaims.Items).To(HaveLen(1))
-		})
-
-		It("does not schedule onto standby capacity blocked by an unrelated taint", func() {
-			nodePool := test.NodePool()
-			otherTaint := corev1.Taint{Key: "example.com/block", Effect: corev1.TaintEffectNoSchedule}
-			nodeClaim, node := standbyReuseNode(nodePool)
-			standby.SetNodeClaimStandby(nodeClaim, true, env.Clock.Now())
-			standby.SetNodeTaint(node, true)
-			node.Spec.Taints = append(node.Spec.Taints, otherTaint)
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 			ExpectMakeNodeClaimsInitialized(ctx, env.Client, env.Clock, nodeClaim)
 			ExpectMakeNodesInitialized(ctx, env.Client, env.Clock, node)
@@ -90,11 +57,17 @@ var _ = Describe("Provisioning", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(results.ExistingNodeToPodMapping()[nodeClaim.Name]).To(BeEmpty())
 			Expect(results.NewNodeClaims).ToNot(BeEmpty())
+
+			storedNode := ExpectNodeExists(ctx, env.Client, node.Name)
+			storedClaim := &v1.NodeClaim{}
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), storedClaim)).To(Succeed())
+			Expect(standby.IsNodeClaimStandby(storedClaim)).To(BeTrue())
+			Expect(standby.HasNodeTaint(storedNode)).To(BeTrue())
 		})
 	})
 })
 
-func standbyReuseNode(nodePool *v1.NodePool) (*v1.NodeClaim, *corev1.Node) {
+func standbySchedulingNode(nodePool *v1.NodePool) (*v1.NodeClaim, *corev1.Node) {
 	its, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
 	Expect(err).ToNot(HaveOccurred())
 	instanceType := its[0]

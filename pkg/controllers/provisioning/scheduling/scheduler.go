@@ -54,7 +54,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/disruption"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
-	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 type ReservedOfferingMode int
@@ -879,7 +878,7 @@ func (s *Scheduler) addToNewNodeClaim(ctx context.Context, pod *corev1.Pod) erro
 func (s *Scheduler) calculateExistingNodeClaims(ctx context.Context, stateNodes []*state.StateNode, daemonSetPods []*corev1.Pod, nodePoolMap map[string]*v1.NodePool, enforceConsolidateAfter bool) {
 	// create our existing nodes
 	for _, node := range stateNodes {
-		taints := standby.PlanningTaints(node)
+		taints := node.Taints()
 		daemons := s.getCompatibleDaemonPods(ctx, node, taints, daemonSetPods)
 		isUnderConsolidateAfter := enforceConsolidateAfter && disruption.IsUnderConsolidateAfter(nodePoolMap[node.Name()], node.NodeClaim, s.clock)
 		s.existingNodes = append(s.existingNodes, NewExistingNode(node, s.topology, taints, resources.RequestsForPods(daemons...), s.instanceTypeForNode(node), isUnderConsolidateAfter))

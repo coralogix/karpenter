@@ -59,7 +59,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/standby"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
-	utilstandby "sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 const (
@@ -305,24 +304,6 @@ func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) e
 	return nil
 }
 
-func (q *Queue) activateStandbyDestinations(ctx context.Context, cmd *Command) error {
-	stateNodes := lo.FilterMap(cmd.Results.ExistingNodes, func(existing *pscheduling.ExistingNode, _ int) (*state.StateNode, bool) {
-		if len(existing.Pods) == 0 || existing.StateNode == nil ||
-			(!utilstandby.IsNodeClaimStandby(existing.NodeClaim) && !utilstandby.IsNodeClaimActivating(existing.NodeClaim)) {
-			return nil, false
-		}
-		return existing.StateNode, true
-	})
-	if len(stateNodes) == 0 {
-		return nil
-	}
-	actResult, err := q.standbyCoordinator.Activate(ctx, utilstandby.ActivationSourceCompaction, stateNodes...)
-	if applyErr := standby.ApplyActivationResult(ctx, q.cluster, stateNodes, actResult); applyErr != nil && err == nil {
-		return applyErr
-	}
-	return err
-}
-
 func (q *Queue) rollbackStart(ctx context.Context, candidates []*Candidate, cause error) error {
 	stateNodes := lo.Map(candidates, func(c *Candidate, _ int) *state.StateNode { return c.StateNode })
 	rollbackErr := multierr.Combine(
@@ -348,10 +329,6 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	if q.HasAny(providerIDs...) {
 		return fmt.Errorf("candidate is being disrupted")
 	}
-	if err := q.activateStandbyDestinations(ctx, cmd); err != nil {
-		return fmt.Errorf("activating standby destinations, %w", err)
-	}
-
 	log.FromContext(ctx).WithValues(append([]any{
 		"command", cmd.String(),
 	}, cmd.LogValues()...)...).Info("disrupting node(s)")

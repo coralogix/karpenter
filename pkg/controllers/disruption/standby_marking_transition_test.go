@@ -62,7 +62,7 @@ func TestStandbyMarkingQueueRecoversWhenPodBindsDuringTransition(t *testing.T) {
 	claim := &v1.NodeClaim{}
 	require.NoError(t, h.apiReader.Get(h.ctx, client.ObjectKeyFromObject(h.node), node))
 	require.NoError(t, h.apiReader.Get(h.ctx, client.ObjectKeyFromObject(h.nodeClaim), claim))
-	require.False(t, standby.IsNodeClaimStandby(claim) || standby.IsNodeClaimActivating(claim) || standby.HasNodeTaint(node))
+	require.False(t, standby.IsNodeClaimStandby(claim) || standby.HasNodeTaint(node))
 	require.False(t, hasDisruptionNoScheduleTaint(node))
 	require.False(t, h.queue.HasAny(h.nodeClaim.Status.ProviderID))
 	require.True(t, injected, "expected the workload to bind after the temporary disruption taint was added")

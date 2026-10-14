@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -32,14 +33,14 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-func TestReclamationConditionalDeleteRevalidatesConcurrentActivation(t *testing.T) {
-	h := newReclamationDeleteRaceHarness(t, false, activateNodeClaimBeforeConditionalDelete)
+func TestReclamationConditionalDeleteRevalidatesRemovedStandbyMarker(t *testing.T) {
+	h := newReclamationDeleteRaceHarness(t, false, removeStandbyMarkerBeforeConditionalDelete)
 	requireReconciliationRequeues(t, h)
 	requireDeleteCalls(t, h, 1)
 	requireReconciliationCompletes(t, h)
 	requireDeleteCalls(t, h, 1)
-	require.True(t, standby.IsNodeClaimActivating(getRaceNodeClaim(t, h)))
-	require.False(t, h.queue.HasAny(h.claim.Status.ProviderID), "rejected command should complete after fresh activation validation")
+	require.False(t, standby.IsNodeClaimStandby(getRaceNodeClaim(t, h)))
+	require.False(t, h.queue.HasAny(h.claim.Status.ProviderID), "rejected command should complete after fresh standby marker validation")
 }
 
 func TestReclamationConditionalDeleteProtectsSameNameReplacement(t *testing.T) {
@@ -80,13 +81,13 @@ func TestReclamationRetriesDeleteForAlreadyTerminatingClaim(t *testing.T) {
 	require.False(t, getRaceNodeClaim(t, h).DeletionTimestamp.IsZero(), "retry should preserve the already-started termination")
 }
 
-func activateNodeClaimBeforeConditionalDelete(ctx context.Context, kubeClient client.Client, object client.Object) error {
+func removeStandbyMarkerBeforeConditionalDelete(ctx context.Context, kubeClient client.Client, object client.Object) error {
 	claim := &v1.NodeClaim{}
 	if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(object), claim); err != nil {
 		return err
 	}
 	oldResourceVersion := claim.ResourceVersion
-	standby.SetNodeClaimActivating(claim, true)
+	standby.SetNodeClaimStandby(claim, false, time.Time{})
 	if err := kubeClient.Update(ctx, claim); err != nil {
 		return err
 	}
@@ -95,7 +96,7 @@ func activateNodeClaimBeforeConditionalDelete(ctx context.Context, kubeClient cl
 		return err
 	}
 	if updated.ResourceVersion == oldResourceVersion {
-		return fmt.Errorf("fake client did not advance resourceVersion after activation update")
+		return fmt.Errorf("fake client did not advance resourceVersion after standby marker removal")
 	}
 	return nil
 }
