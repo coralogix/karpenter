@@ -17,19 +17,11 @@ limitations under the License.
 package disruption
 
 import (
-	"sync"
-
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"sigs.k8s.io/karpenter/pkg/metrics"
-)
-
-const (
-	reclamationEmptyNodeStateLabel   = "state"
-	reclamationEmptyNodeStateStandby = "standby"
-	reclamationEmptyNodeStateOther   = "other"
 )
 
 var (
@@ -43,57 +35,29 @@ var (
 		},
 		[]string{metrics.NodePoolLabel},
 	)
-	ReclamationEmptyNodes = opmetrics.NewPrometheusGauge(
+	ReclamationStandbyNodes = opmetrics.NewPrometheusGauge(
 		crmetrics.Registry,
 		prometheus.GaugeOpts{
 			Namespace: metrics.Namespace,
 			Subsystem: metrics.NodePoolSubsystem,
-			Name:      "empty_nodes",
-			Help:      "Number of empty nodes in NodePools with standby lifecycle enabled. Labeled by NodePool and whether the node is standby or other empty capacity.",
+			Name:      "standby_nodes",
+			Help:      "Number of non-deleting nodes with a standby-marked NodeClaim, labeled by NodePool.",
 		},
-		[]string{metrics.NodePoolLabel, reclamationEmptyNodeStateLabel},
+		[]string{metrics.NodePoolLabel},
 	)
-	reclamationEmptyNodeMetricState = struct {
-		sync.Mutex
-		pools map[string]struct{}
-	}{pools: map[string]struct{}{}}
+	reclamationStandbyNodeMetricStore = metrics.NewStore()
 )
 
-type emptyNodeCounts struct {
-	standby int
-	other   int
-}
-
-func (c emptyNodeCounts) add(isStandby bool) emptyNodeCounts {
-	if isStandby {
-		c.standby++
-	} else {
-		c.other++
-	}
-	return c
-}
-
-func updateReclamationEmptyNodeMetrics(counts map[string]emptyNodeCounts) {
-	reclamationEmptyNodeMetricState.Lock()
-	defer reclamationEmptyNodeMetricState.Unlock()
-
-	for pool := range reclamationEmptyNodeMetricState.pools {
-		if _, ok := counts[pool]; !ok {
-			ReclamationEmptyNodes.DeletePartialMatch(map[string]string{metrics.NodePoolLabel: pool})
-		}
-	}
+func updateReclamationStandbyNodeMetrics(counts map[string]int) {
+	store := make(map[string][]*metrics.StoreMetric, len(counts))
 	for pool, count := range counts {
-		ReclamationEmptyNodes.Set(float64(count.standby), map[string]string{
-			metrics.NodePoolLabel:          pool,
-			reclamationEmptyNodeStateLabel: reclamationEmptyNodeStateStandby,
-		})
-		ReclamationEmptyNodes.Set(float64(count.other), map[string]string{
-			metrics.NodePoolLabel:          pool,
-			reclamationEmptyNodeStateLabel: reclamationEmptyNodeStateOther,
-		})
+		store[pool] = []*metrics.StoreMetric{{
+			GaugeMetric: ReclamationStandbyNodes,
+			Value:       float64(count),
+			Labels: prometheus.Labels{
+				metrics.NodePoolLabel: pool,
+			},
+		}}
 	}
-	reclamationEmptyNodeMetricState.pools = make(map[string]struct{}, len(counts))
-	for pool := range counts {
-		reclamationEmptyNodeMetricState.pools[pool] = struct{}{}
-	}
+	reclamationStandbyNodeMetricStore.ReplaceAll(store)
 }

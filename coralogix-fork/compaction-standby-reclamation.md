@@ -80,7 +80,7 @@ Reclamation delay: standby time must be **strictly greater than** the configured
 
 ## Consistency and API reads
 
-Disruption planning (candidate filtering, inventory, score-based compaction revalidation, and NodePool policy including pacing) uses the controller **cache** (`kubeClient`), matching upstream’s consistency model. Reclamation does not rebuild consolidation candidates between selection and deletion. Configuration and deleted NodePools take effect when the cache observes them; there is no fallback to uncached reads when the cache is stale or returns `NotFound`.
+Disruption planning (candidate filtering, standby counts, score-based compaction revalidation, and NodePool policy including pacing) uses the controller **cache** (`kubeClient`), matching upstream’s consistency model. Reclamation does not rebuild consolidation candidates between selection and deletion. Configuration and deleted NodePools take effect when the cache observes them; there is no fallback to uncached reads when the cache is stale or returns `NotFound`.
 
 **Live reads** remain at execution boundaries: standby coordinator transitions (including occupancy before completing empty marking), evacuation pod polling, and the final reclamation delete safety checks (Node, NodeClaim, and pod occupancy immediately before conditional delete).
 
@@ -116,10 +116,12 @@ Disruption evaluation metrics label consolidation type `standby-marking`, `recla
 | `karpenter_nodes_standby_marked_total` | Empty node successfully marked standby (label: `nodepool`). |
 | `karpenter_nodes_standby_activated_total` | Standby taint removed after successful activation (labels: `nodepool`, `instance_type`, `source`). |
 | `karpenter_nodepools_reclamation_removals_total` | Reclamation delete succeeds (label: `nodepool`). |
-| `karpenter_nodepools_empty_nodes` | Per-pool gauge of empty nodes (`state=standby` or `state=other`); updated after each reclamation inventory scan. |
+| `karpenter_nodepools_standby_nodes` | Per-pool gauge refreshed during reclamation candidate discovery. |
 | `karpenter_voluntary_disruption_evacuation_commands_total` | Evacuation command completed or failed (score-based compaction). |
 | `karpenter_voluntary_disruption_evacuation_duration_seconds` | Time to finish an evacuation command. |
 | `karpenter_voluntary_disruption_nodeclaims_evacuated_total` | Source NodeClaims evacuated per completed command. |
+
+The standby gauge counts non-deleting cluster-state nodes that have both a Node and NodeClaim and whose NodeClaim has the standby marker. It includes retained markers even when a node is protected, nominated, queued, buffer-reserved, still within its reclamation delay, or its NodePool has left standby lifecycle scope. Enabled dynamic pools receive explicit zero-valued series; counting reads no pod occupancy data.
 
 Standby marking does not emit evacuation or consolidation deletion metrics. Reclamation uses reason `Empty` in disruption events and budgets.
 

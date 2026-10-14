@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -28,6 +29,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/utils/pdb"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
@@ -65,8 +67,47 @@ func (s *Reclamation) ConsolidationType() string {
 	return ReclamationType
 }
 
+func (s *Reclamation) candidates(ctx context.Context) ([]*Candidate, error) {
+	nodePoolMap, nodePoolToInstanceTypesMap, err := BuildNodePoolMap(ctx, s.kubeClient, s.cloudProvider)
+	if err != nil {
+		return nil, err
+	}
+	standbyNodes := s.standbyNodes(nodePoolMap)
+	pdbs, err := pdb.NewLimits(ctx, s.kubeClient)
+	if err != nil {
+		return nil, fmt.Errorf("tracking PodDisruptionBudgets, %w", err)
+	}
+	return lo.FilterMap(standbyNodes, func(node *state.StateNode, _ int) (*Candidate, bool) {
+		candidate, err := NewCandidate(ctx, s.kubeClient, s.recorder, s.clock, node, pdbs, nodePoolMap, nodePoolToInstanceTypesMap, s.queue, s.Class())
+		return candidate, err == nil && s.ShouldDisrupt(ctx, candidate)
+	}), nil
+}
+
+func (s *Reclamation) standbyNodes(nodePoolMap map[string]*v1.NodePool) state.StateNodes {
+	allNodes := s.cluster.DeepCopyNodes()
+	standbyNodes := make(state.StateNodes, 0, len(allNodes))
+	counts := map[string]int{}
+	for name, nodePool := range nodePoolMap {
+		if standbyLifecycleEnabled(nodePool) {
+			counts[name] = 0
+		}
+	}
+	for _, node := range allNodes {
+		if node.Node == nil || node.NodeClaim == nil || node.MarkedForDeletion() || !node.Node.DeletionTimestamp.IsZero() || !standby.IsNodeClaimStandby(node.NodeClaim) {
+			continue
+		}
+		poolName := node.Labels()[v1.NodePoolLabelKey]
+		if poolName == "" {
+			continue
+		}
+		counts[poolName]++
+		standbyNodes = append(standbyNodes, node)
+	}
+	updateReclamationStandbyNodeMetrics(counts)
+	return standbyNodes
+}
+
 func (s *Reclamation) computeReclamationCommand(ctx context.Context, candidates []*Candidate) *Command {
-	s.refreshReclamationInventory(ctx)
 	selected := selectReclamationCandidates(candidates)
 	if len(selected) == 0 {
 		return nil
@@ -102,67 +143,6 @@ func selectReclamationCandidates(candidates []*Candidate) []*Candidate {
 		return candidates[i].Name() < candidates[j].Name()
 	})
 	return candidates
-}
-
-func (s *Reclamation) refreshReclamationInventory(ctx context.Context) {
-	emptyNodeCounts, err := s.collectReclamationInventory(ctx)
-	if err != nil {
-		log.FromContext(ctx).Error(err, "collecting reclamation empty-node inventory")
-		return
-	}
-	updateReclamationEmptyNodeMetrics(emptyNodeCounts)
-}
-
-func (s *Reclamation) collectReclamationInventory(ctx context.Context) (map[string]emptyNodeCounts, error) {
-	nodePools, inventoryCounts, err := s.reclamationPools(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for _, node := range s.cluster.DeepCopyNodes() {
-		poolName, isStandby, empty, err := s.emptyReclamationNodeInventory(ctx, node, nodePools)
-		if err != nil {
-			return nil, err
-		}
-		if !empty {
-			continue
-		}
-		inventoryCounts[poolName] = inventoryCounts[poolName].add(isStandby)
-	}
-	return inventoryCounts, nil
-}
-
-func (s *Reclamation) reclamationPools(ctx context.Context) (map[string]*v1.NodePool, map[string]emptyNodeCounts, error) {
-	var nodePoolList v1.NodePoolList
-	if err := s.kubeClient.List(ctx, &nodePoolList); err != nil {
-		return nil, nil, fmt.Errorf("listing NodePools for reclamation, %w", err)
-	}
-	nodePools := make(map[string]*v1.NodePool, len(nodePoolList.Items))
-	inventoryCounts := make(map[string]emptyNodeCounts, len(nodePoolList.Items))
-	for i := range nodePoolList.Items {
-		nodePool := &nodePoolList.Items[i]
-		if !standbyLifecycleEnabled(nodePool) {
-			continue
-		}
-		nodePools[nodePool.Name] = nodePool
-		inventoryCounts[nodePool.Name] = emptyNodeCounts{}
-	}
-	return nodePools, inventoryCounts, nil
-}
-
-func (s *Reclamation) emptyReclamationNodeInventory(ctx context.Context, node *state.StateNode, nodePools map[string]*v1.NodePool) (string, bool, bool, error) {
-	if node.NodeClaim == nil || node.Node == nil || node.MarkedForDeletion() {
-		return "", false, false, nil
-	}
-	poolName := node.Labels()[v1.NodePoolLabelKey]
-	if nodePools[poolName] == nil {
-		return "", false, false, nil
-	}
-	empty, err := nodeEmpty(ctx, s.kubeClient, node.Node)
-	if err != nil {
-		return "", false, false, fmt.Errorf("checking emptiness of node %q for reclamation, %w", node.Name(), err)
-	}
-	isStandby := standby.IsNodeClaimStandby(node.NodeClaim) && standby.HasNodeTaint(node.Node)
-	return poolName, isStandby, empty, nil
 }
 
 func (s *Reclamation) reclamationCandidateNodeClaim(ctx context.Context, candidate *Candidate) (*v1.NodeClaim, bool, error) {

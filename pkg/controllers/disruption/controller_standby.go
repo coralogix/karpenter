@@ -20,14 +20,6 @@ import (
 	"context"
 )
 
-func (c *Controller) refreshEmptyReclamationInventory(ctx context.Context, disruption Method) {
-	reclamation, ok := disruption.(*Reclamation)
-	if !ok {
-		return
-	}
-	reclamation.refreshReclamationInventory(ctx)
-}
-
 func (c *Controller) budgetMappingForMethod(ctx context.Context, disruption Method) (map[string]int, error) {
 	if _, budgetExempt := disruption.(*Reclamation); budgetExempt {
 		return map[string]int{}, nil

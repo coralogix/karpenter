@@ -18,7 +18,6 @@ package disruption
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -34,6 +33,7 @@ import (
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	fakecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
@@ -41,104 +41,64 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-func TestReclamationEmptyNodeMetricsIncludeAllConfiguredPools(t *testing.T) {
-	resetScoreBasedEmptyNodeMetricForTest()
-	defer resetScoreBasedEmptyNodeMetricForTest()
+func TestReclamationCandidateDiscoveryCountsBlockedStandbyAndSkipsOtherNodes(t *testing.T) {
+	resetReclamationStandbyNodeMetricsForTest()
+	defer resetReclamationStandbyNodeMetricsForTest()
 
 	ctx := context.Background()
-	now := time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC)
-	clock := clocktesting.NewFakeClock(now)
-	duePool := reclamationTestPool("due-pool")
-	otherPool := reclamationTestPool("other-pool")
+	clock := clocktesting.NewFakeClock(time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC))
+	pool := reclamationTestPool("enabled-pool")
 	zeroPool := reclamationTestPool("zero-pool")
-	unconfiguredPool := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "unconfigured-pool"}}
+	disabledPool := test.NodePool(v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "disabled-pool"}})
+	blockedClaim, blockedNode := reclamationTestNode(pool.Name, "blocked-standby", true, false, false)
+	blockedClaim.Annotations[v1.DoNotDisruptAnnotationKey] = "true"
+	activeClaim, activeNode := reclamationTestNode(pool.Name, "active-node", false, false, false)
+	readyClaim, readyNode := reclamationTestNode(pool.Name, "ready-standby", true, true, false)
+	retainedClaim, retainedNode := reclamationTestNode(disabledPool.Name, "retained-standby", true, false, false)
+	deletedClaim, deletedNode := reclamationTestNode(pool.Name, "deleted-standby", true, false, true)
+	deletedNodeClaimTime := metav1.NewTime(time.Now())
+	deletedNode.DeletionTimestamp = &deletedNodeClaimTime
+	deletedNode.Finalizers = []string{"test.karpenter.sh/finalizer"}
 
-	standbyClaim, standbyNode := reclamationTestNode("due-pool", "standby-node", true, true, false)
-	otherClaim, otherNode := reclamationTestNode("due-pool", "other-node", false, false, false)
-	emptyOtherClaim, emptyOtherNode := reclamationTestNode("due-pool", "empty-other-node", false, false, false)
-	markerOnlyClaim, markerOnlyNode := reclamationTestNode("other-pool", "marker-only-node", true, false, false)
-	terminatingClaim, terminatingNode := reclamationTestNode("due-pool", "terminating-node", false, false, true)
-	workload := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "bound", Namespace: "default"}, Spec: corev1.PodSpec{NodeName: otherNode.Name}}
-	kubeClient := reclamationTestClient(duePool, otherPool, zeroPool, unconfiguredPool, standbyClaim, standbyNode, otherClaim, otherNode, emptyOtherClaim, emptyOtherNode, markerOnlyClaim, markerOnlyNode, terminatingClaim, terminatingNode, workload)
-	cluster := state.NewCluster(clock, kubeClient, nil)
-	for _, nodeClaim := range []*v1.NodeClaim{standbyClaim, otherClaim, emptyOtherClaim, markerOnlyClaim, terminatingClaim} {
+	baseClient := reclamationTestClient(pool, zeroPool, disabledPool, blockedClaim, blockedNode, activeClaim, activeNode, readyClaim, readyNode, retainedClaim, retainedNode, deletedClaim, deletedNode)
+	cluster := state.NewCluster(clock, baseClient, nil)
+	for _, nodeClaim := range []*v1.NodeClaim{blockedClaim, activeClaim, readyClaim, retainedClaim, deletedClaim} {
 		cluster.UpdateNodeClaim(nodeClaim)
 	}
-	for _, node := range []*corev1.Node{standbyNode, otherNode, emptyOtherNode, markerOnlyNode, terminatingNode} {
+	for _, node := range []*corev1.Node{blockedNode, activeNode, readyNode, retainedNode, deletedNode} {
 		if err := cluster.UpdateNode(ctx, node); err != nil {
 			t.Fatal(err)
 		}
 	}
-	consolidator := MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
-	reclamation := NewReclamation(consolidator)
+	countingClient := &countingPodListClient{Client: baseClient}
+	recorder := events.NewRecorder(&record.FakeRecorder{})
+	queue := newTestQueue(countingClient, recorder, cluster, clock, nil)
+	reclamation := NewReclamation(MakeConsolidation(clock, cluster, countingClient, nil, fakecloudprovider.NewCloudProvider(), recorder, queue, nil))
 
-	reclamation.refreshReclamationInventory(ctx)
-	assertScoreBasedEmptyNodeMetric(t, "due-pool", reclamationEmptyNodeStateStandby, 1, true)
-	assertScoreBasedEmptyNodeMetric(t, "due-pool", reclamationEmptyNodeStateOther, 1, true)
-	assertScoreBasedEmptyNodeMetric(t, "other-pool", reclamationEmptyNodeStateStandby, 0, true)
-	assertScoreBasedEmptyNodeMetric(t, "other-pool", reclamationEmptyNodeStateOther, 1, true)
-	assertScoreBasedEmptyNodeMetric(t, "zero-pool", reclamationEmptyNodeStateStandby, 0, true)
-	assertScoreBasedEmptyNodeMetric(t, "zero-pool", reclamationEmptyNodeStateOther, 0, true)
-	assertScoreBasedEmptyNodeMetric(t, "unconfigured-pool", reclamationEmptyNodeStateOther, 0, false)
+	candidates, err := reclamation.candidates(ctx)
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	require.Equal(t, "ready-standby", candidates[0].Node.Name)
+	require.Equal(t, 3, countingClient.podListCalls, "the ready standby and retained out-of-scope marker need candidate reads; only the ready node gets an occupancy check, while the unmarked node is skipped")
+	assertReclamationStandbyNodeMetric(t, pool.Name, 2, true)
+	assertReclamationStandbyNodeMetric(t, disabledPool.Name, 1, true)
+	assertReclamationStandbyNodeMetric(t, zeroPool.Name, 0, true)
+	assertReclamationStandbyNodeMetric(t, "missing-pool", 0, false)
+
+	updateReclamationStandbyNodeMetrics(map[string]int{"new-pool": 2})
+	assertReclamationStandbyNodeMetric(t, pool.Name, 0, false)
+	assertReclamationStandbyNodeMetric(t, disabledPool.Name, 0, false)
+	assertReclamationStandbyNodeMetric(t, "new-pool", 2, true)
 }
 
-func TestReclamationEmptyNodeMetricsKeepLastCompleteScanAndRemoveOutOfScopePools(t *testing.T) {
-	resetScoreBasedEmptyNodeMetricForTest()
-	defer resetScoreBasedEmptyNodeMetricForTest()
-
-	ctx := context.Background()
-	clock := clocktesting.NewFakeClock(time.Date(2026, time.September, 25, 12, 0, 0, 0, time.UTC))
-	oldPool := reclamationTestPool("old-pool")
-	oldClaim, oldNode := reclamationTestNode("old-pool", "old-node", false, false, false)
-	kubeClient := reclamationTestClient(oldPool, oldClaim, oldNode)
-	cluster := state.NewCluster(clock, kubeClient, nil)
-	cluster.UpdateNodeClaim(oldClaim)
-	if err := cluster.UpdateNode(ctx, oldNode); err != nil {
-		t.Fatal(err)
-	}
-	consolidator := MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
-	reclamation := NewReclamation(consolidator)
-	reclamation.refreshReclamationInventory(ctx)
-	assertScoreBasedEmptyNodeMetric(t, "old-pool", reclamationEmptyNodeStateOther, 1, true)
-
-	newPool := reclamationTestPool("new-pool")
-	newClaim, newNode := reclamationTestNode("new-pool", "new-node", false, false, false)
-	if err := kubeClient.Delete(ctx, oldPool); err != nil {
-		t.Fatal(err)
-	}
-	if err := kubeClient.Create(ctx, newPool); err != nil {
-		t.Fatal(err)
-	}
-	if err := kubeClient.Create(ctx, newClaim); err != nil {
-		t.Fatal(err)
-	}
-	if err := kubeClient.Create(ctx, newNode); err != nil {
-		t.Fatal(err)
-	}
-	cluster.UpdateNodeClaim(newClaim)
-	if err := cluster.UpdateNode(ctx, newNode); err != nil {
-		t.Fatal(err)
-	}
-
-	reclamation.kubeClient = errorOnPodListClient{Client: kubeClient, err: errors.New("pod list failed")}
-	reclamation.refreshReclamationInventory(ctx)
-	assertScoreBasedEmptyNodeMetric(t, "old-pool", reclamationEmptyNodeStateOther, 1, true)
-	assertScoreBasedEmptyNodeMetric(t, "new-pool", reclamationEmptyNodeStateOther, 0, false)
-
-	reclamation.kubeClient = kubeClient
-	reclamation.refreshReclamationInventory(ctx)
-	assertScoreBasedEmptyNodeMetric(t, "old-pool", reclamationEmptyNodeStateOther, 0, false)
-	assertScoreBasedEmptyNodeMetric(t, "new-pool", reclamationEmptyNodeStateOther, 1, true)
-}
-
-type errorOnPodListClient struct {
+type countingPodListClient struct {
 	client.Client
-	err error
+	podListCalls int
 }
 
-func (c errorOnPodListClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+func (c *countingPodListClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
 	if _, ok := list.(*corev1.PodList); ok {
-		return c.err
+		c.podListCalls++
 	}
 	return c.Client.List(ctx, list, opts...)
 }
@@ -160,13 +120,13 @@ func reclamationPodNodeIndex(obj client.Object) []string {
 }
 
 func reclamationTestPool(name string) *v1.NodePool {
-	return &v1.NodePool{
+	return test.NodePool(v1.NodePool{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: map[string]string{v1.ScoreBasedConsolidationAnnotationKey: ""}},
 		Spec: v1.NodePoolSpec{Disruption: v1.Disruption{
 			ConsolidationPolicy: v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
 			ConsolidateAfter:    v1.MustParseNillableDuration("0s"),
 		}},
-	}
+	})
 }
 
 func reclamationTestNode(poolName, name string, standbyMarker, standbyTaint, deleting bool) (*v1.NodeClaim, *corev1.Node) {
@@ -207,42 +167,36 @@ func reclamationCandidate(pool *v1.NodePool, claim *v1.NodeClaim, node *corev1.N
 	return &Candidate{StateNode: stateNode, NodePool: pool}
 }
 
-func assertScoreBasedEmptyNodeMetric(t *testing.T, pool, state string, want float64, wantFound bool) {
+func assertReclamationStandbyNodeMetric(t *testing.T, pool string, want float64, wantFound bool) {
 	t.Helper()
 	metricFamilies, err := crmetrics.Registry.Gather()
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, family := range metricFamilies {
-		if family.GetName() != "karpenter_nodepools_empty_nodes" {
+		if family.GetName() != "karpenter_nodepools_standby_nodes" {
 			continue
 		}
 		for _, metric := range family.GetMetric() {
-			labels := map[string]string{}
-			for _, label := range metric.GetLabel() {
-				labels[label.GetName()] = label.GetValue()
-			}
-			if labels["nodepool"] == pool && labels["state"] == state {
+			if metric.GetLabel()[0].GetValue() == pool {
 				if !wantFound {
-					t.Fatalf("metric series for nodepool=%q state=%q unexpectedly exists", pool, state)
+					t.Fatalf("metric series for nodepool=%q unexpectedly exists", pool)
 				}
 				if got := metric.GetGauge().GetValue(); got != want {
-					t.Fatalf("metric value for nodepool=%q state=%q = %v, want %v", pool, state, got, want)
+					t.Fatalf("metric value for nodepool=%q = %v, want %v", pool, got, want)
 				}
 				return
 			}
 		}
 	}
 	if wantFound {
-		t.Fatalf("metric series for nodepool=%q state=%q was not found", pool, state)
+		t.Fatalf("metric series for nodepool=%q was not found", pool)
 	}
 }
 
-func resetScoreBasedEmptyNodeMetricForTest() {
-	reclamationEmptyNodeMetricState.Lock()
-	defer reclamationEmptyNodeMetricState.Unlock()
-	ReclamationEmptyNodes.Reset()
-	reclamationEmptyNodeMetricState.pools = map[string]struct{}{}
+func resetReclamationStandbyNodeMetricsForTest() {
+	reclamationStandbyNodeMetricStore.ReplaceAll(nil)
+	ReclamationStandbyNodes.Reset()
 }
 
 func TestStandbyLifecycleEnabledForReclamation(t *testing.T) {
@@ -542,27 +496,5 @@ func TestReclamationRejectsBufferReservedNode(t *testing.T) {
 	queue := newTestQueue(kubeClient, events.NewRecorder(&record.FakeRecorder{}), cluster, clk, nil)
 	if eligible, err := queue.reclamationCandidateBeforeDelete(ctx, candidate); err != nil || eligible {
 		t.Fatalf("reclamationCandidateBeforeDelete() = (%t, %v), want (false, nil) for buffer reservation", eligible, err)
-	}
-}
-
-func TestReclamationComputeCommandSucceedsWhenInventoryCollectionFails(t *testing.T) {
-	ctx := context.Background()
-	now := time.Date(2026, time.October, 10, 12, 0, 0, 0, time.UTC)
-	clock := clocktesting.NewFakeClock(now)
-	pool := reclamationTestPool("pool-a")
-	standbySince := now.Add(-30 * time.Second)
-	claim, node := reclamationTestNode("pool-a", "ready-a", true, true, false)
-	standby.SetNodeClaimStandby(claim, true, standbySince)
-	kubeClient := reclamationTestClient(pool, claim, node)
-	cluster := state.NewCluster(clock, kubeClient, nil)
-	cluster.UpdateNodeClaim(claim)
-	if err := cluster.UpdateNode(ctx, node); err != nil {
-		t.Fatal(err)
-	}
-	reclamation := NewReclamation(MakeConsolidation(clock, cluster, kubeClient, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil))
-	reclamation.kubeClient = errorOnPodListClient{Client: kubeClient, err: errors.New("pod list failed")}
-	cmd := reclamation.computeReclamationCommand(ctx, []*Candidate{reclamationCandidate(pool, claim, node)})
-	if cmd == nil || len(cmd.Candidates) != 1 {
-		t.Fatalf("computeReclamationCommand() = %v, want one selected candidate", cmd)
 	}
 }

@@ -198,7 +198,16 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		metrics.ReasonLabel:    strings.ToLower(string(disruption.Reason())),
 		ConsolidationTypeLabel: disruption.ConsolidationType(),
 	})()
-	candidates, nodePoolTotals, err := GetCandidatesWithTotals(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, disruption.ShouldDisrupt, disruption.Class(), c.queue, c.clusterCost)
+	var (
+		candidates     []*Candidate
+		nodePoolTotals map[string]NodePoolTotals
+		err            error
+	)
+	if reclamation, ok := disruption.(*Reclamation); ok {
+		candidates, err = reclamation.candidates(ctx)
+	} else {
+		candidates, nodePoolTotals, err = GetCandidatesWithTotals(ctx, c.cluster, c.kubeClient, c.recorder, c.clock, c.cloudProvider, disruption.ShouldDisrupt, disruption.Class(), c.queue, c.clusterCost)
+	}
 	if err != nil {
 		return false, fmt.Errorf("determining candidates, %w", err)
 	}
@@ -208,11 +217,10 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 
 	// If there are no candidates, move to the next disruption
 	if len(candidates) == 0 {
-		c.refreshEmptyReclamationInventory(ctx, disruption)
 		return false, nil
 	}
 	// Pass precomputed NodePool totals to consolidation methods for balanced scoring
-	if setter, ok := disruption.(NodePoolTotalsSetter); ok {
+	if setter, ok := disruption.(NodePoolTotalsSetter); ok && nodePoolTotals != nil {
 		setter.SetNodePoolTotals(nodePoolTotals)
 	}
 	disruptionBudgetMapping, err := c.budgetMappingForMethod(ctx, disruption)
