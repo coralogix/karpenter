@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 func TestReclamationExecutionSkipsBufferReservedCandidateInBatch(t *testing.T) {
@@ -44,6 +45,33 @@ func TestReclamationExecutionSkipsInvalidCandidateInBatch(t *testing.T) {
 	require.NoError(t, h.kubeClient.Create(h.ctx, workload))
 	require.NoError(t, h.queue.deleteCandidates(h.ctx, h.cmd))
 	require.Equal(t, 1, h.tracker.deleteCallCount())
+}
+
+func TestReclamationExecutionSkipsCandidateWhenCachedDelayIncreases(t *testing.T) {
+	h := newReclamationExecutionHarness(t, 1)
+	candidate := h.candidates[0]
+	candidate.NodePool.Annotations[v1.ReclamationStandbyDelayAnnotationKey] = "15s"
+
+	pool := &v1.NodePool{}
+	require.NoError(t, h.kubeClient.Get(h.ctx, client.ObjectKeyFromObject(candidate.NodePool), pool))
+	pool.Annotations[v1.ReclamationStandbyDelayAnnotationKey] = "15s"
+	require.NoError(t, h.kubeClient.Update(h.ctx, pool))
+
+	claim := &v1.NodeClaim{}
+	require.NoError(t, h.kubeClient.Get(h.ctx, client.ObjectKeyFromObject(candidate.NodeClaim), claim))
+	standby.SetNodeClaimStandby(claim, true, h.queue.clock.Now().Add(-30*time.Second))
+	require.NoError(t, h.kubeClient.Update(h.ctx, claim))
+
+	pool.Annotations[v1.ReclamationStandbyDelayAnnotationKey] = "1h"
+	require.NoError(t, h.kubeClient.Update(h.ctx, pool))
+
+	_, err := h.queue.Reconcile(h.ctx, candidate.NodeClaim)
+	require.NoError(t, err)
+	require.Zero(t, h.tracker.deleteCallCount(), "candidate should remain standby for 30s under the current 1h delay")
+	require.False(t, h.queue.HasAny(candidate.ProviderID()), "skipping the candidate should complete its queue command")
+	storedClaim := &v1.NodeClaim{}
+	require.NoError(t, h.kubeClient.Get(h.ctx, client.ObjectKeyFromObject(candidate.NodeClaim), storedClaim))
+	require.True(t, standby.IsNodeClaimStandby(storedClaim), "claim should remain in standby")
 }
 
 func TestReclamationExecutionBoundedConcurrency(t *testing.T) {

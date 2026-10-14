@@ -76,13 +76,19 @@ Standby ──provisioning or compaction activate──► Active (schedulable)
 - **Standby marking** applies the same standby persistence to nodes that are **already** empty, without eviction.
 - **Reclamation** selects **all** standby candidates past reclamation delay in each pool on a pass (stable sort by node name within the pool), using the same cached candidate admission as other disruption methods. At execution, each candidate is checked independently (identity, standby/activation, nomination, occupancy) and deleted with a UID/resourceVersion precondition so activation and deletion cannot both succeed. Candidates that become ineligible after selection are skipped without blocking unrelated deletions in the same batch.
 
+A non-DaemonSet workload that tolerates `karpenter.sh/disruption:NoSchedule` can still be admitted as a compaction workload and its node can be selected as a source. During evacuation, Karpenter's `IsEvictable` check exempts that pod, while the evacuation wait still counts it as occupying. This is an accepted limitation: evacuation waits for the pod to leave on its own, and may reach the queue timeout and roll back with the source instance retained. Other workloads may already have been evicted, and replacements or activated standby destinations may remain. Upstream consolidation can ignore these pods during drain because it ultimately terminates the source instance.
+
+The eviction exemption and the strict physical-emptiness check are intentional. Compaction does not force-evict a workload that tolerates the disruption taint, and a node is not marked standby or reclaimed until its occupying workloads have actually left. This limitation does not reject the source from compaction admission.
+
 Reclamation delay: standby time must be **strictly greater than** the configured delay. Legacy marker value `true` skips reclamation delay. Nodes with an in-progress activation marker are not reclaimable.
 
 ## Consistency and API reads
 
 Disruption planning (candidate filtering, standby counts, score-based compaction revalidation, and NodePool policy including pacing) uses the controller **cache** (`kubeClient`), matching upstream’s consistency model. Reclamation does not rebuild consolidation candidates between selection and deletion. Configuration and deleted NodePools take effect when the cache observes them; there is no fallback to uncached reads when the cache is stale or returns `NotFound`.
 
-**Live reads** remain at execution boundaries: standby coordinator transitions (including occupancy before completing empty marking), evacuation pod polling, and the final reclamation delete safety checks (Node, NodeClaim, and pod occupancy immediately before conditional delete).
+At final reclamation validation, one cached NodePool read checks both whether the standby lifecycle is still enabled and whether the current delay has elapsed. A delay increase already visible to the cache therefore skips a candidate selected under the older delay; it is reconsidered by later candidate discovery. This uses the existing cache read and does not rebuild candidates or make NodePool policy transactional with deletion. The transient tradeoff is cache convergence plus the short interval between validation and delete: the queue honors changes it has observed, while a later policy change can still race the conditional NodeClaim delete.
+
+**Live reads** remain at execution boundaries: standby coordinator transitions (including occupancy before completing empty marking), evacuation pod polling, and the final reclamation delete safety checks (Node, NodeClaim, and pod occupancy immediately before conditional delete). UID/resourceVersion preconditions still protect NodeClaim identity and concurrent claim updates; NodePool policy is checked through the cache.
 
 ## “Empty” and occupancy
 

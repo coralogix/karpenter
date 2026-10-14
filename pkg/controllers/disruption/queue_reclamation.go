@@ -63,13 +63,10 @@ func (q *Queue) reclamationCandidateBeforeDelete(ctx context.Context, candidate 
 	if !standby.IsNodeClaimStandby(nodeClaim) {
 		return false, nil
 	}
-	if !standbyReclamationDelayElapsed(candidate.NodePool, nodeClaim, q.clock.Now()) {
-		return false, nil
-	}
 	if nodeClaim.Labels[v1.NodePoolLabelKey] != candidate.NodePool.Name {
 		return false, nil
 	}
-	if eligible, err := q.reclamationNodePoolStillManaged(ctx, candidate.NodePool.Name); err != nil || !eligible {
+	if eligible, err := q.reclamationNodePoolAllowsDelete(ctx, candidate.NodePool.Name, nodeClaim); err != nil || !eligible {
 		return false, err
 	}
 	if eligible, err := q.reclamationNodeStillEmpty(ctx, candidate); err != nil || !eligible {
@@ -111,7 +108,7 @@ func (q *Queue) reclamationNodeStillEmpty(ctx context.Context, candidate *Candid
 	return true, nil
 }
 
-func (q *Queue) reclamationNodePoolStillManaged(ctx context.Context, nodePoolName string) (bool, error) {
+func (q *Queue) reclamationNodePoolAllowsDelete(ctx context.Context, nodePoolName string, nodeClaim *v1.NodeClaim) (bool, error) {
 	nodePool := &v1.NodePool{}
 	if err := q.kubeClient.Get(ctx, types.NamespacedName{Name: nodePoolName}, nodePool); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -119,7 +116,7 @@ func (q *Queue) reclamationNodePoolStillManaged(ctx context.Context, nodePoolNam
 		}
 		return false, fmt.Errorf("getting reclamation NodePool, %w", err)
 	}
-	return standbyLifecycleEnabled(nodePool), nil
+	return standbyLifecycleEnabled(nodePool) && standbyReclamationDelayElapsed(nodePool, nodeClaim, q.clock.Now()), nil
 }
 
 func (q *Queue) reportReclamationCandidateDeleted(candidate *Candidate) {
