@@ -23,8 +23,6 @@ import (
 	utilstandby "sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-// StandbyEntryComplete reports whether persistent standby entry finished: claim marker,
-// node taint, and no activation in progress.
 func StandbyEntryComplete(node *corev1.Node, nodeClaim *v1.NodeClaim) bool {
 	if node == nil || nodeClaim == nil {
 		return false
@@ -38,7 +36,6 @@ func StandbyEntryComplete(node *corev1.Node, nodeClaim *v1.NodeClaim) bool {
 	return utilstandby.HasNodeTaint(node)
 }
 
-// StandbyEntrySucceeded reports whether EnterStandby established or confirmed complete entry.
 func StandbyEntrySucceeded(result TransitionResult) bool {
 	switch result.Outcome {
 	case OutcomeCompleted:

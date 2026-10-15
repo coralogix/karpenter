@@ -70,12 +70,10 @@ func TestCancelWaitsForInFlightEviction(t *testing.T) {
 		close(cancelDone)
 	}()
 
-	// Cancel removes membership before waiting for the in-flight API request. Seeing
-	// the public membership change establishes that Cancel has removed the pod.
+	// Observe Cancel reaching its wait before checking that it remains blocked.
 	require.Eventually(t, func() bool { return !queue.Has(pod) }, 5*time.Second, time.Millisecond,
 		"cancellation removes queue membership")
 
-	// The eviction is still gated, so cancellation must not have returned yet.
 	select {
 	case <-cancelDone:
 		t.Fatal("Cancel returned while the eviction request was still in flight")

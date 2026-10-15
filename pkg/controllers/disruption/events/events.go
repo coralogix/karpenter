@@ -67,7 +67,6 @@ func Terminating(node *corev1.Node, nodeClaim *v1.NodeClaim, reason string) []ev
 	}
 }
 
-// StandbyMarked reports that an already-empty Node was retained as standby capacity.
 func StandbyMarked(node *corev1.Node, nodeClaim *v1.NodeClaim) []events.Event {
 	return []events.Event{
 		{

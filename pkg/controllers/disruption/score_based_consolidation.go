@@ -117,12 +117,8 @@ func (s *ScoreBasedConsolidation) shouldCompact(_ context.Context, cn *Candidate
 	})
 }
 
-// compactionConsolidationMetadataEligible duplicates the static-pool and label checks at the start
-// of consolidation.ShouldDisrupt in consolidation.go so score-based compaction does not call into
-// that upstream type. The caller enforces consolidation policy. It omits consolidateAfter
-// (including Never), empty-node exclusion (standby/reclamation own empties), and
-// ConditionTypeConsolidatable (score-based pools ignore consolidateAfter timing in the nodeclaim
-// disruption controller).
+// Compaction shares upstream's metadata checks but ignores consolidateAfter and the
+// Consolidatable condition. Standby marking and reclamation handle empty nodes.
 func (s *ScoreBasedConsolidation) compactionConsolidationMetadataEligible(cn *Candidate) bool {
 	if cn.OwnedByStaticNodePool() {
 		return false

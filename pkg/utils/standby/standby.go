@@ -44,7 +44,6 @@ const (
 	ActivationSourceRecovery     ActivationSource = "recovery"
 )
 
-// NodeTaint returns the taint that prevents ordinary pods from scheduling onto standby capacity.
 func NodeTaint() corev1.Taint {
 	return corev1.Taint{Key: NodeTaintKey, Value: NodeTaintValue, Effect: corev1.TaintEffectNoSchedule}
 }

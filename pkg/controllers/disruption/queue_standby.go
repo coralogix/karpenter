@@ -36,8 +36,7 @@ import (
 )
 
 func (q *Queue) startStandbyCommand(ctx context.Context, cmd *Command) error {
-	// The singleton controller cleans stale state before dispatch, and candidate discovery excludes registered commands.
-	// Standby marking emits one synchronous command per pass; the coordinator rechecks live state during each transition.
+	// Standby marking runs synchronously; the coordinator rechecks live state for each transition.
 	var transitioned []*Candidate
 	var errs []error
 	for _, candidate := range cmd.Candidates {

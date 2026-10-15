@@ -25,7 +25,6 @@ import (
 
 const StandbyMarkingType = "standby-marking"
 
-// StandbyMarking marks empty active nodes in score-based NodePools as standby capacity.
 type StandbyMarking struct {
 	consolidation
 }

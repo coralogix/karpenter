@@ -57,13 +57,11 @@ func (c *Coordinator) Activate(ctx context.Context, source utilstandby.Activatio
 	return result, nil
 }
 
-// EnterStandbyOptions configures empty marking versus post-evacuation persistence.
 type EnterStandbyOptions struct {
 	// BarrierTaintPresent skips applying the temporary disruption scheduling barrier.
 	BarrierTaintPresent bool
 	Since               time.Time
-	// Eligibility receives live Node and NodeClaim objects that the coordinator has already
-	// verified match EnterStandbyRequest (UIDs and provider IDs) before invoking the callback.
+	// Eligibility receives live objects verified against the request's UIDs and provider ID.
 	Eligibility func(context.Context, *corev1.Node, *v1.NodeClaim) (bool, error)
 	// PostBarrierEligibility is evaluated after the barrier is applied during empty marking,
 	// with the same input guarantee as Eligibility.

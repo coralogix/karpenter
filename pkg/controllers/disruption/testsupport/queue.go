@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package testsupport provides helpers for disruption controller tests.
 package testsupport
 
 import (
@@ -29,7 +28,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/standby"
 )
 
-// NewTestQueue builds a disruption queue wired with a test standby coordinator.
 func NewTestQueue(kubeClient client.Client, recorder events.Recorder, cluster *state.Cluster, clk clock.Clock, provisioner *provisioning.Provisioner, evictionQueue *terminator.Queue) *disruption.Queue {
 	coordinator := standby.NewCoordinator(kubeClient, kubeClient)
 	return disruption.NewQueue(kubeClient, kubeClient, recorder, cluster, clk, provisioner, coordinator, evictionQueue)

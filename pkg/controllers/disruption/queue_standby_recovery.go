@@ -36,7 +36,6 @@ func (q *Queue) cleanupStaleDisruptionState(ctx context.Context) error {
 	if err := q.repairStandbyNodes(ctx); err != nil {
 		log.FromContext(ctx).Error(err, "repairing standby nodes")
 	}
-	// Clear stale karpenter.sh/disruption taints from nodes that are not in the orchestration queue.
 	outdatedNodes := lo.Reject(q.cluster.DeepCopyNodes(), func(s *state.StateNode, _ int) bool {
 		return q.HasAny(s.ProviderID()) || s.MarkedForDeletion() || standby.IsNodeClaimActivating(s.NodeClaim)
 	})
