@@ -327,6 +327,10 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 		"command", cmd.String(),
 	}, cmd.LogValues()...)...).Info("disrupting node(s)")
 
+	if cmd.Method != nil && cmd.ConsolidationType() == StandbyMarkingConsolidationType {
+		return q.executeStandbyMarking(ctx, cmd)
+	}
+
 	// Cordon the old nodes before we launch the replacements to prevent new pods from scheduling to the old nodes
 	markedCandidates, markDisruptedErr := q.markDisrupted(ctx, cmd)
 	// If we get a failure marking some nodes as disrupted, if we are launching replacements, we shouldn't continue
@@ -373,6 +377,23 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	q.Unlock()
 
 	// An action is only performed and pods/nodes are only disrupted after a successful add to the queue
+	q.recordCommandPerformed(cmd)
+	return nil
+}
+
+func (q *Queue) executeStandbyMarking(ctx context.Context, cmd *Command) error {
+	errs := make([]error, len(cmd.Candidates))
+	workqueue.ParallelizeUntil(ctx, len(cmd.Candidates), len(cmd.Candidates), func(i int) {
+		errs[i] = markNodeStandby(ctx, q.kubeClient, q.clock, cmd.Candidates[i])
+	})
+	if err := multierr.Combine(errs...); err != nil {
+		return serrors.Wrap(fmt.Errorf("marking standby, %w", err), "command-id", cmd.ID)
+	}
+	q.recordCommandPerformed(cmd)
+	return nil
+}
+
+func (q *Queue) recordCommandPerformed(cmd *Command) {
 	nodePools := lo.Uniq(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string {
 		return c.NodePool.Name
 	}))
@@ -389,7 +410,6 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 		metrics.ReasonLabel:    strings.ToLower(string(cmd.Reason())),
 		ConsolidationTypeLabel: cmd.ConsolidationType(),
 	})
-	return nil
 }
 
 // HasAny checks to see if the candidate is part of an currently executing command.

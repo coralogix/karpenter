@@ -125,6 +125,17 @@ func NodePoolBlockedForDisruptionReason(nodePool *v1.NodePool, reason v1.Disrupt
 	}
 }
 
+func InvalidReclamationDelay(nodePool *v1.NodePool, raw string, fallback time.Duration) events.Event {
+	return events.Event{
+		InvolvedObject: nodePool,
+		Type:           corev1.EventTypeWarning,
+		Reason:         events.InvalidReclamationDelay,
+		Message:        fmt.Sprintf("Could not parse %q as a Go duration for annotation %q; using %s", raw, v1.ReclamationDelayAnnotationKey, fallback),
+		DedupeValues:   []string{string(nodePool.UID), raw},
+		DedupeTimeout:  time.Minute * 15,
+	}
+}
+
 func NodePoolBlocked(nodePool *v1.NodePool) events.Event {
 	return events.Event{
 		InvolvedObject: nodePool,
