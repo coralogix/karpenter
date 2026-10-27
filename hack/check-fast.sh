@@ -1,20 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Ginkgo suite drivers in this repo (func Test… that calls RunSpecs). --focus runs only these unless --run is set.
+ginkgo_suite_run='^(TestAPIs|TestScheduling|TestResources|TestMetrics|TestOperator|TestOptions|TestAtomic|TestCapacityBuffer|TestCloudProvider|TestDynamicResources|TestNodeOverlay|TestReconciles|TestRecorder|TestVirtualPods)$'
+
 usage() {
     cat <<'EOF'
-Usage: hack/check-fast.sh [--run REGEX] [--focus REGEX] ./package [./package ...]
+Usage: hack/check-fast.sh [--run REGEX] [--focus REGEX] [--full] ./package
 
-Checks formatting, compiles the selected packages and tests, runs Go's default
-test vet checks, and executes only the selected tests. Uses -mod=readonly, no tidy.
-Requires a non-empty test filter and explicit local packages (no ./... patterns).
+Compiles the package and its tests, runs Go's default test vet checks, and
+executes only the selected tests. Does not format or lint; use hack/lint-and-format.sh
+separately. Uses -mod=readonly, no tidy.
+Requires exactly one explicit package directory (no ./... patterns).
+
+--run and --focus need a non-empty test filter. --full runs every test in the
+package (no filter), with the same envtest checks.
 
 Examples:
   hack/check-fast.sh --run '^TestDisruptionPacing' ./pkg/controllers/disruption
   hack/check-fast.sh --focus 'Shared disruption pacing' ./pkg/controllers/disruption
+  hack/check-fast.sh --full ./pkg/controllers/disruption
 
 --run selects Go tests, including the parent test when selecting subtests.
---focus selects Ginkgo specs; without --run, ordinary Go tests also run.
+--focus selects Ginkgo specs inside the suite test for this package. Without
+--run, only the Ginkgo suite driver runs (not other Test* functions in the package).
+Use --run to target unit tests or a non-default suite name explicitly.
+
+Focused runs use a 3m test timeout; --full uses 20m. Override with CHECK_FAST_TIMEOUT.
+Complete test output is retained in a temporary log whose path is printed.
+Progress is printed every 15 seconds while tests run.
+
 Envtest defaults to installed Kubernetes 1.36.2 assets. Install missing assets
 separately with: go tool -modfile=go.tools.mod setup-envtest use -p path 1.36.2
 EOF
@@ -23,6 +38,7 @@ EOF
 cd "$(dirname "$0")/.."
 run=''
 focus=''
+full=false
 packages=()
 while (($#)); do
     case "$1" in
@@ -34,6 +50,10 @@ while (($#)); do
             fi
             if [[ "$option" == --run ]]; then run="$2"; else focus="$2"; fi
             shift 2
+            ;;
+        --full)
+            full=true
+            shift
             ;;
         --help|-h) usage; exit 0 ;;
         ./*)
@@ -47,8 +67,20 @@ while (($#)); do
         *) usage >&2; exit 2 ;;
     esac
 done
-if ((${#packages[@]} == 0)) || [[ -z "$run$focus" ]]; then
+if ((${#packages[@]} == 0)); then
     usage >&2
+    exit 2
+fi
+if ((${#packages[@]} > 1)); then
+    echo 'Pass exactly one package directory per invocation (envtest starts once per package)' >&2
+    exit 2
+fi
+if [[ -z "$run$focus" ]] && ! $full; then
+    usage >&2
+    exit 2
+fi
+if $full && [[ -n "$run$focus" ]]; then
+    echo '--full cannot be combined with --run or --focus' >&2
     exit 2
 fi
 
@@ -73,44 +105,80 @@ for asset in etcd kube-apiserver kubectl; do
     fi
 done
 
-echo 'Checking package formatting'
-package_dirs="$(go list -mod=readonly -f '{{.Dir}}' "${packages[@]}")"
-shopt -s nullglob
-while IFS= read -r directory; do
-    files=("$directory"/*.go)
-    if ((${#files[@]})); then
-        unformatted="$(gofmt -l "${files[@]}")"
-        if [[ -n "$unformatted" ]]; then
-            printf 'Run gofmt on:\n%s\n' "$unformatted" >&2
-            exit 1
-        fi
-    fi
-done <<< "$package_dirs"
-git diff --check
+pkg="${packages[0]}"
 
-args=(-mod=readonly -count=1 -timeout=20m -v)
-if [[ -n "$run" ]]; then args+=(-run "$run"); fi
-if [[ -n "$focus" ]]; then args+=(-ginkgo.focus="$focus" -ginkgo.fail-on-empty -ginkgo.no-color); fi
-echo 'Running focused tests (including compilation and default vet checks)'
-test_output="$(mktemp)"
-trap 'rm -f "$test_output"' EXIT
-if ! go test "${packages[@]}" "${args[@]}" > "$test_output" 2>&1; then
-    cat "$test_output"
-    exit 1
+if $full; then
+    test_timeout="${CHECK_FAST_TIMEOUT:-20m}"
+else
+    test_timeout="${CHECK_FAST_TIMEOUT:-3m}"
 fi
+
+args=(-mod=readonly -count=1 -timeout="$test_timeout" -v)
+if [[ -n "$run" ]]; then
+    args+=(-run "$run")
+elif [[ -n "$focus" ]]; then
+    args+=(-run "$ginkgo_suite_run")
+fi
+if [[ -n "$focus" ]]; then args+=(-ginkgo.focus="$focus" -ginkgo.fail-on-empty -ginkgo.no-color); fi
+
+test_label="$pkg"
+if [[ -n "$focus" ]]; then
+    test_label+=" (ginkgo.focus: $focus)"
+elif [[ -n "$run" ]]; then
+    test_label+=" (run: $run)"
+else
+    test_label+=" (full package tests)"
+fi
+echo "Running tests in $test_label (timeout: $test_timeout)"
+test_output="$(mktemp)"
+echo "check-fast: full log: $test_output"
+test_start=$SECONDS
+(
+    while sleep 15 >/dev/null 2>&1; do
+        echo "check-fast: $pkg — still running ($((SECONDS - test_start))s)"
+    done
+) &
+heartbeat_pid=$!
+trap 'kill "$heartbeat_pid" 2>/dev/null || true' EXIT
+
+test_status=0
+go test "$pkg" "${args[@]}" > "$test_output" 2>&1 || test_status=$?
+kill "$heartbeat_pid" 2>/dev/null || true
+wait "$heartbeat_pid" 2>/dev/null || true
+trap - EXIT
+
+if ((test_status != 0)); then
+    cat "$test_output"
+    exit "$test_status"
+fi
+test_elapsed=$((SECONDS - test_start))
+parse_output="$(mktemp)"
+trap 'rm -f "$parse_output"' EXIT
+sed $'s/\033\\[[0-9;]*m//g' "$test_output" > "$parse_output"
+
 # Detect a filter that ran nothing without paying for a second Go invocation.
-if ! grep -q '^=== RUN ' "$test_output"; then
+if ! grep -q '^=== RUN ' "$parse_output"; then
+    if $full && grep -Eq '^\?[[:space:]]+[^[:space:]]+[[:space:]]+\[no test files\]$' "$parse_output"; then
+        echo "check-fast: $pkg — compiled; no test files (${test_elapsed}s)"
+        exit 0
+    fi
     cat "$test_output"
     echo 'No tests ran; correct the test filter' >&2
     exit 1
 fi
-if [[ -n "$focus" ]] && ! grep -Eq '^Ran [1-9][0-9]* of [0-9]+ Specs' "$test_output"; then
+if [[ -n "$focus" ]] && ! grep -Eq '^Ran [1-9][0-9]* of [0-9]+ Specs' "$parse_output"; then
     cat "$test_output"
     echo 'No Ginkgo specs ran; ensure --run selects the suite entry point' >&2
     exit 1
+fi
+ginkgo_summary="$(grep -E '^Ran [0-9]+ of [0-9]+ Specs' "$parse_output" | tail -1 || true)"
+if [[ -n "$ginkgo_summary" ]]; then
+    echo "check-fast: $pkg — $ginkgo_summary (${test_elapsed}s)"
+else
+    echo "check-fast: $pkg — tests finished (${test_elapsed}s)"
 fi
 awk '
     /^=== RUN / { if ($3 ~ /\//) subtests++; else tests++ }
     /^(ok[[:space:]]|Ran |SUCCESS!)/ { print }
     END { printf "Go tests started: %d (+ %d subtests)\n", tests, subtests }
-' "$test_output"
+' "$parse_output"

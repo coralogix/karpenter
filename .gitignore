@@ -25,4 +25,13 @@ profiles/
 *.swp
 *.swo
 *~
+
+# Local agentic coding configs
 .cursor
+docs/agents/
+AGENTS.md
+AGENTS.override.md
+.scratch/
+.agents
+skills-lock.json
+notes.md
