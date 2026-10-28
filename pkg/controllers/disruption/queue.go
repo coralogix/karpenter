@@ -57,6 +57,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	utilscontroller "sigs.k8s.io/karpenter/pkg/utils/controller"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
+	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 const (
@@ -312,8 +313,9 @@ func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) e
 
 // StartCommand will do the following:
 // 1. Taint candidate nodes
-// 2. Spin up replacement nodes
-// 3. Add Command to the queue to wait to delete the candidates.
+// 2. Reactivate standby destination nodes
+// 3. Spin up replacement nodes
+// 4. Add Command to the queue to wait to delete the candidates.
 func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// First check if we can add the command.
 	providerIDs := lo.Map(cmd.Candidates, func(c *Candidate, _ int) string {
@@ -341,6 +343,11 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 
 	// Update the command to only consider the successfully MarkDisrupted candidates
 	cmd.Candidates = markedCandidates
+
+	// Pods evicted from the candidates can only bind to standby destinations after standby is cleared.
+	if err := q.provisioner.ReactivateStandby(ctx, cmd.Results); err != nil {
+		return serrors.Wrap(fmt.Errorf("reactivating standby destinations, %w", err), "command-id", cmd.ID)
+	}
 
 	if err := q.createReplacementNodeClaims(ctx, cmd); err != nil {
 		// If we failed to launch the replacement, don't disrupt.  If this is some permanent failure,
@@ -384,7 +391,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 func (q *Queue) executeStandbyMarking(ctx context.Context, cmd *Command) error {
 	errs := make([]error, len(cmd.Candidates))
 	workqueue.ParallelizeUntil(ctx, len(cmd.Candidates), len(cmd.Candidates), func(i int) {
-		errs[i] = markNodeStandby(ctx, q.kubeClient, q.clock, cmd.Candidates[i])
+		errs[i] = standby.Mark(ctx, q.kubeClient, cmd.Candidates[i].Node, cmd.Candidates[i].NodeClaim, q.clock.Now())
 	})
 	if err := multierr.Combine(errs...); err != nil {
 		return serrors.Wrap(fmt.Errorf("marking standby, %w", err), "command-id", cmd.ID)

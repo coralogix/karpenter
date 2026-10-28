@@ -200,7 +200,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	if err != nil {
 		return reconciler.Result{}, fmt.Errorf("building node pool map for standby repair, %w", err)
 	}
-	if err := RepairStandbyState(ctx, c.kubeClient, c.cluster, c.recorder, c.clock, nodePoolMap); err != nil {
+	if err := repairStandbyState(ctx, c.kubeClient, c.cluster, c.recorder, c.clock, nodePoolMap); err != nil {
 		if errors.IsConflict(err) {
 			return reconciler.Result{Requeue: true}, nil
 		}

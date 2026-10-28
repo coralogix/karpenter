@@ -21,6 +21,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 const StandbyMarkingConsolidationType = "standby-marking"
@@ -46,7 +47,7 @@ func (s *StandbyMarking) ShouldDisrupt(_ context.Context, c *Candidate) bool {
 	if !candidateEmptyForStandbyWork(s.cluster, c) {
 		return false
 	}
-	if nodeHasStandbyTaint(c.Node) {
+	if standby.HasStandbyTaint(c.Node) {
 		return false
 	}
 	return true

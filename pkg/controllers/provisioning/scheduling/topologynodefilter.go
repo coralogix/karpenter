@@ -21,6 +21,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 // TopologyNodeFilter is used to determine if a given actual node or scheduling node matches the pod's node selectors
@@ -72,7 +73,7 @@ func (t TopologyNodeFilter) Matches(taints []corev1.Taint, requirements scheduli
 	}
 	matchesTaints := true
 	if t.TaintPolicy == corev1.NodeInclusionPolicyHonor {
-		if err := scheduling.Taints(taints).Tolerates(t.Tolerations); err != nil {
+		if err := scheduling.Taints(standby.WithoutStandbyTaint(taints)).Tolerates(t.Tolerations); err != nil {
 			matchesTaints = false
 		}
 	}

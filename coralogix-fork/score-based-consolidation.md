@@ -30,7 +30,7 @@ On opted-in dynamic NodePools, empty nodes are marked **standby** instead of bei
 
 ### Standby marks (set by Karpenter)
 
-When a node enters standby, Karpenter writes the marks below. **Do not set or edit these in manifests**; they are observability and control state on live Nodes and NodeClaims. Provisioning, evacuation (later steps), and disruption repair clear them when the node leaves standby.
+When a node enters standby, Karpenter writes the marks below. **Do not set or edit these in manifests**; they are observability and control state on live Nodes and NodeClaims. Reactivation and disruption repair clear them when the node leaves standby.
 
 | Mark | Object | Set by | Meaning |
 |------|--------|--------|---------|
@@ -38,6 +38,14 @@ When a node enters standby, Karpenter writes the marks below. **Do not set or ed
 | `karpenter.coralogix.net/standby` | NodeClaim (annotation) | Disruption | Standby start time in **RFC3339Nano UTC** (for example `2026-10-27T11:00:00.123456789Z`). Reclamation compares this timestamp to the pool’s `reclamation-delay`. The value survives a Karpenter restart so time already spent in standby still counts. If the taint is present but the annotation is missing or not an RFC3339Nano timestamp, disruption backfills the timestamp and reclamation does not delete the node on that pass. |
 
 To inspect standby state: `kubectl describe node <name>` for the taint, and `kubectl get nodeclaim <name> -o jsonpath='{.metadata.annotations.karpenter\.coralogix\.net/standby}'` for the timestamp.
+
+### Reactivation
+
+Provisioning and disruption treat a standby node as existing capacity. When choosing where pods fit, the scheduling simulation ignores the standby taint and keeps every other taint, resource, affinity, and topology constraint. When Karpenter acts on a result that places pods on a standby node, it clears the taint and the timestamp so the pods can bind there, and does not launch a new node for them. This applies to provisioning, capacity-buffer pods, and every disruption method that moves pods (consolidation and drift included). A simulation that is not acted on leaves standby unchanged.
+
+- Disruption clears standby on its destinations before it taints the source nodes. If clearing fails, the command does not start and a later pass retries.
+- Nothing is reserved: once standby is cleared, any pod may bind. A node reactivated for a real pod is nominated for the usual nomination window, so standby marking does not hide it again before the pods arrive. Capacity-buffer pods do not nominate the node; buffer accounting keeps it from being marked standby again.
+- A restart during the nomination window may mark the node standby again; a later scheduling pass reactivates it.
 
 Non-empty score-based consolidation still deletes its source node. `WhenEmpty` score-based pools only mark/reclaim empty nodes (no evacuation of nodes that still have pods).
 
