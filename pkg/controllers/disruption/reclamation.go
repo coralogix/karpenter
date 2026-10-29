@@ -23,7 +23,6 @@ import (
 	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
@@ -91,14 +90,5 @@ func candidateReadyForReclamation(cluster *state.Cluster, recorder events.Record
 
 // reclamationDelay returns how long a node must stay in standby before reclamation may delete it.
 func reclamationDelay(np *v1.NodePool, recorder events.Recorder) time.Duration {
-	raw, ok := np.Annotations[v1.ReclamationDelayAnnotationKey]
-	if !ok || raw == "" {
-		return defaultReclamationDelay
-	}
-	delay, err := time.ParseDuration(raw)
-	if err != nil {
-		recorder.Publish(disruptionevents.InvalidReclamationDelay(np, raw, defaultReclamationDelay))
-		return defaultReclamationDelay
-	}
-	return max(delay, 0)
+	return readDurationAnnotation(np, recorder, v1.ReclamationDelayAnnotationKey, defaultReclamationDelay, events.InvalidReclamationDelay)
 }

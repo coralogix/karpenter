@@ -22,8 +22,10 @@ spec:
 | Annotation | Meaning |
 |------------|---------|
 | `karpenter.coralogix.net/score-based-consolidation` | Opt the NodePool into score-based consolidation (presence of the key is sufficient; value is ignored) |
-| `karpenter.coralogix.net/reclamation-delay` | Go duration a node must stay in standby before reclamation may delete it. Absent or invalid values default to **15s**. `0s` or negative values mean no minimum age and no mandatory extra pass. |
-| `karpenter.coralogix.net/evacuation-timeout` | Go duration an evacuation may run, counted from when the command starts (including any wait for a replacement), before it is abandoned. Absent values default to **5m**. Invalid, `0s`, or negative values also mean 5m and raise an event on the NodePool. |
+| `karpenter.coralogix.net/reclamation-delay` | Go duration a node must stay in standby before reclamation may delete it. Absent or invalid values default to **15s**. `0s` means no minimum age and no mandatory extra pass. Empty, malformed, or negative values raise an event on the NodePool. |
+| `karpenter.coralogix.net/evacuation-timeout` | Go duration an evacuation may run, counted from when the command starts (including any wait for a replacement), before it is abandoned. Absent or invalid values default to **5m**. `0s` means an immediate timeout. Empty, malformed, or negative values raise an event on the NodePool. |
+
+Both duration annotations accept zero literally and use their defaults for empty, malformed, or negative values. Choose a positive evacuation timeout to allow draining; `0s` causes every evacuation to be abandoned immediately.
 
 ## Standby and reclamation
 
@@ -36,7 +38,7 @@ When a node enters standby, Karpenter writes the marks below. **Do not set or ed
 | Mark | Object | Set by | Meaning |
 |------|--------|--------|---------|
 | `karpenter.coralogix.net/standby:NoSchedule` | Node (taint) | Disruption | Ordinary pods cannot bind while the node is standby. |
-| `karpenter.coralogix.net/standby` | Node (annotation) | Disruption | Standby start time in **RFC3339Nano UTC** (for example `2026-10-27T11:00:00.123456789Z`). Reclamation compares this timestamp to the pool’s `reclamation-delay`. The value survives a Karpenter restart so time already spent in standby still counts. If the taint is present but the annotation is missing or not an RFC3339Nano timestamp, disruption backfills the timestamp with now. A positive delay starts from that timestamp. With zero or negative delay, same-pass reclamation is permitted if the timestamp is visible in the cache, but is not guaranteed. |
+| `karpenter.coralogix.net/standby` | Node (annotation) | Disruption | Standby start time in **RFC3339Nano UTC** (for example `2026-10-27T11:00:00.123456789Z`). Reclamation compares this timestamp to the pool’s `reclamation-delay`. The value survives a Karpenter restart so time already spent in standby still counts. If the taint is present but the annotation is missing or not an RFC3339Nano timestamp, disruption backfills the timestamp with now. A positive delay starts from that timestamp. With zero delay, same-pass reclamation is permitted if the timestamp is visible in the cache, but is not guaranteed. |
 
 Entering standby writes the taint (with no value) and timestamp together in one Node update; reactivation and repair clear both together. The taint determines whether a node is standby. Repair clears an annotation without a taint; it cannot make the node reclaimable. Later standby entry writes a fresh timestamp. Repair also clears standby when a reschedulable pod appears or the NodePool stops qualifying.
 

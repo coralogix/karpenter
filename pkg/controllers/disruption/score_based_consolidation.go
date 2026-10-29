@@ -29,7 +29,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/events"
+	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
 
 var ScoreBasedConsolidationTimeoutDuration = 20 * time.Second
@@ -93,6 +95,12 @@ func NewScoreBasedConsolidationValidator(c consolidation) *ConsolidationValidato
 func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
 	if !NodePoolUsesScoreBasedConsolidation(cn.NodePool) {
 		return false
+	}
+	for _, pod := range cn.reschedulablePods {
+		if podutils.ToleratesDisruptedNoScheduleTaint(pod) {
+			s.recorder.Publish(disruptionevents.Unconsolidatable(cn.Node, cn.NodeClaim, fmt.Sprintf("Pod %s/%s tolerates the disruption taint", pod.Namespace, pod.Name))...)
+			return false
+		}
 	}
 	return s.consolidation.ShouldDisrupt(ctx, cn)
 }
