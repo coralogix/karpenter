@@ -8,6 +8,10 @@ Decisions about taking pods off a node, holding that node, and either deleting i
 A decision to take the pods off one node so that node can become standby.
 _Avoid_: compaction, consolidation
 
+**Evacuation timeout**:
+The longest an evacuation may run before it is abandoned and its node takes pods again.
+_Avoid_: drain timeout
+
 **Standby**:
 A node that stays in the cluster and is held back from ordinary scheduling until it is reclaimed or reactivated.
 _Avoid_: empty node, cordoned node
