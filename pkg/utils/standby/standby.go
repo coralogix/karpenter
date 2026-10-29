@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package standby reads and writes the standby marks: the node taint and the NodeClaim timestamp.
+// Package standby reads and writes the standby marks: the Node taint and timestamp.
 package standby
 
 import (
@@ -23,22 +23,20 @@ import (
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
-// IsMarked reports whether the node carries the standby taint or its NodeClaim carries a standby timestamp.
-func IsMarked(node *corev1.Node, nodeClaim *v1.NodeClaim) bool {
-	return HasStandbyTaint(node) || (nodeClaim != nil && nodeClaim.Annotations[v1.StandbyNodeClaimAnnotationKey] != "")
+func HasAnnotation(node *corev1.Node) bool {
+	_, ok := node.Annotations[v1.StandbyNodeAnnotationKey]
+	return ok
 }
 
-func Timestamp(nodeClaim *v1.NodeClaim) (time.Time, bool) {
-	if nodeClaim == nil {
-		return time.Time{}, false
-	}
-	raw := nodeClaim.Annotations[v1.StandbyNodeClaimAnnotationKey]
+func Timestamp(node *corev1.Node) (time.Time, bool) {
+	raw := node.Annotations[v1.StandbyNodeAnnotationKey]
 	if raw == "" {
 		return time.Time{}, false
 	}
@@ -49,71 +47,26 @@ func Timestamp(nodeClaim *v1.NodeClaim) (time.Time, bool) {
 	return ts.UTC(), true
 }
 
-// Mark writes the timestamp before the taint, so a failed taint write leaves no taint rather than a taint with an old timestamp.
-func Mark(ctx context.Context, kubeClient client.Client, node *corev1.Node, nodeClaim *v1.NodeClaim, now time.Time) error {
-	if err := setTimestamp(ctx, kubeClient, nodeClaim, now); err != nil {
-		return err
-	}
-	return addTaint(ctx, kubeClient, node)
-}
-
-func Clear(ctx context.Context, kubeClient client.Client, node *corev1.Node, nodeClaim *v1.NodeClaim) error {
-	if err := removeTaint(ctx, kubeClient, node); err != nil {
-		return err
-	}
-	return clearTimestamp(ctx, kubeClient, nodeClaim)
-}
-
-func setTimestamp(ctx context.Context, kubeClient client.Client, nodeClaim *v1.NodeClaim, at time.Time) error {
-	if nodeClaim == nil {
-		return nil
-	}
-	return retryIgnoringNotFound(func() error {
-		stored := &v1.NodeClaim{}
-		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(nodeClaim), stored); err != nil {
-			return err
-		}
-		patch := stored.DeepCopy()
+// Mark writes the standby timestamp and taint together.
+func Mark(ctx context.Context, kubeClient client.Client, node *corev1.Node, now time.Time) error {
+	return patchNode(ctx, kubeClient, node, func(patch *corev1.Node) {
 		if patch.Annotations == nil {
 			patch.Annotations = map[string]string{}
 		}
-		patch.Annotations[v1.StandbyNodeClaimAnnotationKey] = at.UTC().Format(time.RFC3339Nano)
-		return kubeClient.Patch(ctx, patch, client.MergeFrom(stored))
+		patch.Annotations[v1.StandbyNodeAnnotationKey] = now.UTC().Format(time.RFC3339Nano)
+		patch.Spec.Taints = append(WithoutStandbyTaint(patch.Spec.Taints), v1.StandbyNoScheduleTaint)
 	})
 }
 
-func clearTimestamp(ctx context.Context, kubeClient client.Client, nodeClaim *v1.NodeClaim) error {
-	if nodeClaim == nil {
-		return nil
-	}
-	return retryIgnoringNotFound(func() error {
-		stored := &v1.NodeClaim{}
-		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(nodeClaim), stored); err != nil {
-			return err
-		}
-		if stored.Annotations[v1.StandbyNodeClaimAnnotationKey] == "" {
-			return nil
-		}
-		patch := stored.DeepCopy()
-		delete(patch.Annotations, v1.StandbyNodeClaimAnnotationKey)
-		return kubeClient.Patch(ctx, patch, client.MergeFrom(stored))
+// Clear removes both standby marks in one Node update.
+func Clear(ctx context.Context, kubeClient client.Client, node *corev1.Node) error {
+	return patchNode(ctx, kubeClient, node, func(patch *corev1.Node) {
+		delete(patch.Annotations, v1.StandbyNodeAnnotationKey)
+		patch.Spec.Taints = WithoutStandbyTaint(patch.Spec.Taints)
 	})
 }
 
-func addTaint(ctx context.Context, kubeClient client.Client, node *corev1.Node) error {
-	return patchTaints(ctx, kubeClient, node, func(taints []corev1.Taint) []corev1.Taint {
-		return append(WithoutStandbyTaint(taints), v1.StandbyNoScheduleTaint)
-	})
-}
-
-func removeTaint(ctx context.Context, kubeClient client.Client, node *corev1.Node) error {
-	return patchTaints(ctx, kubeClient, node, WithoutStandbyTaint)
-}
-
-func patchTaints(ctx context.Context, kubeClient client.Client, node *corev1.Node, update func([]corev1.Taint) []corev1.Taint) error {
-	if node == nil {
-		return nil
-	}
+func patchNode(ctx context.Context, kubeClient client.Client, node *corev1.Node, update func(*corev1.Node)) error {
 	return retryIgnoringNotFound(func() error {
 		stored := &corev1.Node{}
 		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(node), stored); err != nil {
@@ -123,8 +76,8 @@ func patchTaints(ctx context.Context, kubeClient client.Client, node *corev1.Nod
 			return nil
 		}
 		patch := stored.DeepCopy()
-		patch.Spec.Taints = update(patch.Spec.Taints)
-		if HasStandbyTaint(patch) == HasStandbyTaint(stored) {
+		update(patch)
+		if equality.Semantic.DeepEqual(patch, stored) {
 			return nil
 		}
 		return kubeClient.Patch(ctx, patch, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))

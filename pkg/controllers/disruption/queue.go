@@ -391,7 +391,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 func (q *Queue) executeStandbyMarking(ctx context.Context, cmd *Command) error {
 	errs := make([]error, len(cmd.Candidates))
 	workqueue.ParallelizeUntil(ctx, len(cmd.Candidates), len(cmd.Candidates), func(i int) {
-		errs[i] = standby.Mark(ctx, q.kubeClient, cmd.Candidates[i].Node, cmd.Candidates[i].NodeClaim, q.clock.Now())
+		errs[i] = standby.Mark(ctx, q.kubeClient, cmd.Candidates[i].Node, q.clock.Now())
 	})
 	if err := multierr.Combine(errs...); err != nil {
 		return serrors.Wrap(fmt.Errorf("marking standby, %w", err), "command-id", cmd.ID)

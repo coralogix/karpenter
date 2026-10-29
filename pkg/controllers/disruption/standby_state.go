@@ -29,7 +29,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-// repairStandbyState clears standby when the node is no longer empty and backfills a standby taint with no usable timestamp.
+// repairStandbyState reconciles standby marks on active nodes: orphan annotations, disqualified pools, non-empty nodes, and missing timestamps.
 func repairStandbyState(ctx context.Context, kubeClient client.Client, cluster *state.Cluster, recorder events.Recorder, clk clock.Clock, nodePoolMap map[string]*v1.NodePool) error {
 	var errs []error
 	for _, node := range cluster.DeepCopyNodes().Active() {
@@ -40,37 +40,34 @@ func repairStandbyState(ctx context.Context, kubeClient client.Client, cluster *
 	return multierr.Combine(errs...)
 }
 
-// if the node is in standby, but its pool no longer qualifies, standby status is cleared
-// if the node is in standby, but no longer empty, standby status is cleared
-// if the node is in standby but the timestamp is incorrect, it is set to now
+// orphan annotation without the standby taint is cleared
+// tainted node whose pool no longer qualifies is cleared
+// tainted node with a reschedulable pod is cleared
+// tainted node with a missing or invalid timestamp gets the timestamp set to now
 func repairStandbyNode(ctx context.Context, kubeClient client.Client, recorder events.Recorder, clk clock.Clock, nodePoolMap map[string]*v1.NodePool, node *state.StateNode) error {
-	if !isStandby(node) {
+	if node.Node == nil || !node.Managed() || !node.Initialized() {
+		return nil
+	}
+	if !standby.HasStandbyTaint(node.Node) {
+		if standby.HasAnnotation(node.Node) {
+			return standby.Clear(ctx, kubeClient, node.Node)
+		}
 		return nil
 	}
 	if !scoreBasedStandbyPool(nodePoolMap[node.Labels()[v1.NodePoolLabelKey]]) {
-		return standby.Clear(ctx, kubeClient, node.Node, node.NodeClaim)
+		return standby.Clear(ctx, kubeClient, node.Node)
 	}
 	reschedulable, err := node.CurrentlyReschedulablePods(ctx, kubeClient, clk, recorder)
 	if err != nil {
 		return err
 	}
 	if computeRescheduleDisruptionCost(ctx, reschedulable) > PerNodeBaseDisruptionCost {
-		return standby.Clear(ctx, kubeClient, node.Node, node.NodeClaim)
+		return standby.Clear(ctx, kubeClient, node.Node)
 	}
-	if standby.HasStandbyTaint(node.Node) {
-		if _, hasTS := standby.Timestamp(node.NodeClaim); !hasTS {
-			return standby.Mark(ctx, kubeClient, node.Node, node.NodeClaim, clk.Now())
-		}
+	if _, hasTS := standby.Timestamp(node.Node); !hasTS {
+		return standby.Mark(ctx, kubeClient, node.Node, clk.Now())
 	}
 	return nil
-}
-
-// isStandby reports whether a managed, initialized node carries any standby mark.
-func isStandby(node *state.StateNode) bool {
-	if node.Node == nil || node.NodeClaim == nil || !node.Managed() || !node.Initialized() {
-		return false
-	}
-	return standby.IsMarked(node.Node, node.NodeClaim)
 }
 
 // candidateEmptyForStandbyWork also requires no buffer pods: they are virtual, so IsEmpty cannot see them on the node.

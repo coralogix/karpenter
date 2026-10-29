@@ -32,30 +32,30 @@ import (
 
 var _ = Describe("Standby reactivation", func() {
 	It("clears standby on a consolidation destination and still deletes the source", func() {
-		_, destinationNode, destination, source := givenStandbyDestinationAndSource()
+		_, destinationNode, source := givenStandbyDestinationAndSource()
 
 		reconcileThroughValidationDelay(disruptionController)
 
 		Expect(queue.GetCommands()).To(HaveLen(1))
-		expectNotStandby(destinationNode, destination)
+		expectNotStandby(destinationNode)
 		ExpectObjectReconciled(ctx, env.Client, queue, source)
 		ExpectNotFound(ctx, env.Client, source)
 	})
 
 	It("leaves standby unchanged when validation rejects the consolidation", func() {
-		nodePool, destinationNode, destination, _ := givenStandbyDestinationAndSource()
+		nodePool, destinationNode, _ := givenStandbyDestinationAndSource()
 		validator := NewTestScoreBasedConsolidationValidator(nodePool, WithUnderutilizedBlockingBudget())
 
 		reconcileThroughValidationDelay(scoreBasedDisruptionController(validator))
 
 		Expect(queue.GetCommands()).To(BeEmpty())
-		expectMarkedStandby(destinationNode, destination)
+		expectMarkedStandby(destinationNode)
 	})
 })
 
 // givenStandbyDestinationAndSource returns a standby node and a score-based source node running one pod.
 // The pod is owned by a ReplicaSet so consolidation may move it.
-func givenStandbyDestinationAndSource() (nodePool *v1.NodePool, destinationNode *corev1.Node, destination, source *v1.NodeClaim) {
+func givenStandbyDestinationAndSource() (nodePool *v1.NodePool, destinationNode *corev1.Node, source *v1.NodeClaim) {
 	nodePool = scoreBasedStandbyNodePool(v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
 		map[string]string{v1.ReclamationDelayAnnotationKey: "1h"}, []v1.Budget{{Nodes: "100%"}})
 	nodeClaims, nodes := standbyTestNodeClaims(nodePool, 2)
@@ -68,9 +68,9 @@ func givenStandbyDestinationAndSource() (nodePool *v1.NodePool, destinationNode 
 	ExpectManualBinding(ctx, env.Client, pod, nodes[1])
 	refreshStandbyStates(nodes, nodeClaims)
 	reconcileDisruption()
-	expectMarkedStandby(nodes[0], nodeClaims[0])
+	expectMarkedStandby(nodes[0])
 	refreshStandbyStates(nodes, nodeClaims)
-	return nodePool, nodes[0], nodeClaims[0], nodeClaims[1]
+	return nodePool, nodes[0], nodeClaims[1]
 }
 
 // scoreBasedDisruptionController runs only score-based consolidation, validated by the given validator.
@@ -88,10 +88,9 @@ func reconcileThroughValidationDelay(controller *disruption.Controller) {
 	})
 }
 
-func expectNotStandby(node *corev1.Node, nodeClaim *v1.NodeClaim) {
+func expectNotStandby(node *corev1.Node) {
 	GinkgoHelper()
 	Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(node), node)).To(Succeed())
 	expectNodeWithoutStandbyTaint(node)
-	Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), nodeClaim)).To(Succeed())
-	Expect(nodeClaim.Annotations).NotTo(HaveKey(v1.StandbyNodeClaimAnnotationKey))
+	Expect(node.Annotations).NotTo(HaveKey(v1.StandbyNodeAnnotationKey))
 }
