@@ -254,9 +254,13 @@ var (
 	NoOpDecision    Decision = "no-op"
 	ReplaceDecision Decision = "replace"
 	DeleteDecision  Decision = "delete"
+	StandbyDecision Decision = "standby"
 )
 
 func (c Command) Decision() Decision {
+	if c.Method != nil && c.ConsolidationType() == StandbyMarkingConsolidationType {
+		return StandbyDecision
+	}
 	switch {
 	case len(c.Candidates) > 0 && len(c.Replacements) > 0:
 		return ReplaceDecision

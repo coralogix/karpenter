@@ -61,6 +61,8 @@ const (
 	DisruptionPacingPerMinuteAnnotationKey = "karpenter.coralogix.net/disruption-pacing-per-minute"
 	DisruptionPacingPerBatchAnnotationKey  = "karpenter.coralogix.net/disruption-pacing-per-batch"
 	ScoreBasedConsolidationAnnotationKey   = "karpenter.coralogix.net/score-based-consolidation"
+	ReclamationDelayAnnotationKey          = "karpenter.coralogix.net/reclamation-delay"
+	StandbyNodeClaimAnnotationKey          = "karpenter.coralogix.net/standby"
 )
 
 // Karpenter specific finalizers

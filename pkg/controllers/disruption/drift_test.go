@@ -898,7 +898,7 @@ var _ = Describe("Drift", func() {
 		})
 		It("should delete drifted nodes when they are empty and consolidatable", func() {
 			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeDrifted)
-			nodeClaim.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+			_ = nodeClaim.StatusConditions().Clear(v1.ConditionTypeConsolidatable)
 			ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 
 			// inform cluster state about nodes and nodeclaims

@@ -27,6 +27,7 @@ const (
 	ConsolidationCandidate     = "ConsolidationCandidate"
 	ConsolidationRejected      = "ConsolidationRejected"
 	ConsolidationApproved      = "ConsolidationApproved"
+	InvalidReclamationDelay    = "InvalidReclamationDelay"
 
 	// provisioning/scheduling
 	FailedScheduling             = "FailedScheduling"

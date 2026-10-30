@@ -26,6 +26,7 @@ import (
 const (
 	DisruptedTaintKey    = apis.Group + "/disrupted"
 	UnregisteredTaintKey = apis.Group + "/unregistered"
+	StandbyTaintKey      = "karpenter.coralogix.net/standby"
 )
 
 var (
@@ -38,5 +39,10 @@ var (
 	UnregisteredNoExecuteTaint = v1.Taint{
 		Key:    UnregisteredTaintKey,
 		Effect: v1.TaintEffectNoExecute,
+	}
+	// StandbyNoScheduleTaint holds an empty node out of ordinary scheduling until reactivation or reclamation.
+	StandbyNoScheduleTaint = v1.Taint{
+		Key:    StandbyTaintKey,
+		Effect: v1.TaintEffectNoSchedule,
 	}
 )

@@ -391,15 +391,15 @@ var _ = Describe("Emptiness", func() {
 			ExpectSingletonReconciled(ctx, disruptionController)
 			ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
 
-			// The node is both empty and drifted. Drift runs before Emptiness in
-			// the method list, so it claims the node. Verify deletion succeeds and
-			// the metric reflects "drifted" as the reason.
+			// The node is both empty and drifted. Emptiness runs before drift in the
+			// method list, so it claims the node. Verify deletion succeeds and the
+			// metric reflects "empty" as the reason.
 			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
 			Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(0))
 			Expect(ExpectNodes(ctx, env.Client)).To(HaveLen(0))
 			ExpectNotFound(ctx, env.Client, nodeClaim, node)
 			ExpectMetricGaugeValue(disruption.EligibleNodes, 1, map[string]string{
-				metrics.ReasonLabel: "drifted",
+				metrics.ReasonLabel: "empty",
 			})
 		})
 		It("should ignore nodes without the consolidatable status condition", func() {
