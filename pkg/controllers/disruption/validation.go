@@ -293,6 +293,8 @@ func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candida
 }
 
 // ValidateCommand validates a command for a Method
+//
+//nolint:gocyclo
 func (v *validation) validateCommand(ctx context.Context, cmd Command, candidates []*Candidate) error {
 	// None of the chosen candidate are valid for execution, so retry
 	if len(candidates) == 0 {
@@ -306,6 +308,12 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 	if err != nil {
 		return fmt.Errorf("simluating scheduling, %w", err)
 	}
+	if cmd.scoreBasedStandbyPrices != nil {
+		if err := validateStandbyDestinations(cmd.Results, results); err != nil {
+			return err
+		}
+	}
+
 	if !results.AllNonPendingPodsScheduled() {
 		return NewSchedulingValidationError(errors.New(results.NonPendingPodSchedulingErrors()))
 	}

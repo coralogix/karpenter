@@ -1,6 +1,6 @@
 # Score-based consolidation
 
-This fork adds an alternate consolidation disruption method for NodePools that opt in via annotation. It works like single-node consolidation except instead of sorting nodes by DisruptionCost it sorts them by `nodePriorityScore`, a search-guidance heuristic that ranks expensive, underused nodes higher (price divided by non-daemon pod CPU/memory requests).
+This fork adds an alternate consolidation disruption method for NodePools that opt in via annotation. It shuffles eligible source nodes, simulates single-node moves, and ranks them by estimated hourly dollar savings.
 
 ## NodePool configuration
 
@@ -70,7 +70,10 @@ After a controller restart, the existing repair pass clears the temporary disrup
 - Annotated NodePools are excluded from emptiness, single-node consolidation, and multi-node consolidation.
 - Dynamic and static drift continue to use the standard drift methods and `Drifted` disruption budgets. Optional disruption pacing also limits drift candidates and shares the per-NodePool or group cooldown with consolidation.
 - The method reports `Underutilized` as its disruption reason for budget accounting. Empty nodes are handled by standby marking and reclamation instead of score-based consolidation or standard emptiness.
-- Candidates are sorted by `nodePriorityScore` descending (`price / workloadSize`, or `price` when the node is empty), then evaluated in priority order with up to `runtime.GOMAXPROCS` move sets in parallel. `workloadSize` is `cpu_cores + 0.125 × memory_gib` from non-daemon pod requests. Up to 10 valid commands with positive estimated savings are collected (or fewer on timeout), sorted by score, then the controller waits for any remaining consolidation TTL time since the pass started. The first command that still passes validation is executed. Each pass has a 20-second timeout (single-node consolidation keeps the upstream 3-minute timeout).
+- Candidates are shuffled and all single-node moves are attempted with up to `runtime.GOMAXPROCS` simulations in parallel. After 15 seconds no new simulations are started; simulations already running finish and their results are used. Partial searches retain successful results. The ten moves with highest positive savings are kept; moves requiring more than one new node are rejected. Savings subtract the estimated new-node price and the prices of standby destinations that would reactivate.
+- After the remaining 15-second validation delay since the pass started, moves are validated in savings order. Validation rechecks all source budgets, standby destinations, and whole-command pacing. The first valid move is evacuated; validation does not re-rank moves. Simulation errors preserve successful evaluations and prevent marking the cluster consolidated.
+- Each searched pass writes one Info decision log: `score-based consolidation move selected` includes source identity and prices, new capacity, reactivated standby destinations, savings, search counts, deadline, duration, rank, and up to three alternatives with validation results. `score-based consolidation found no move` includes counts, sorted blocked NodePools, and one reason: `no_candidates`, `blocked_by_budget_or_pacing`, `timed_out`, `no_saving_move`, `all_rejected_by_validation`, or `simulation_error`. Simulation errors take precedence when nothing is selected. Passes skipped because the cluster is consolidated log nothing. These logs contain no pod names.
+
 - Optional disruption pacing annotations (`karpenter.coralogix.net/disruption-pacing-per-minute` and `karpenter.coralogix.net/disruption-pacing-per-batch`) apply to non-empty score-based, single-node, and multi-node consolidation, plus dynamic and static drift. NodePools can share a limit with `karpenter.coralogix.net/disruption-pacing-group`; empty-node removals are not paced. See [Disruption pacing](disruption-pacing.md) for configuration and behavior.
 
 ## Rollback to upstream

@@ -69,20 +69,6 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 		ExpectCleanedUp(ctx, env.Client)
 	})
 
-	Context("Candidate sorting", func() {
-		It("should sort candidates by score descending", func() {
-			cheapCandidate, err := createScoreBasedCandidateForPool(scoreBasedNodePool, leastExpensiveInstance, test.Pod())
-			Expect(err).To(BeNil())
-			expensiveCandidate, err := createScoreBasedCandidateForPool(scoreBasedNodePool, mostExpensiveInstance, test.Pod())
-			Expect(err).To(BeNil())
-
-			sorted := scoreBased.SortCandidates([]*disruption.Candidate{cheapCandidate, expensiveCandidate})
-			Expect(sorted).To(HaveLen(2))
-			Expect(sorted[0].Labels()[corev1.LabelInstanceTypeStable]).To(Equal(mostExpensiveInstance.Name))
-			Expect(sorted[1].Labels()[corev1.LabelInstanceTypeStable]).To(Equal(leastExpensiveInstance.Name))
-		})
-	})
-
 	Context("Empty nodes", func() {
 		// Pending until the rebase gap is addressed: upstream commit 43964dc5, Balanced consolidation (#2962),
 		// added an unconditional IsEmpty rejection to the shared predicate.

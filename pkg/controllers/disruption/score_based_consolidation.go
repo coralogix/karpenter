@@ -19,14 +19,17 @@ package disruption
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"runtime"
 	"sort"
-	"sync/atomic"
+	"sync"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/clock"
 
 	"github.com/awslabs/operatorpkg/option"
 	"github.com/destel/rill"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
@@ -34,7 +37,7 @@ import (
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
 
-var ScoreBasedConsolidationTimeoutDuration = 20 * time.Second
+var ScoreBasedConsolidationTimeoutDuration = 15 * time.Second
 
 var scoreBasedValidEvaluationsTarget = 10
 
@@ -47,8 +50,9 @@ type moveSet struct {
 }
 
 type moveSetEvaluation struct {
-	Command Command
-	Score   float64
+	Command    Command
+	Score      float64
+	Validation string
 }
 
 type consolidationComputer func(ctx context.Context, candidates ...*Candidate) (Command, error)
@@ -113,41 +117,60 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 
 	start := s.clock.Now()
 	deadline := start.Add(ScoreBasedConsolidationTimeoutDuration)
+	blocked := map[string]bool{}
+	reason := "no_saving_move"
+	var evals []*moveSetEvaluation
+	var stats searchStats
+	eligible := 0
+	defer func() {
+		names := []string{}
+		for name := range blocked {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		logScoreDecision(ctx, evals, stats, eligible, names, s.clock.Since(start), reason)
+	}()
 	constrainedByBudgets := false
 	constrainedByDisruptionPacing := false
 
-	candidates = s.SortCandidates(candidates)
 	var validCandidates []*Candidate
 	for _, candidate := range candidates {
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			constrainedByBudgets = true
+			blocked[candidate.NodePool.Name] = true
 			continue
 		}
 		if len(candidate.reschedulablePods) > 0 && !s.disruptionPacing.CandidateAllowed(candidate.NodePool, 0) {
 			constrainedByDisruptionPacing = true
+			blocked[candidate.NodePool.Name] = true
 			continue
 		}
 		validCandidates = append(validCandidates, candidate)
 	}
 
-	evals, evaluated, err := s.searchForMoveSets(ctx, validCandidates, deadline)
+	eligible = len(validCandidates)
+	var err error
+	evals, stats, err = s.searchForMoveSets(ctx, validCandidates, deadline)
 	if err != nil {
+		reason = "simulation_error"
 		return []Command{}, err
 	}
+	if len(candidates) == 0 {
+		reason = "no_candidates"
+	} else if len(validCandidates) == 0 {
+		reason = "blocked_by_budget_or_pacing"
+	}
+	if stats.TimedOut {
+		ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
+		reason = "timed_out"
+	}
 	if len(evals) == 0 {
-		timedOut := evaluated < len(validCandidates)
-		if timedOut {
-			log.FromContext(ctx).V(1).Info(fmt.Sprintf("abandoning score-based consolidation due to timeout after evaluating %d candidates", evaluated))
-		}
-		if !timedOut && !constrainedByBudgets && !constrainedByDisruptionPacing {
+
+		if stats.canMarkConsolidated(len(evals), constrainedByBudgets || constrainedByDisruptionPacing) {
 			s.markConsolidated()
 		}
 		return []Command{}, nil
 	}
-
-	sort.Slice(evals, func(i, j int) bool {
-		return evals[i].Score > evals[j].Score
-	})
 
 	remainingValidationDelay := commandValidationDelay - s.clock.Since(start)
 	if remainingValidationDelay > 0 {
@@ -157,7 +180,8 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		case <-s.clock.After(remainingValidationDelay):
 		}
 	}
-	cmd, err := selectFirstStillValidCommand(ctx, s.validator, s.recorder, evals)
+	reason = "all_rejected_by_validation"
+	cmd, err := selectFirstStillValidCommand(ctx, scoreMoveValidator{s.validator, s.disruptionPacing}, s.recorder, evals)
 	if err != nil {
 		return []Command{}, err
 	}
@@ -167,98 +191,98 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	return []Command{cmd}, nil
 }
 
-func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, validCandidates []*Candidate, deadline time.Time) ([]*moveSetEvaluation, int, error) {
-	moveSets := make([]moveSet, len(validCandidates))
-	for i, candidate := range validCandidates {
-		moveSets[i] = moveSet{Nodes: []*Candidate{candidate}}
+func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, candidates []*Candidate, deadline time.Time) ([]*moveSetEvaluation, searchStats, error) {
+	if len(candidates) == 0 {
+		return nil, searchStats{}, nil
 	}
-	simulator, err := NewConsolidationSchedulingSimulator(ctx, s.kubeClient, s.cluster, s.provisioner, s.clock, s.recorder, validCandidates...)
+	simulator, err := NewConsolidationSchedulingSimulator(ctx, s.kubeClient, s.cluster, s.provisioner, s.clock, s.recorder, candidates...)
 	if err != nil {
-		return nil, 0, err
+		return nil, searchStats{}, err
 	}
-	compute := func(ctx context.Context, candidates ...*Candidate) (Command, error) {
-		return s.computeConsolidation(ctx, simulator, candidates...)
+	prices, err := s.nodePrices(ctx)
+	if err != nil {
+		return nil, searchStats{}, err
 	}
-	return evaluateMoveSetsPar(ctx, moveSets, deadline, compute)
+	moves := make([]moveSet, len(candidates))
+	for i, c := range candidates {
+		moves[i] = moveSet{Nodes: []*Candidate{c}}
+	}
+	evals, stats := searchMoves(ctx, moves, deadline, func(ctx context.Context, candidates ...*Candidate) (Command, error) {
+		cmd, err := s.computeConsolidation(ctx, simulator, candidates...)
+		if err == nil {
+			cmd.scoreBasedStandbyPrices = prices
+		}
+		return cmd, err
+	}, rand.New(rand.NewSource(time.Now().UnixNano())), s.clock) //nolint:gosec
+	return evals, stats, nil
 }
 
-func evaluateMoveSetsPar(
-	ctx context.Context,
-	moveSets []moveSet,
-	deadline time.Time,
-	compute consolidationComputer,
-) ([]*moveSetEvaluation, int, error) {
-	searchStart := time.Now()
-	stats := &moveSetSearchStats{}
+func (s *ScoreBasedConsolidation) nodePrices(ctx context.Context) (map[string]float64, error) {
+	_, instanceTypes, err := BuildNodePoolMap(ctx, s.kubeClient, s.cloudProvider)
+	if err != nil {
+		return nil, err
+	}
+	prices := map[string]float64{}
+	for _, node := range s.cluster.DeepCopyNodes() {
+		poolName := node.Labels()[v1.NodePoolLabelKey]
+		it := instanceTypes[poolName][node.Labels()[corev1.LabelInstanceTypeStable]]
+		if it == nil {
+			continue
+		}
+		prices[node.Name()] = resolveNodePrice(node, it)
+	}
+	return prices, nil
+}
 
-	ctx, cancel := context.WithDeadline(ctx, deadline)
-	defer cancel()
+type searchStats struct {
+	Evaluated int
+	Errors    int
+	NoOp      int
+	NoSavings int
+	TimedOut  bool
+}
 
-	var evaluated atomic.Int64
-
-	// Stop feeding move sets once the deadline passes so in-flight work is drained but new work is not started.
+func searchMoves(ctx context.Context, moves []moveSet, deadline time.Time, compute consolidationComputer, random *rand.Rand, clk clock.Clock) ([]*moveSetEvaluation, searchStats) {
+	moves = append([]moveSet(nil), moves...)
+	random.Shuffle(len(moves), func(i, j int) { moves[i], moves[j] = moves[j], moves[i] })
+	var stats searchStats
+	var mu sync.Mutex
 	pending := rill.Generate(func(send func(moveSet), _ func(error)) {
-		for _, moveSet := range moveSets {
+		for _, move := range moves {
 			if ctx.Err() != nil {
 				return
 			}
-			send(moveSet)
+			if clk.Now().After(deadline) {
+				mu.Lock()
+				stats.TimedOut = true
+				mu.Unlock()
+				return
+			}
+			send(move)
 		}
 	})
-
-	valid := rill.OrderedFilterMap(pending, scoreBasedMoveSetParallelism, func(moveSet moveSet) (*moveSetEvaluation, bool, error) {
-		eval := evaluateMoveSet(ctx, moveSet, compute, stats)
-		if ctx.Err() == nil {
-			evaluated.Add(1)
-			return eval, eval != nil, nil
+	valid := rill.OrderedFilterMap(pending, scoreBasedMoveSetParallelism, func(move moveSet) (*moveSetEvaluation, bool, error) {
+		cmd, err := compute(ctx, move.Nodes...)
+		mu.Lock()
+		defer mu.Unlock()
+		stats.Evaluated++
+		if err != nil {
+			stats.Errors++
+			return nil, false, nil
 		}
-		return nil, false, nil
+		if cmd.Decision() == NoOpDecision || len(cmd.Replacements) > 1 {
+			stats.NoOp++
+			return nil, false, nil
+		}
+		savings := cmd.EstimatedSavings() - cmd.standbyCost()
+		if savings <= 0 {
+			stats.NoSavings++
+			return nil, false, nil
+		}
+		return &moveSetEvaluation{Command: cmd, Score: savings, Validation: "not_attempted"}, true, nil
 	})
-
-	evals, err := collectMoveSetEvaluations(valid, scoreBasedValidEvaluationsTarget)
-	timedOut := ctx.Err() != nil && len(evals) == 0
-	logMoveSetSearchComplete(ctx, len(moveSets), int(evaluated.Load()), len(evals), timedOut, time.Since(searchStart), stats)
-	if err != nil {
-		return nil, int(evaluated.Load()), err
-	}
-	if len(evals) == 0 {
-		if timedOut {
-			ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
-		}
-		return nil, int(evaluated.Load()), nil
-	}
-	return evals, int(evaluated.Load()), nil
-}
-
-func evaluateMoveSet(ctx context.Context, moveSet moveSet, compute consolidationComputer, stats *moveSetSearchStats) *moveSetEvaluation {
-	select {
-	case <-ctx.Done():
-		return nil
-	default:
-	}
-
-	start := time.Now()
-	cmd, err := compute(ctx, moveSet.Nodes...)
-	stats.record(time.Since(start), err)
-	select {
-	case <-ctx.Done():
-		return nil
-	default:
-	}
-	if err != nil {
-		log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
-		return nil
-	}
-	if cmd.Decision() == NoOpDecision {
-		return nil
-	}
-	if cmd.EstimatedSavings() <= 0 {
-		return nil
-	}
-	return &moveSetEvaluation{
-		Command: cmd,
-		Score:   moveSetPriorityScore(moveSet),
-	}
+	evals, _ := collectMoveSetEvaluations(valid, scoreBasedValidEvaluationsTarget)
+	return evals, stats
 }
 
 func collectMoveSetEvaluations(valid <-chan rill.Try[*moveSetEvaluation], limit int) ([]*moveSetEvaluation, error) {
@@ -270,21 +294,13 @@ func collectMoveSetEvaluations(valid <-chan rill.Try[*moveSetEvaluation], limit 
 			return nil, a.Error
 		}
 		evals = append(evals, a.Value)
-		if len(evals) >= limit {
-			break
-		}
+
+	}
+	sort.SliceStable(evals, func(i, j int) bool { return evals[i].Score > evals[j].Score })
+	if len(evals) > limit {
+		evals = evals[:limit]
 	}
 	return evals, nil
-}
-
-func moveSetPriorityScore(moveSet moveSet) float64 {
-	var maxScore float64
-	for _, node := range moveSet.Nodes {
-		if score := nodePriorityScore(node); score > maxScore {
-			maxScore = score
-		}
-	}
-	return maxScore
 }
 
 func selectFirstStillValidCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation) (Command, error) {
@@ -292,6 +308,7 @@ func selectFirstStillValidCommand(ctx context.Context, validator Validator, reco
 
 	for i, eval := range evals {
 		if _, err := validator.Validate(ctx, eval.Command, 0); err != nil {
+			eval.Validation = getValidationFailureReason(err)
 			if IsValidationError(err) {
 				if i == 0 {
 					firstValidationReason = getValidationFailureReason(err)
@@ -300,6 +317,7 @@ func selectFirstStillValidCommand(ctx context.Context, validator Validator, reco
 			}
 			return Command{}, fmt.Errorf("validating score-based consolidation, %w", err)
 		}
+		eval.Validation = "passed"
 		return eval.Command, nil
 	}
 	if firstValidationReason != "" {
@@ -320,10 +338,6 @@ func (s *ScoreBasedConsolidation) ConsolidationType() string {
 	return ScoreBasedConsolidationType
 }
 
-// SortCandidates orders candidates by nodePriority (highest first).
-func (s *ScoreBasedConsolidation) SortCandidates(candidates []*Candidate) []*Candidate {
-	sort.Slice(candidates, func(i, j int) bool {
-		return nodePriorityScore(candidates[i]) > nodePriorityScore(candidates[j])
-	})
-	return candidates
+func (s searchStats) canMarkConsolidated(kept int, blocked bool) bool {
+	return kept == 0 && !s.TimedOut && s.Errors == 0 && !blocked
 }

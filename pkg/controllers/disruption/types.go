@@ -225,6 +225,8 @@ func replacementsFromNodeClaims(newNodeClaims ...*pscheduling.NodeClaim) []*Repl
 }
 
 type Command struct {
+	// Non-nil for score-based commands: node name to hourly price; enables standby-destination validation.
+	scoreBasedStandbyPrices map[string]float64
 	Method
 
 	Succeeded bool
