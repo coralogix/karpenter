@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -61,6 +62,21 @@ func givenStandbyDestinationAndSource() (nodePool *v1.NodePool, destinationNode 
 	nodePool = scoreBasedStandbyNodePool(v1.ConsolidationPolicyWhenEmptyOrUnderutilized,
 		map[string]string{v1.ReclamationDelayAnnotationKey: "1h"}, []v1.Budget{{Nodes: "100%"}})
 	nodeClaims, nodes := standbyTestNodeClaims(nodePool, 2)
+	// Reactivating standby must cost less than retaining the source.
+	expensive := leastExpensiveInstance.DeepCopy()
+	expensive.Name = "standby-reactivation-source"
+	expensive.Offerings = make(cloudprovider.Offerings, len(leastExpensiveInstance.Offerings))
+	for i, offering := range leastExpensiveInstance.Offerings {
+		offeringCopy := *offering
+		offeringCopy.Price += 1
+		expensive.Offerings[i] = &offeringCopy
+	}
+	cloudProvider.InstanceTypes = append(cloudProvider.InstanceTypes, expensive)
+	nodeClaims[1].Labels[corev1.LabelInstanceTypeStable] = expensive.Name
+	nodes[1].Labels[corev1.LabelInstanceTypeStable] = expensive.Name
+	clusterCost.Reset()
+	ExpectSingletonReconciled(ctx, pricingController)
+
 	rs := test.ReplicaSet()
 	ExpectApplied(ctx, env.Client, rs)
 	Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(rs), rs)).To(Succeed())

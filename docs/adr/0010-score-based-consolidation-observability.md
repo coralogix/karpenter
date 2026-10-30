@@ -5,13 +5,13 @@ Status: accepted
 The per-decision log is the record of why score-based consolidation acted or did not. Each pass in which a search ran writes exactly one Info log. If a move was chosen, the log carries everything needed to recompute its score by hand:
 - the move's kind and sources;
 - the new node and any reactivated standby nodes;
-- the savings;
+- the savings (from the rescored simulation when a move is chosen);
 - each term's contribution with its inputs and baselines, plus a short reason when a term that is on contributed 0;
 - search counts and duration;
-- the chosen move's rank and how many higher-ranked moves failed validation;
+- the chosen move's rank by search score, its search and rescored scores, and how many kept moves failed validation;
 - up to three alternatives.
 
-If nothing was chosen, the log gives one reason with the search counts. A pass skipped because nothing changed since the last empty result logs nothing, so an idle cluster stays quiet. Logs carry no pod names.
+A pass that fails with an error writes no decision log, because the controller reports the error. If nothing was chosen, the log gives one reason with the search counts. The reason `blocked_by_budget_or_pacing` is used only when budgets or pacing left no candidate to search. When some NodePools are blocked and the remaining candidates find nothing, the reason describes the search (for example `no_saving_move`) and the log's `blockedNodePools` lists the blocked pools. A pass skipped because nothing changed since the last empty result logs nothing, so an idle cluster stays quiet. Logs carry no pod names.
 
 Events describe only decisions that were made. Upstream simulation emits `ConsolidationCandidate` for every move it simulates, so score-based consolidation suppresses those during the search. It emits `ConsolidationCandidate` for the chosen move's sources only, and `ConsolidationRejected` for each kept move that failed validation. Upstream `Unconsolidatable` events are unchanged. A deduplicated `DisruptionBlocked` event on the NodePool covers the two cases upstream leaves silent: an `Underutilized` budget used up by disruptions already in progress, and pacing holding back all of a pool's candidates.
 

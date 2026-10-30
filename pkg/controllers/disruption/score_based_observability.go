@@ -18,71 +18,76 @@ package disruption
 
 import (
 	"context"
-	"sync"
+	"maps"
+	"slices"
+	"strings"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+
+	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-type moveSetSearchStats struct {
-	mu     sync.Mutex
-	count  int
-	sum    time.Duration
-	max    time.Duration
-	errors int
-}
-
-func (s *moveSetSearchStats) record(d time.Duration, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.count++
-	s.sum += d
-	if d > s.max {
-		s.max = d
+func logScoreDecision(ctx context.Context, evals []*moveSetEvaluation, stats searchStats, eligible int, blocked []string, duration time.Duration, reason string) {
+	fields := []interface{}{"eligibleCandidates", eligible, "evaluatedMoves", stats.Evaluated, "keptMoves", len(evals), "simulationErrors", stats.Errors, "noOp", stats.NoOp, "noSavings", stats.NoSavings, "deadlineHit", stats.TimedOut, "duration", duration, "blockedNodePools", blocked}
+	attempts := 0
+	failedValidation := 0
+	for _, eval := range evals {
+		if eval.Validation != "not_attempted" {
+			attempts++
+		}
+		if strings.HasPrefix(eval.Validation, "failed:") {
+			failedValidation++
+		}
 	}
-	if err != nil {
-		s.errors++
+	for i, eval := range evals {
+		if !eval.Selected {
+			continue
+		}
+		alternatives := []map[string]interface{}{}
+		for j, other := range evals {
+			if j != i && len(alternatives) < 3 {
+				alternatives = append(alternatives, moveLog(other))
+			}
+		}
+		fields = append(fields, "move", moveLog(eval), "rank", i+1, "searchScore", eval.Score, "rescoredScore", eval.RescoredScore, "failedValidation", failedValidation, "alternatives", alternatives, "validationAttempts", attempts)
+		log.FromContext(ctx).Info("score-based consolidation move selected", fields...)
+		return
 	}
-}
-
-func (s *moveSetSearchStats) avg() time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.count == 0 {
-		return 0
+	if stats.Errors > 0 {
+		reason = "simulation_error"
 	}
-	return s.sum / time.Duration(s.count)
+	fields = append(fields, "reason", reason, "validationAttempts", attempts)
+	log.FromContext(ctx).Info("score-based consolidation found no move", fields...)
 }
 
-func (s *moveSetSearchStats) maxDuration() time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.max
-}
-
-func (s *moveSetSearchStats) errorCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.errors
-}
-
-func logMoveSetSearchComplete(
-	ctx context.Context,
-	moveSets int,
-	evaluated int,
-	valid int,
-	timedOut bool,
-	searchDuration time.Duration,
-	stats *moveSetSearchStats,
-) {
-	log.FromContext(ctx).Info("score-based consolidation move set search complete",
-		"moveSets", moveSets,
-		"evaluated", evaluated,
-		"valid", valid,
-		"timedOut", timedOut,
-		"searchDuration", searchDuration,
-		"avgMoveSetEvalDuration", stats.avg(),
-		"maxMoveSetEvalDuration", stats.maxDuration(),
-		"computeErrors", stats.errorCount(),
-	)
+func moveLog(eval *moveSetEvaluation) map[string]interface{} {
+	cmd := eval.Command
+	savings := eval.Score
+	rescored := eval.Validation == "passed" || eval.Validation == "failed: no_savings"
+	if rescored {
+		savings = eval.RescoredScore
+	}
+	sources := []map[string]interface{}{}
+	for _, c := range cmd.Candidates {
+		sources = append(sources, map[string]interface{}{"node": c.Name(), "nodePool": c.NodePool.Name, "instanceType": c.Labels()[corev1.LabelInstanceTypeStable], "capacityType": c.Labels()[v1.CapacityTypeLabelKey], "price": c.Price})
+	}
+	destinations := []map[string]interface{}{}
+	for _, name := range slices.Sorted(maps.Keys(eval.StandbyPrices)) {
+		destinations = append(destinations, map[string]interface{}{"node": name, "price": eval.StandbyPrices[name]})
+	}
+	var newNode interface{}
+	for _, n := range cmd.Results.NewNodeClaims {
+		if len(n.InstanceTypeOptions) > 0 {
+			// EstimatedSavings is the sources' price minus the new node's price.
+			newNode = map[string]interface{}{"instanceType": n.InstanceTypeOptions[0].Name, "price": cmd.SourceCost() - cmd.EstimatedSavings()}
+		}
+	}
+	entry := map[string]interface{}{"kind": "single", "sources": sources, "newNode": newNode, "reactivatedStandbyNodes": destinations, "savings": savings, "validation": eval.Validation}
+	if rescored && eval.Score != eval.RescoredScore {
+		entry["searchScore"] = eval.Score
+	}
+	return entry
 }
