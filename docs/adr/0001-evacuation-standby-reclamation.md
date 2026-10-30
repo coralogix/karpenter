@@ -4,7 +4,7 @@ Status: accepted
 
 **Before.** Score-based consolidation drains a node and deletes it in one disruption, so a later decision cannot use that node, and an empty node is removed only by an in-memory wait.
 
-**After.** On score-based NodePools, evacuation takes the pods off one node and marks it standby. It is one move off one node, and the node stops taking pods when it starts. A chain of moves happens across later decisions, not inside one. Reclamation is the only decision that deletes a standby node. Drift is unchanged.
+**After.** On score-based NodePools, evacuation takes the pods off one node and marks it standby. Each evacuation concerns one node, and the node stops taking pods when it starts. [ADR-0007](0007-moves-may-evacuate-several-nodes.md) lets one move start several evacuations together. Reclamation is the only decision that deletes a standby node. Drift is unchanged.
 
 Reactivation is how a standby node comes back. Provisioning and disruption place pods on standby capacity through the shared scheduling simulation, which ignores the standby taint and keeps every other scheduling constraint. Simulations have no side effects. Only applying a scheduling result clears standby, and that holds for every disruption method that uses the scheduling simulation, drift included. Virtual buffer pods reactivate standby too, since a buffer counted on capacity ordinary pods cannot use would be a false promise. Buffer accounting protects a buffer-only placement without nominating it, and real pod placements use the existing nomination window. Once cleared, the node is open to any pod. If clearing standby fails, disruption does not evict on the strength of that destination.
 
