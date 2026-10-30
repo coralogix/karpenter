@@ -152,7 +152,7 @@ func TestSearchMoves_ranksSavings(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	winner, stats := searchMoves(ctx, moveSets, time.Now().Add(time.Second), compute, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	winner, stats := searchMoves(ctx, moveSets, time.Now().Add(time.Second), compute, nil, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
 	evaluated := stats.Evaluated
 	if len(winner) != 2 {
 		t.Fatalf("evaluations = %d, want 2", len(winner))
@@ -182,7 +182,7 @@ func TestSearchMoves_stopsOnDeadline(t *testing.T) {
 		}
 	}
 
-	winner, stats := searchMoves(ctx, moveSets, time.Now().Add(-time.Millisecond), compute, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	winner, stats := searchMoves(ctx, moveSets, time.Now().Add(-time.Millisecond), compute, nil, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
 	evaluated := stats.Evaluated
 	if len(winner) != 0 {
 		t.Fatalf("evaluations = %d, want 0", len(winner))
@@ -208,7 +208,7 @@ func TestSearchMoves_keepsTenBest(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	evals, stats := searchMoves(ctx, moveSets, time.Now().Add(time.Second), compute, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	evals, stats := searchMoves(ctx, moveSets, time.Now().Add(time.Second), compute, nil, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
 	evaluated := stats.Evaluated
 	if len(evals) != scoreBasedValidEvaluationsTarget {
 		t.Fatalf("evaluations = %d, want %d", len(evals), scoreBasedValidEvaluationsTarget)
@@ -246,7 +246,7 @@ func TestSearchMoves_returnsPartialOnTimeout(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	evals, stats := searchMoves(ctx, moveSets, deadline, compute, rand.New(rand.NewSource(1)), fakeClock) //nolint:gosec
+	evals, stats := searchMoves(ctx, moveSets, deadline, compute, nil, rand.New(rand.NewSource(1)), fakeClock) //nolint:gosec
 	if !stats.TimedOut {
 		t.Fatal("expected stats.TimedOut")
 	}

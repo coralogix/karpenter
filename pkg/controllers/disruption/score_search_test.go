@@ -45,7 +45,7 @@ func TestSearchMovesRejectsUnprofitableAndMultipleReplacements(t *testing.T) {
 			cmd.Replacements = []*Replacement{{}, {}}
 		}
 		return cmd, nil
-	}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	}, nil, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
 	if len(evals) != 1 || evals[0].Score != 3 || stats.Evaluated != 3 {
 		t.Fatalf("got %v, stats %+v", evals, stats)
 	}
@@ -58,7 +58,7 @@ func TestSearchMovesPreservesSuccessOnSimulationError(t *testing.T) {
 			return Command{}, fmt.Errorf("simulation failed")
 		}
 		return Command{Candidates: c}, nil
-	}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	}, nil, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
 	if len(evals) != 1 || evals[0].Score != 1 || stats.Errors != 1 || stats.Evaluated != 2 {
 		t.Fatalf("got %v, stats %+v", evals, stats)
 	}
@@ -84,7 +84,7 @@ func (acceptScoreCommand) Validate(_ context.Context, cmd Command, _ time.Durati
 func TestSearchMovesErrorPreventsConsolidatedState(t *testing.T) {
 	_, stats := searchMoves(context.Background(), []moveSet{{Nodes: []*Candidate{candidateWithPrice(t, 1)}}}, time.Now().Add(time.Second), func(context.Context, ...*Candidate) (Command, error) {
 		return Command{}, fmt.Errorf("simulation failed")
-	}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	}, nil, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
 	if stats.canMarkConsolidated(1, false) {
 		t.Fatal("failed search must not mark cluster consolidated")
 	}
@@ -96,15 +96,12 @@ func TestSearchMovesFiltersMoveWhenStandbyCostExceedsSavings(t *testing.T) {
 	moves := []moveSet{{Nodes: []*Candidate{expensive}}, {Nodes: []*Candidate{cheap}}}
 	evals, stats := searchMoves(context.Background(), moves, time.Now().Add(time.Second), func(_ context.Context, c ...*Candidate) (Command, error) {
 		if c[0].Price == 10 {
-			cmd := Command{
-				Candidates:              c,
-				scoreBasedStandbyPrices: map[string]float64{"standby-a": 12},
-			}
+			cmd := Command{Candidates: c}
 			cmd.Results.ExistingNodes = standbyReactivationResults("standby-a")
 			return cmd, nil
 		}
 		return Command{Candidates: c}, nil
-	}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	}, map[string]float64{"standby-a": 12}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
 	if len(evals) != 1 || evals[0].Score != 5 || stats.NoSavings != 1 {
 		t.Fatalf("got %v, stats %+v", evals, stats)
 	}

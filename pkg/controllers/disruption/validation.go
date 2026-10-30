@@ -104,6 +104,8 @@ type validation struct {
 	recorder      events.Recorder
 	queue         *Queue
 	reason        v1.DisruptionReason
+	// validateResults, when set, compares the command's results with the re-simulated ones.
+	validateResults resultsValidator
 }
 
 type EmptinessValidator struct {
@@ -308,12 +310,11 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 	if err != nil {
 		return fmt.Errorf("simluating scheduling, %w", err)
 	}
-	if cmd.scoreBasedStandbyPrices != nil {
-		if err := validateStandbyDestinations(cmd.Results, results); err != nil {
+	if v.validateResults != nil {
+		if err := v.validateResults(cmd.Results, results); err != nil {
 			return err
 		}
 	}
-
 	if !results.AllNonPendingPodsScheduled() {
 		return NewSchedulingValidationError(errors.New(results.NonPendingPodSchedulingErrors()))
 	}

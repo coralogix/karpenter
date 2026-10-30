@@ -18,56 +18,14 @@ package disruption
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"slices"
-	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
-	"sigs.k8s.io/karpenter/pkg/utils/standby"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
-
-var errWholeCommandPacing = errors.New("whole-command pacing")
-
-type scoreMoveValidator struct {
-	Validator
-	pacing *DisruptionPacing
-}
-
-func scoreBasedValidationFailureReason(err error) string {
-	var ve *ValidationError
-	if errors.As(err, &ve) && errors.Is(ve.error, errWholeCommandPacing) {
-		return "pacing"
-	}
-	return getValidationFailureReason(err)
-}
-
-func (v scoreMoveValidator) Validate(ctx context.Context, cmd Command, delay time.Duration) (Command, error) {
-	validated, err := v.Validator.Validate(ctx, cmd, delay)
-	if err != nil {
-		return Command{}, err
-	}
-	if !v.pacing.CommandAllowed(cmd) {
-		return Command{}, NewValidationError(errWholeCommandPacing)
-	}
-	return validated, nil
-}
-
-func (c Command) standbyCost() float64 {
-	cost := 0.0
-	for _, n := range c.Results.ExistingNodes {
-		if len(n.Pods) > 0 && standby.HasStandbyTaint(n.Node) {
-			cost += c.scoreBasedStandbyPrices[n.Name()]
-		}
-	}
-	return cost
-}
 
 func logScoreDecision(ctx context.Context, evals []*moveSetEvaluation, stats searchStats, eligible int, blocked []string, duration time.Duration, reason string) {
 	fields := []interface{}{"eligibleCandidates", eligible, "evaluatedMoves", stats.Evaluated, "keptMoves", len(evals), "simulationErrors", stats.Errors, "noOp", stats.NoOp, "noSavings", stats.NoSavings, "deadlineHit", stats.TimedOut, "duration", duration, "blockedNodePools", blocked}
@@ -97,42 +55,21 @@ func logScoreDecision(ctx context.Context, evals []*moveSetEvaluation, stats sea
 }
 
 func moveLog(eval *moveSetEvaluation) map[string]interface{} {
+	cmd := eval.Command
 	sources := []map[string]interface{}{}
-	for _, c := range eval.Command.Candidates {
+	for _, c := range cmd.Candidates {
 		sources = append(sources, map[string]interface{}{"node": c.Name(), "nodePool": c.NodePool.Name, "instanceType": c.Labels()[corev1.LabelInstanceTypeStable], "capacityType": c.Labels()[v1.CapacityTypeLabelKey], "price": c.Price})
 	}
 	destinations := []map[string]interface{}{}
-	for _, name := range standbyDestinations(eval.Command.Results) {
-		destinations = append(destinations, map[string]interface{}{"node": name, "price": eval.Command.scoreBasedStandbyPrices[name]})
+	for _, name := range standbyDestinations(cmd.Results) {
+		destinations = append(destinations, map[string]interface{}{"node": name, "price": eval.StandbyPrices[name]})
 	}
 	var newNode interface{}
-	for _, n := range eval.Command.Results.NewNodeClaims {
+	for _, n := range cmd.Results.NewNodeClaims {
 		if len(n.InstanceTypeOptions) > 0 {
-			price := 0.0
-			offerings := n.InstanceTypeOptions[0].Offerings.Available().Compatible(n.Requirements)
-			if len(offerings) > 0 {
-				price = offerings.Cheapest().Price
-			}
-			newNode = map[string]interface{}{"instanceType": n.InstanceTypeOptions[0].Name, "price": price}
+			// EstimatedSavings is the sources' price minus the new node's price.
+			newNode = map[string]interface{}{"instanceType": n.InstanceTypeOptions[0].Name, "price": cmd.SourceCost() - cmd.EstimatedSavings()}
 		}
 	}
 	return map[string]interface{}{"kind": "single", "sources": sources, "newNode": newNode, "reactivatedStandbyNodes": destinations, "savings": eval.Score, "validation": eval.Validation}
-}
-
-func validateStandbyDestinations(expected, actual pscheduling.Results) error {
-	if !slices.Equal(standbyDestinations(expected), standbyDestinations(actual)) {
-		return NewSchedulingValidationError(fmt.Errorf("standby destinations changed"))
-	}
-	return nil
-}
-
-func standbyDestinations(results pscheduling.Results) []string {
-	names := []string{}
-	for _, n := range results.ExistingNodes {
-		if len(n.Pods) > 0 && standby.HasStandbyTaint(n.Node) {
-			names = append(names, n.Name())
-		}
-	}
-	sort.Strings(names)
-	return names
 }
