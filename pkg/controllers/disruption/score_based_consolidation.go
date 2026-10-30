@@ -111,7 +111,6 @@ func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candida
 	return s.consolidation.ShouldDisrupt(ctx, cn)
 }
 
-//nolint:gocyclo
 func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
 	if s.IsConsolidated() {
 		return []Command{}, nil
@@ -119,35 +118,16 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 
 	start := s.clock.Now()
 	deadline := start.Add(ScoreBasedConsolidationTimeoutDuration)
-	blocked := map[string]bool{}
+	validCandidates, blocked := s.filterCandidates(disruptionBudgetMapping, candidates)
 	reason := "no_saving_move"
 	var evals []*moveSetEvaluation
 	var stats searchStats
-	eligible := 0
+	eligible := len(validCandidates)
 	var searchDuration time.Duration
 	defer func() {
-		names := []string{}
-		for name := range blocked {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		logScoreDecision(ctx, evals, stats, eligible, names, searchDuration, reason)
+		logScoreDecision(ctx, evals, stats, eligible, blocked, searchDuration, reason)
 	}()
 
-	var validCandidates []*Candidate
-	for _, candidate := range candidates {
-		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
-			blocked[candidate.NodePool.Name] = true
-			continue
-		}
-		if len(candidate.reschedulablePods) > 0 && !s.disruptionPacing.CandidateAllowed(candidate.NodePool, 0) {
-			blocked[candidate.NodePool.Name] = true
-			continue
-		}
-		validCandidates = append(validCandidates, candidate)
-	}
-
-	eligible = len(validCandidates)
 	var err error
 	evals, stats, err = s.searchForMoveSets(ctx, validCandidates, deadline)
 	searchDuration = s.clock.Since(start)
@@ -171,13 +151,8 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		return []Command{}, nil
 	}
 
-	remainingValidationDelay := commandValidationDelay - s.clock.Since(start)
-	if remainingValidationDelay > 0 {
-		select {
-		case <-ctx.Done():
-			return []Command{}, ctx.Err()
-		case <-s.clock.After(remainingValidationDelay):
-		}
+	if err := s.waitForValidation(ctx, start); err != nil {
+		return []Command{}, err
 	}
 	reason = "all_rejected_by_validation"
 	cmd, err := selectFirstStillValidCommand(ctx, scoreMoveValidator{s.validator, s.disruptionPacing}, s.recorder, evals)
@@ -188,6 +163,40 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		return []Command{}, nil
 	}
 	return []Command{cmd}, nil
+}
+
+func (s *ScoreBasedConsolidation) filterCandidates(disruptionBudgetMapping map[string]int, candidates []*Candidate) ([]*Candidate, []string) {
+	var validCandidates []*Candidate
+	blocked := map[string]bool{}
+	for _, candidate := range candidates {
+		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
+			blocked[candidate.NodePool.Name] = true
+			continue
+		}
+		if len(candidate.reschedulablePods) > 0 && !s.disruptionPacing.CandidateAllowed(candidate.NodePool, 0) {
+			blocked[candidate.NodePool.Name] = true
+			continue
+		}
+		validCandidates = append(validCandidates, candidate)
+	}
+	names := []string{}
+	for name := range blocked {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return validCandidates, names
+}
+
+func (s *ScoreBasedConsolidation) waitForValidation(ctx context.Context, start time.Time) error {
+	remainingValidationDelay := commandValidationDelay - s.clock.Since(start)
+	if remainingValidationDelay > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.clock.After(remainingValidationDelay):
+		}
+	}
+	return nil
 }
 
 func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, candidates []*Candidate, deadline time.Time) ([]*moveSetEvaluation, searchStats, error) {
