@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/samber/lo"
@@ -180,6 +181,23 @@ func instanceTypeForNode(inputs *NodePoolInputs, node *state.StateNode) *cloudpr
 		}
 	}
 	return nil
+}
+
+// NodePrice returns the offering price for the node's zone and capacity type.
+// It returns 0 when the instance type is nil, no matching offering exists, or the price is NaN.
+func NodePrice(node *state.StateNode, instanceType *cloudprovider.InstanceType) float64 {
+	if instanceType == nil {
+		return 0
+	}
+	labels := node.Labels()
+	price, ok := instanceType.OfferingPrice(labels[corev1.LabelTopologyZone], labels[v1.CapacityTypeLabelKey])
+	if !ok {
+		return 0
+	}
+	if math.IsNaN(price) {
+		return 0
+	}
+	return price
 }
 
 func sortPreparedExistingNodes(nodes []*preparedExistingNode) {
