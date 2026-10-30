@@ -28,11 +28,152 @@ Use --run to target unit tests or a non-default suite name explicitly.
 
 Focused runs use a 3m test timeout; --full uses 20m. Override with CHECK_FAST_TIMEOUT.
 Complete test output is retained in a temporary log whose path is printed.
+Failure summaries are limited to 16 KiB, 10 failures, 40 context lines per
+failure, and 1 KiB per line. Truncated details remain in the full log.
 Progress is printed every 15 seconds while tests run.
 
 Envtest defaults to installed Kubernetes 1.36.2 assets. Install missing assets
 separately with: go tool -modfile=go.tools.mod setup-envtest use -p path 1.36.2
 EOF
+}
+
+summarize_failure() {
+    local summary
+    echo "check-fast: $1"
+    # Keep the full log untouched. Buffer the summary so a formatter failure
+    # cannot print a partial report followed by an unbounded fallback.
+    if ! summary="$(LC_ALL=C awk '
+        function clip(s, limit, marker) {
+            marker = " ... [truncated]"
+            return length(s) <= limit ? s : substr(s, 1, limit - length(marker)) marker
+        }
+        function emit(s) {
+            s = clip(s, 1023)
+            if (bytes + length(s) + 1 > 14000) exhausted = 1
+            if (exhausted) { shortened = 1; return }
+            print s
+            bytes += length(s) + 1
+        }
+        function failure(name, kind) {
+            total++
+            if (total > 10) return -1
+            names[total] = clip(name, 511)
+            kinds[total] = kind
+            return total
+        }
+        function context(id, line) {
+            if (id < 1) return
+            if (++lines[id] <= 40) details[id] = details[id] clip(line, 1023) "\n"
+            else omitted[id] = 1
+        }
+        {
+            gsub(/\033\[[0-?]*[ -\/]*[@-~]/, "")
+            line = clip($0, 1023)
+            if (NR <= 10) head[NR] = line
+            tail[(NR - 1) % 10] = line
+
+            # Crashes and build errors may never produce a completed test.
+            if ($0 ~ /^(panic:|fatal error:|# |go: )/ || $0 ~ /^[^[:space:]]+\.go:[0-9]+(:[0-9]+)?:/) diagnostic = 1
+            if (diagnostic) {
+                if (++diagnostic_lines <= 20) diagnostic_head[diagnostic_lines] = line
+                else diagnostic_tail[(diagnostic_lines - 21) % 20] = line
+            }
+
+            # Ginkgo reports repeat failures in the final suite summary. Use
+            # the detailed blocks, and prefer the final assertion over timelines.
+            if ($0 ~ /\[(FAILED|PANICKED|TIMEDOUT|ABORTED|INTERRUPTED)\].*\[[0-9.]+ seconds\]/) {
+                ginkgo = failure(line, "Ginkgo")
+                suite[active] = 1
+                part = message = 0
+                next
+            }
+            if ($0 ~ /^--------------------/) ginkgo = 0
+            if (ginkgo) {
+                if ($0 !~ /^[[:space:]]*$/ && part < 2) {
+                    if (ginkgo > 0) {
+                        if (part == 0) names[ginkgo] = clip($0, 511)
+                        else locations[ginkgo] = clip($0, 511)
+                    }
+                    part++
+                    next
+                }
+                if ($0 ~ /^[[:space:]]+\[(FAILED|PANICKED|TIMEDOUT|ABORTED|INTERRUPTED)\]/) {
+                    message = 1
+                    if (ginkgo > 0) { details[ginkgo] = ""; lines[ginkgo] = omitted[ginkgo] = 0 }
+                }
+                if (message) {
+                    if (ginkgo > 0 && $0 ~ /^[[:space:]]+In .* at:/) locations[ginkgo] = clip($0, 511)
+                    context(ginkgo, line)
+                }
+                next
+            }
+
+            # Go assertions precede --- FAIL. Retain a bounded ring for each
+            # active test, following ownership switches in verbose output.
+            if ($0 ~ /^=== (RUN|CONT|NAME)[[:space:]]/) { active = $3; next }
+            if ($0 ~ /^=== PAUSE[[:space:]]/) { active = ""; next }
+            if ($0 ~ /^[[:space:]]*--- (PASS|SKIP|FAIL): /) {
+                name = $3
+                if ($0 ~ /--- FAIL:/) {
+                    if (suite[name]) suite_result = line
+                    else if (!child_failed[name] || buffered[name] > 0) {
+                        id = failure("Go test: " name, "Go")
+                        start = buffered[name] > 40 ? buffered[name] - 40 : 0
+                        for (j = start; j < buffered[name]; j++) context(id, output[name, j % 40])
+                        if (id > 0 && buffered[name] > 40) omitted[id] = 1
+                    }
+                    parent = name
+                    while (sub(/\/[^\/]+$/, "", parent)) child_failed[parent] = 1
+                }
+                for (j = 0; j < 40; j++) delete output[name, j]
+                delete buffered[name]
+                if (active == name) active = ""
+                next
+            }
+            if (active != "") output[active, buffered[active]++ % 40] = line
+        }
+        END {
+            selected = total < 10 ? total : 10
+            if (total) emit("Failures: " total)
+            for (i = 1; i <= selected; i++) {
+                emit(i ". " names[i])
+                if (locations[i] != "") emit(locations[i])
+            }
+            if (total > selected) emit((total - selected) " additional failures omitted; see full log.")
+            if (suite_result != "") emit(suite_result)
+            for (i = 1; i <= selected; i++) {
+                if (details[i] == "") continue
+                emit("")
+                emit("Context " i (kinds[i] == "Go" ? " (Go output; attribution is best effort):" : ":"))
+                n = split(details[i], block, "\n")
+                for (j = 1; j < n; j++) emit(block[j])
+                useful = 1
+                if (omitted[i]) shortened = 1
+            }
+            if (diagnostic_lines) {
+                emit("General crash/build diagnostics:")
+                for (i = 1; i <= 20 && i <= diagnostic_lines; i++) emit(diagnostic_head[i])
+                if (diagnostic_lines > 40) { emit("... diagnostic lines omitted ..."); shortened = 1 }
+                start = diagnostic_lines > 40 ? diagnostic_lines - 20 : 20
+                for (i = start; i < diagnostic_lines; i++) emit(diagnostic_tail[(i - 20) % 20])
+            } else if (!useful) {
+                emit("Unrecognized or incomplete failure output; general log excerpts:")
+                for (i = 1; i <= 10 && i <= NR; i++) emit(head[i])
+                if (NR > 20) { emit("... log lines omitted ..."); shortened = 1 }
+                start = NR > 20 ? NR - 9 : 11
+                for (i = start; i <= NR; i++) emit(tail[(i - 1) % 10])
+            }
+            if (shortened) print "[Output truncated by display limits; see full log.]"
+        }
+    ' "$test_output" 2>/dev/null)"; then
+        summary="$(
+            printf 'Summary unavailable; general log excerpts:\n'
+            { head -c 4096 "$test_output"; printf '\n...\n'; tail -c 4096 "$test_output"; } | LC_ALL=C cut -b 1-1000
+        )"
+    fi
+    printf '%s\n' "$summary"
+    # The formatter reserves room for the reason, truncation notice and log path.
+    printf 'check-fast: full log: %s\n' "$test_output" | LC_ALL=C cut -b 1-1023
 }
 
 cd "$(dirname "$0")/.."
@@ -148,7 +289,7 @@ wait "$heartbeat_pid" 2>/dev/null || true
 trap - EXIT
 
 if ((test_status != 0)); then
-    cat "$test_output"
+    summarize_failure "tests failed (exit status $test_status)"
     exit "$test_status"
 fi
 test_elapsed=$((SECONDS - test_start))
@@ -162,13 +303,11 @@ if ! grep -q '^=== RUN ' "$parse_output"; then
         echo "check-fast: $pkg — compiled; no test files (${test_elapsed}s)"
         exit 0
     fi
-    cat "$test_output"
-    echo 'No tests ran; correct the test filter' >&2
+    summarize_failure 'No tests ran; correct the test filter'
     exit 1
 fi
 if [[ -n "$focus" ]] && ! grep -Eq '^Ran [1-9][0-9]* of [0-9]+ Specs' "$parse_output"; then
-    cat "$test_output"
-    echo 'No Ginkgo specs ran; ensure --run selects the suite entry point' >&2
+    summarize_failure 'No Ginkgo specs ran; ensure --run selects the suite entry point'
     exit 1
 fi
 ginkgo_summary="$(grep -E '^Ran [0-9]+ of [0-9]+ Specs' "$parse_output" | tail -1 || true)"
