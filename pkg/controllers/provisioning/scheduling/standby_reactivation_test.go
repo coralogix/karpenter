@@ -48,25 +48,25 @@ var _ = Describe("Standby reactivation", func() {
 	})
 
 	It("places a pending pod on a standby node and clears standby without a new NodeClaim", func() {
-		nodeClaim, node := givenMarkedStandbyNode(nodePool)
+		node := givenMarkedStandbyNode(nodePool)
 		pod := test.UnschedulablePod()
 
 		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
 
 		Expect(ExpectScheduled(ctx, env.Client, pod).Name).To(Equal(node.Name))
 		Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
-		expectNotStandby(node, nodeClaim)
+		expectNotStandby(node)
 		Expect(cluster.IsNodeNominated(node.Spec.ProviderID)).To(BeTrue())
 	})
 
 	It("places a buffer pod on a standby node and clears standby without nominating the node", func() {
-		nodeClaim, node := givenMarkedStandbyNode(nodePool)
+		node := givenMarkedStandbyNode(nodePool)
 		bufferCtx, bufferProvisioner := givenCapacityBuffer(1)
 
 		ExpectProvisioned(bufferCtx, env.Client, cluster, cloudProvider, bufferProvisioner)
 
 		Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
-		expectNotStandby(node, nodeClaim)
+		expectNotStandby(node)
 		Expect(cluster.IsNodeNominated(node.Spec.ProviderID)).To(BeFalse())
 	})
 })
@@ -88,11 +88,10 @@ func givenCapacityBuffer(replicas int32) (context.Context, *provisioning.Provisi
 		deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client))
 }
 
-func givenMarkedStandbyNode(nodePool *v1.NodePool) (*v1.NodeClaim, *corev1.Node) {
+func givenMarkedStandbyNode(nodePool *v1.NodePool) *corev1.Node {
 	nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels:      map[string]string{v1.NodePoolLabelKey: nodePool.Name},
-			Annotations: map[string]string{v1.StandbyNodeClaimAnnotationKey: env.Clock.Now().UTC().Format(time.RFC3339Nano)},
+			Labels: map[string]string{v1.NodePoolLabelKey: nodePool.Name},
 		},
 		Spec: v1.NodeClaimSpec{Taints: []corev1.Taint{v1.StandbyNoScheduleTaint}},
 		Status: v1.NodeClaimStatus{
@@ -103,15 +102,15 @@ func givenMarkedStandbyNode(nodePool *v1.NodePool) (*v1.NodeClaim, *corev1.Node)
 			},
 		},
 	})
+	node.Annotations = map[string]string{v1.StandbyNodeAnnotationKey: env.Clock.Now().UTC().Format(time.RFC3339Nano)}
 	ExpectApplied(ctx, env.Client, nodeClaim, node)
 	ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
-	return nodeClaim, node
+	return node
 }
 
-func expectNotStandby(node *corev1.Node, nodeClaim *v1.NodeClaim) {
+func expectNotStandby(node *corev1.Node) {
 	GinkgoHelper()
 	Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(node), node)).To(Succeed())
 	Expect(standby.HasStandbyTaint(node)).To(BeFalse())
-	Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), nodeClaim)).To(Succeed())
-	Expect(nodeClaim.Annotations).NotTo(HaveKey(v1.StandbyNodeClaimAnnotationKey))
+	Expect(node.Annotations).NotTo(HaveKey(v1.StandbyNodeAnnotationKey))
 }

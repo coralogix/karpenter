@@ -22,7 +22,7 @@ spec:
 | Annotation | Meaning |
 |------------|---------|
 | `karpenter.coralogix.net/score-based-consolidation` | Opt the NodePool into score-based consolidation (presence of the key is sufficient; value is ignored) |
-| `karpenter.coralogix.net/reclamation-delay` | Go duration a node must stay in standby before reclamation may delete it. Absent or invalid values default to **15s**. `0s` or negative values mean no minimum age (reclamation may delete on a later disruption pass). |
+| `karpenter.coralogix.net/reclamation-delay` | Go duration a node must stay in standby before reclamation may delete it. Absent or invalid values default to **15s**. `0s` or negative values mean no minimum age and no mandatory extra pass. |
 
 ## Standby and reclamation
 
@@ -30,14 +30,16 @@ On opted-in dynamic NodePools, empty nodes are marked **standby** instead of bei
 
 ### Standby marks (set by Karpenter)
 
-When a node enters standby, Karpenter writes the marks below. **Do not set or edit these in manifests**; they are observability and control state on live Nodes and NodeClaims. Reactivation and disruption repair clear them when the node leaves standby.
+When a node enters standby, Karpenter writes the marks below. **Do not set or edit these in manifests**; they are observability and control state on live Nodes. Reactivation and disruption repair clear them when the node leaves standby.
 
 | Mark | Object | Set by | Meaning |
 |------|--------|--------|---------|
 | `karpenter.coralogix.net/standby:NoSchedule` | Node (taint) | Disruption | Ordinary pods cannot bind while the node is standby. |
-| `karpenter.coralogix.net/standby` | NodeClaim (annotation) | Disruption | Standby start time in **RFC3339Nano UTC** (for example `2026-10-27T11:00:00.123456789Z`). Reclamation compares this timestamp to the pool’s `reclamation-delay`. The value survives a Karpenter restart so time already spent in standby still counts. If the taint is present but the annotation is missing or not an RFC3339Nano timestamp, disruption backfills the timestamp and reclamation does not delete the node on that pass. |
+| `karpenter.coralogix.net/standby` | Node (annotation) | Disruption | Standby start time in **RFC3339Nano UTC** (for example `2026-10-27T11:00:00.123456789Z`). Reclamation compares this timestamp to the pool’s `reclamation-delay`. The value survives a Karpenter restart so time already spent in standby still counts. If the taint is present but the annotation is missing or not an RFC3339Nano timestamp, disruption backfills the timestamp with now. A positive delay starts from that timestamp. With zero or negative delay, same-pass reclamation is permitted if the timestamp is visible in the cache, but is not guaranteed. |
 
-To inspect standby state: `kubectl describe node <name>` for the taint, and `kubectl get nodeclaim <name> -o jsonpath='{.metadata.annotations.karpenter\.coralogix\.net/standby}'` for the timestamp.
+Entering standby writes the taint (with no value) and timestamp together in one Node update; reactivation and repair clear both together. The taint determines whether a node is standby. Repair clears an annotation without a taint; it cannot make the node reclaimable. Later standby entry writes a fresh timestamp. Repair also clears standby when a reschedulable pod appears or the NodePool stops qualifying.
+
+To inspect standby state: `kubectl describe node <name>` for the taint, and `kubectl get node <name> -o jsonpath='{.metadata.annotations.karpenter\.coralogix\.net/standby}'` for the timestamp.
 
 ### Reactivation
 
@@ -67,4 +69,4 @@ Rolling back the controller to upstream Karpenter is safe:
 - Annotated NodePools resume standard emptiness and underutilized consolidation behavior.
 - No manifest or CRD changes are required to roll back.
 
-After rollback, nodes may still carry the standby **taint** until you remove it manually (`kubectl taint nodes <node> karpenter.coralogix.net/standby:NoSchedule-`), so scheduling is not blocked with no controller managing standby. Leftover **NodeClaim** `karpenter.coralogix.net/standby` annotations are inert for upstream; they disappear when the NodeClaim is deleted.
+After rollback, nodes may still carry the standby **taint** until you remove it manually (`kubectl taint nodes <node> karpenter.coralogix.net/standby:NoSchedule-`), so scheduling is not blocked with no controller managing standby. Leftover **Node** `karpenter.coralogix.net/standby` annotations are inert for upstream; they disappear when the Node is deleted.

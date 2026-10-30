@@ -199,8 +199,8 @@ func (p *Provisioner) CreateNodeClaims(ctx context.Context, nodeClaims []*schedu
 func (p *Provisioner) ReactivateStandby(ctx context.Context, results scheduler.Results) error {
 	var errs []error
 	for _, n := range results.ExistingNodes {
-		if len(n.Pods) > 0 && standby.IsMarked(n.Node, n.NodeClaim) {
-			errs = append(errs, standby.Clear(ctx, p.kubeClient, n.Node, n.NodeClaim))
+		if len(n.Pods) > 0 && standby.HasStandbyTaint(n.Node) {
+			errs = append(errs, standby.Clear(ctx, p.kubeClient, n.Node))
 		}
 	}
 	return multierr.Combine(errs...)

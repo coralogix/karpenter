@@ -85,7 +85,7 @@ func candidateReadyForReclamation(cluster *state.Cluster, recorder events.Record
 	if !candidateEmptyForStandbyWork(cluster, c) || !standby.HasStandbyTaint(c.Node) {
 		return false
 	}
-	ts, ok := standby.Timestamp(c.NodeClaim)
+	ts, ok := standby.Timestamp(c.Node)
 	return ok && !clk.Now().Before(ts.Add(reclamationDelay(c.NodePool, recorder)))
 }
 
