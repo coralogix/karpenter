@@ -26,6 +26,7 @@ import (
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 const ReclamationConsolidationType = "reclamation"
@@ -81,10 +82,10 @@ func candidateReadyForReclamation(cluster *state.Cluster, recorder events.Record
 	if c == nil || c.Node == nil || c.NodeClaim == nil {
 		return false
 	}
-	if !candidateEmptyForStandbyWork(cluster, c) || !nodeHasStandbyTaint(c.Node) {
+	if !candidateEmptyForStandbyWork(cluster, c) || !standby.HasStandbyTaint(c.Node) {
 		return false
 	}
-	ts, ok := standbyTimestamp(c.NodeClaim)
+	ts, ok := standby.Timestamp(c.NodeClaim)
 	return ok && !clk.Now().Before(ts.Add(reclamationDelay(c.NodePool, recorder)))
 }
 

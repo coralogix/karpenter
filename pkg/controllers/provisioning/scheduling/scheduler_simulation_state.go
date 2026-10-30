@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/disruption"
 	"sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
+	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 // PreparedSchedulerState binds one scheduler baseline to the captured node
@@ -105,7 +106,7 @@ func prepareSchedulerNodes(ctx context.Context, baseline *SchedulerBaseline, sta
 			deletingNodeNames.Insert(node.Name())
 			continue
 		}
-		taints := node.Taints()
+		taints := standby.WithoutStandbyTaint(node.Taints())
 		daemons := getCompatibleDaemonPods(ctx, node, taints, daemonSetPods)
 		daemonResources := resources.RequestsForPods(daemons...)
 		nodePool := nodePoolsByName[node.Labels()[v1.NodePoolLabelKey]]
