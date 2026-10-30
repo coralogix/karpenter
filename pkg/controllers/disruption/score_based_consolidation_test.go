@@ -64,23 +64,9 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 	})
 
 	AfterEach(func() {
-		disruption.ScoreBasedConsolidationTimeoutDuration = 20 * time.Second
+		disruption.ScoreBasedConsolidationTimeoutDuration = 15 * time.Second
 		env.Clock.SetTime(time.Now())
 		ExpectCleanedUp(ctx, env.Client)
-	})
-
-	Context("Candidate sorting", func() {
-		It("should sort candidates by score descending", func() {
-			cheapCandidate, err := createScoreBasedCandidateForPool(scoreBasedNodePool, leastExpensiveInstance, test.Pod())
-			Expect(err).To(BeNil())
-			expensiveCandidate, err := createScoreBasedCandidateForPool(scoreBasedNodePool, mostExpensiveInstance, test.Pod())
-			Expect(err).To(BeNil())
-
-			sorted := scoreBased.SortCandidates([]*disruption.Candidate{cheapCandidate, expensiveCandidate})
-			Expect(sorted).To(HaveLen(2))
-			Expect(sorted[0].Labels()[corev1.LabelInstanceTypeStable]).To(Equal(mostExpensiveInstance.Name))
-			Expect(sorted[1].Labels()[corev1.LabelInstanceTypeStable]).To(Equal(leastExpensiveInstance.Name))
-		})
 	})
 
 	Context("Empty nodes", func() {

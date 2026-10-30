@@ -34,6 +34,7 @@ type ExistingNode struct {
 	cachedAvailable         v1.ResourceList // Cache so we don't have to re-subtract resources on the StateNode every time
 	cachedTaints            []v1.Taint      // Cache so we don't hae to re-construct the taints each time
 	Pods                    []*v1.Pod
+	Price                   float64
 	topology                *Topology
 	remainingResources      v1.ResourceList
 	requirements            scheduling.Requirements
@@ -60,6 +61,7 @@ type preparedExistingNode struct {
 	volumeUsage             *scheduling.VolumeUsage
 	instanceType            *cloudprovider.InstanceType
 	isUnderConsolidateAfter bool
+	price                   float64
 }
 
 func prepareExistingNode(n *state.StateNode, taints []v1.Taint, daemonResources v1.ResourceList, instanceType *cloudprovider.InstanceType, isUnderConsolidateAfter bool) *preparedExistingNode {
@@ -86,6 +88,7 @@ func prepareExistingNode(n *state.StateNode, taints []v1.Taint, daemonResources 
 		volumeUsage:             cloneVolumeUsage(n.VolumeUsage()),
 		instanceType:            instanceType,
 		isUnderConsolidateAfter: isUnderConsolidateAfter,
+		price:                   NodePrice(n, instanceType),
 	}
 }
 
@@ -104,6 +107,7 @@ func (n *preparedExistingNode) materialize(topology *Topology) *ExistingNode {
 		volumeUsage:             cloneVolumeUsage(n.volumeUsage),
 		instanceType:            n.instanceType,
 		isUnderConsolidateAfter: n.isUnderConsolidateAfter,
+		Price:                   n.price,
 	}
 }
 

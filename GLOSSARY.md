@@ -51,3 +51,11 @@ _Avoid_: pair, 2→1 move
 **Score**:
 The number that ranks moves within one pass. A move whose score is not positive is never chosen.
 _Avoid_: priority, nodePriorityScore
+
+**Budget-blocked pool**:
+A NodePool that cannot start further scored consolidation moves in this pass because its configurable disruption budget for the relevant reason allows none.
+_Avoid_: blocked pool
+
+**Pacing-blocked pool**:
+A NodePool whose non-empty disruption is held back by pool-scoped pacing: invalid pacing configuration or an active rate cooldown for its pacing scope.
+_Avoid_: blocked pool, throttled pool

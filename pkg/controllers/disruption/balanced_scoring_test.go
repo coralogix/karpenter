@@ -83,7 +83,7 @@ func makeCandidate(nodeName string, np *v1.NodePool, it *cloudprovider.InstanceT
 		instanceType:             it,
 		NodePool:                 np,
 		reschedulablePods:        pods,
-		Price:                    resolveNodePrice(sn, it),
+		Price:                    pscheduling.NodePrice(sn, it),
 		RescheduleDisruptionCost: computeRescheduleDisruptionCost(context.Background(), pods),
 	}
 }
