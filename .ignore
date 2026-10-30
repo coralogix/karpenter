@@ -1,0 +1,4 @@
+# Codex `@` / file search uses ignore rules like ripgrep. `.scratch/` stays in
+# `.gitignore`; negations here make local scratch files discoverable in `@`.
+!.scratch/
+!.scratch/**

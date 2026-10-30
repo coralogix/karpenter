@@ -1,5 +1,6 @@
 # This is the format of an AWS ECR Public Repo as an example.
-export GOTOOLCHAIN ?= go1.25.7
+export GOTOOLCHAIN ?= go1.26.6
+export GOLANGCI_LINT_CACHE ?= $(shell git rev-parse --show-toplevel)/.cache/golangci-lint
 export KWOK_REPO ?= ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
 export KARPENTER_NAMESPACE=kube-system
 export KIND_CLUSTER_NAME ?= test-cluster

@@ -9,6 +9,7 @@ go.work.sum
 report.json
 *__debug_*
 bin/
+.cache/
 
 # Local cluster benchmark fixtures (see cluster-fixture-scraper/README.md)
 testdata/clusterfixtures/
@@ -25,4 +26,13 @@ profiles/
 *.swp
 *.swo
 *~
+
+# Local agentic coding configs
 .cursor
+docs/agents/
+AGENTS.md
+AGENTS.override.md
+.scratch/
+.agents
+skills-lock.json
+notes.md
