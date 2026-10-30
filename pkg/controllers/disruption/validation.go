@@ -29,6 +29,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
+	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 )
@@ -189,33 +190,41 @@ func NewMultiConsolidationValidator(c consolidation) *ConsolidationValidator {
 }
 
 func (c *ConsolidationValidator) Validate(ctx context.Context, cmd Command, validationPeriod time.Duration) (Command, error) {
-	if err := c.isValid(ctx, cmd, validationPeriod); err != nil {
+	results, err := c.isValid(ctx, cmd, validationPeriod)
+	if err != nil {
 		return Command{}, err
 	}
+	// Keep the launch options used for pricing while retaining the re-simulated pod placements.
+	if len(results.NewNodeClaims) > 0 && len(cmd.Results.NewNodeClaims) > 0 {
+		results.NewNodeClaims[0].InstanceTypeOptions = cmd.Results.NewNodeClaims[0].InstanceTypeOptions
+		results.NewNodeClaims[0].Requirements = cmd.Results.NewNodeClaims[0].Requirements
+	}
+	cmd.Results = results
 	return cmd, nil
 }
 
-func (c *ConsolidationValidator) isValid(ctx context.Context, cmd Command, validationPeriod time.Duration) error {
+func (c *ConsolidationValidator) isValid(ctx context.Context, cmd Command, validationPeriod time.Duration) (pscheduling.Results, error) {
 	if validationPeriod > 0 {
 		select {
 		case <-ctx.Done():
-			return errors.New("context canceled")
+			return pscheduling.Results{}, errors.New("context canceled")
 		case <-c.clock.After(validationPeriod):
 		}
 	}
 	validatedCandidates, err := c.validateCandidates(ctx, cmd.Candidates...)
 	if err != nil {
-		return err
+		return pscheduling.Results{}, err
 	}
-	if err := c.validateCommand(ctx, cmd, validatedCandidates); err != nil {
-		return err
+	results, err := c.validateCommand(ctx, cmd, validatedCandidates)
+	if err != nil {
+		return pscheduling.Results{}, err
 	}
 	// Revalidate candidates after validating the command. This mitigates the chance of a race condition outlined in
 	// the following GitHub issue: https://github.com/kubernetes-sigs/karpenter/issues/1167.
 	if _, err = c.validateCandidates(ctx, validatedCandidates...); err != nil {
-		return err
+		return pscheduling.Results{}, err
 	}
-	return nil
+	return results, nil
 }
 
 func (e *EmptinessValidator) validateCandidates(ctx context.Context, candidates ...*Candidate) ([]*Candidate, error) {
@@ -293,21 +302,23 @@ func (c *ConsolidationValidator) validateCandidates(ctx context.Context, candida
 }
 
 // ValidateCommand validates a command for a Method
-func (v *validation) validateCommand(ctx context.Context, cmd Command, candidates []*Candidate) error {
+//
+//nolint:gocyclo
+func (v *validation) validateCommand(ctx context.Context, cmd Command, candidates []*Candidate) (pscheduling.Results, error) {
 	// None of the chosen candidate are valid for execution, so retry
 	if len(candidates) == 0 {
-		return NewValidationError(fmt.Errorf("no candidates"))
+		return pscheduling.Results{}, NewValidationError(fmt.Errorf("no candidates"))
 	}
 	simulator, err := NewConsolidationSchedulingSimulator(ctx, v.kubeClient, v.cluster, v.provisioner, v.clock, v.recorder, candidates...)
 	if err != nil {
-		return err
+		return pscheduling.Results{}, err
 	}
 	results, err := simulator.Simulate(ctx, candidates...)
 	if err != nil {
-		return fmt.Errorf("simluating scheduling, %w", err)
+		return pscheduling.Results{}, fmt.Errorf("simluating scheduling, %w", err)
 	}
 	if !results.AllNonPendingPodsScheduled() {
-		return NewSchedulingValidationError(errors.New(results.NonPendingPodSchedulingErrors()))
+		return pscheduling.Results{}, NewSchedulingValidationError(errors.New(results.NonPendingPodSchedulingErrors()))
 	}
 
 	// We want to ensure that the re-simulated scheduling using the current cluster state produces the same result.
@@ -319,22 +330,22 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 	if len(results.NewNodeClaims) == 0 {
 		if len(cmd.Replacements) == 0 {
 			// scheduling produced zero new NodeClaims and we weren't expecting any, so this is valid.
-			return nil
+			return results, nil
 		}
 		// if it produced no new NodeClaims, but we were expecting one we should re-simulate as there is likely a better
 		// consolidation option now
-		return NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results"))
+		return pscheduling.Results{}, NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results"))
 	}
 
 	// we need more than one replacement node which is never valid currently (all of our node replacement is m->1, never m->n)
 	if len(results.NewNodeClaims) > 1 {
-		return NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results"))
+		return pscheduling.Results{}, NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results"))
 	}
 
 	// we now know that scheduling simulation wants to create one new node
 	if len(cmd.Replacements) == 0 {
 		// but we weren't expecting any new NodeClaims, so this is invalid
-		return NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results"))
+		return pscheduling.Results{}, NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results"))
 	}
 
 	// We know that the scheduling simulation wants to create a new node and that the command we are verifying wants
@@ -349,13 +360,13 @@ func (v *validation) validateCommand(ctx context.Context, cmd Command, candidate
 	// now says that we need to launch a 4xlarge. It's still launching the correct number of NodeClaims, but it's just
 	// as expensive or possibly more so we shouldn't validate.
 	if !instanceTypesAreSubset(cmd.Replacements[0].InstanceTypeOptions, results.NewNodeClaims[0].InstanceTypeOptions) {
-		return NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results"))
+		return pscheduling.Results{}, NewSchedulingValidationError(fmt.Errorf("scheduling simulation produced new results"))
 	}
 
 	// Now we know:
 	// - current scheduling simulation says to create a new node with types T = {T_0, T_1, ..., T_n}
 	// - our lifecycle command says to create a node with types {U_0, U_1, ..., U_n} where U is a subset of T
-	return nil
+	return results, nil
 }
 
 // getValidationFailureReason categorizes validation errors into specific failure types
