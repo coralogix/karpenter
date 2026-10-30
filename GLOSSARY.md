@@ -29,5 +29,25 @@ The decision to let a standby node take pods again. Provisioning and evacuation 
 _Avoid_: activation
 
 **Consolidation**:
-A disruption decision that removes a node's pods and deletes the node as one action.
-_Avoid_: evacuation
+A disruption method that moves pods onto cheaper or better-packed capacity. Upstream consolidation deletes its source nodes in the same action; score-based consolidation evacuates them.
+_Avoid_: compaction
+
+**Score-based consolidation**:
+The consolidation method for opted-in NodePools that ranks moves by score and carries out the chosen move as evacuations.
+_Avoid_: compaction, score-based evacuation
+
+**Move**:
+One or more source nodes chosen to be evacuated together, with the simulated placement of their pods.
+_Avoid_: move set, compaction
+
+**Batch move**:
+A move of several source nodes whose pods all fit on existing or standby nodes, with no new node.
+_Avoid_: batch
+
+**Pair move**:
+A move of exactly two source nodes whose pods fit on exactly one new node.
+_Avoid_: pair, 2→1 move
+
+**Score**:
+The number that ranks moves within one pass. A move whose score is not positive is never chosen.
+_Avoid_: priority, nodePriorityScore
