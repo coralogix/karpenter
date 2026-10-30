@@ -45,6 +45,15 @@ var _ = Describe("Score-based savings selection", func() {
 func givenTwoEvacuationSources() (*v1.NodeClaim, *corev1.Node, *corev1.Node) {
 	GinkgoHelper()
 	source, node, _ := givenEvacuationSource()
+	// The expensive source also holds a large workload, so the removed price-per-workload ranking preferred the cheaper source.
+	largeRS := test.ReplicaSet()
+	ExpectApplied(ctx, env.Client, largeRS)
+	Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(largeRS), largeRS)).To(Succeed())
+	largePod := paceReplicaSetPods(largeRS, 1)[0]
+	largePod.Spec.Containers[0].Resources.Requests = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")}
+	ExpectApplied(ctx, env.Client, largePod)
+	ExpectManualBinding(ctx, env.Client, largePod, node)
+	refreshStandbyState(node, source)
 	pool := &v1.NodePool{}
 	Expect(env.Client.Get(ctx, client.ObjectKey{Name: source.Labels[v1.NodePoolLabelKey]}, pool)).To(Succeed())
 	medium := paceOnDemandInstanceType("less-expensive-source", 5)

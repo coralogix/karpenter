@@ -129,7 +129,7 @@ func TestScoreBasedConsolidationValidatorFilter(t *testing.T) {
 	}
 }
 
-func TestEvaluateMoveSetsPar_ranksSavings(t *testing.T) {
+func TestSearchMoves_ranksSavings(t *testing.T) {
 	ctx := context.Background()
 	moveSets := make([]moveSet, 2)
 	delays := []time.Duration{50 * time.Millisecond, 5 * time.Millisecond}
@@ -158,17 +158,17 @@ func TestEvaluateMoveSetsPar_ranksSavings(t *testing.T) {
 		t.Fatalf("evaluations = %d, want 2", len(winner))
 	}
 	if winner[0].Command.Candidates[0].NodePool.Name != "1" {
-		t.Fatalf("first evaluation index = %q, want %q", winner[0].Command.Candidates[0].NodePool.Name, "0")
+		t.Fatalf("first evaluation index = %q, want %q", winner[0].Command.Candidates[0].NodePool.Name, "1")
 	}
 	if winner[1].Command.Candidates[0].NodePool.Name != "0" {
-		t.Fatalf("second evaluation index = %q, want %q", winner[1].Command.Candidates[0].NodePool.Name, "1")
+		t.Fatalf("second evaluation index = %q, want %q", winner[1].Command.Candidates[0].NodePool.Name, "0")
 	}
 	if evaluated != 2 {
 		t.Fatalf("evaluated = %d, want 2", evaluated)
 	}
 }
 
-func TestEvaluateMoveSetsPar_stopsOnDeadline(t *testing.T) {
+func TestSearchMoves_stopsOnDeadline(t *testing.T) {
 	ctx := context.Background()
 	candidate := candidateWithPrice(t, 0.10)
 	moveSets := []moveSet{{Nodes: []*Candidate{candidate}}, {Nodes: []*Candidate{candidate}}}
@@ -195,7 +195,7 @@ func TestEvaluateMoveSetsPar_stopsOnDeadline(t *testing.T) {
 	}
 }
 
-func TestEvaluateMoveSetsPar_keepsTenBest(t *testing.T) {
+func TestSearchMoves_keepsTenBest(t *testing.T) {
 	ctx := context.Background()
 	moveSets := make([]moveSet, 12)
 	for i := range moveSets {
@@ -224,7 +224,7 @@ func TestEvaluateMoveSetsPar_keepsTenBest(t *testing.T) {
 	}
 }
 
-func TestEvaluateMoveSetsPar_returnsPartialOnTimeout(t *testing.T) {
+func TestSearchMoves_returnsPartialOnTimeout(t *testing.T) {
 	orig := scoreBasedMoveSetParallelism
 	scoreBasedMoveSetParallelism = 1
 	t.Cleanup(func() { scoreBasedMoveSetParallelism = orig })

@@ -64,7 +64,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 	})
 
 	AfterEach(func() {
-		disruption.ScoreBasedConsolidationTimeoutDuration = 20 * time.Second
+		disruption.ScoreBasedConsolidationTimeoutDuration = 15 * time.Second
 		env.Clock.SetTime(time.Now())
 		ExpectCleanedUp(ctx, env.Client)
 	})

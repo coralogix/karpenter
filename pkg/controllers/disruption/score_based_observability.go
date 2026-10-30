@@ -18,6 +18,7 @@ package disruption
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -32,9 +33,19 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+var errWholeCommandPacing = errors.New("whole-command pacing")
+
 type scoreMoveValidator struct {
 	Validator
 	pacing *DisruptionPacing
+}
+
+func scoreBasedValidationFailureReason(err error) string {
+	var ve *ValidationError
+	if errors.As(err, &ve) && errors.Is(ve.error, errWholeCommandPacing) {
+		return "pacing"
+	}
+	return getValidationFailureReason(err)
 }
 
 func (v scoreMoveValidator) Validate(ctx context.Context, cmd Command, delay time.Duration) (Command, error) {
@@ -43,7 +54,7 @@ func (v scoreMoveValidator) Validate(ctx context.Context, cmd Command, delay tim
 		return Command{}, err
 	}
 	if !v.pacing.CommandAllowed(cmd) {
-		return Command{}, NewValidationError(fmt.Errorf("whole-command pacing"))
+		return Command{}, NewValidationError(errWholeCommandPacing)
 	}
 	return validated, nil
 }

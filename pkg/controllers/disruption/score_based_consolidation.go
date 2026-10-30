@@ -35,6 +35,8 @@ import (
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/events"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 var ScoreBasedConsolidationTimeoutDuration = 15 * time.Second
@@ -122,26 +124,23 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	var evals []*moveSetEvaluation
 	var stats searchStats
 	eligible := 0
+	var searchDuration time.Duration
 	defer func() {
 		names := []string{}
 		for name := range blocked {
 			names = append(names, name)
 		}
 		sort.Strings(names)
-		logScoreDecision(ctx, evals, stats, eligible, names, s.clock.Since(start), reason)
+		logScoreDecision(ctx, evals, stats, eligible, names, searchDuration, reason)
 	}()
-	constrainedByBudgets := false
-	constrainedByDisruptionPacing := false
 
 	var validCandidates []*Candidate
 	for _, candidate := range candidates {
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
-			constrainedByBudgets = true
 			blocked[candidate.NodePool.Name] = true
 			continue
 		}
 		if len(candidate.reschedulablePods) > 0 && !s.disruptionPacing.CandidateAllowed(candidate.NodePool, 0) {
-			constrainedByDisruptionPacing = true
 			blocked[candidate.NodePool.Name] = true
 			continue
 		}
@@ -151,6 +150,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	eligible = len(validCandidates)
 	var err error
 	evals, stats, err = s.searchForMoveSets(ctx, validCandidates, deadline)
+	searchDuration = s.clock.Since(start)
 	if err != nil {
 		reason = "simulation_error"
 		return []Command{}, err
@@ -165,8 +165,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		reason = "timed_out"
 	}
 	if len(evals) == 0 {
-
-		if stats.canMarkConsolidated(len(evals), constrainedByBudgets || constrainedByDisruptionPacing) {
+		if stats.canMarkConsolidated(eligible, len(blocked) > 0) {
 			s.markConsolidated()
 		}
 		return []Command{}, nil
@@ -268,6 +267,7 @@ func searchMoves(ctx context.Context, moves []moveSet, deadline time.Time, compu
 		stats.Evaluated++
 		if err != nil {
 			stats.Errors++
+			log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
 			return nil, false, nil
 		}
 		if cmd.Decision() == NoOpDecision || len(cmd.Replacements) > 1 {
@@ -281,26 +281,20 @@ func searchMoves(ctx context.Context, moves []moveSet, deadline time.Time, compu
 		}
 		return &moveSetEvaluation{Command: cmd, Score: savings, Validation: "not_attempted"}, true, nil
 	})
-	evals, _ := collectMoveSetEvaluations(valid, scoreBasedValidEvaluationsTarget)
+	evals := topMovesBySavings(valid, scoreBasedValidEvaluationsTarget)
 	return evals, stats
 }
 
-func collectMoveSetEvaluations(valid <-chan rill.Try[*moveSetEvaluation], limit int) ([]*moveSetEvaluation, error) {
-	defer rill.Discard(valid)
-
-	evals := make([]*moveSetEvaluation, 0, limit)
+func topMovesBySavings(valid <-chan rill.Try[*moveSetEvaluation], limit int) []*moveSetEvaluation {
+	evals := []*moveSetEvaluation{}
 	for a := range valid {
-		if a.Error != nil {
-			return nil, a.Error
-		}
 		evals = append(evals, a.Value)
-
 	}
 	sort.SliceStable(evals, func(i, j int) bool { return evals[i].Score > evals[j].Score })
 	if len(evals) > limit {
 		evals = evals[:limit]
 	}
-	return evals, nil
+	return evals
 }
 
 func selectFirstStillValidCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation) (Command, error) {
@@ -308,10 +302,11 @@ func selectFirstStillValidCommand(ctx context.Context, validator Validator, reco
 
 	for i, eval := range evals {
 		if _, err := validator.Validate(ctx, eval.Command, 0); err != nil {
-			eval.Validation = getValidationFailureReason(err)
+			reason := scoreBasedValidationFailureReason(err)
+			eval.Validation = "failed: " + reason
 			if IsValidationError(err) {
 				if i == 0 {
-					firstValidationReason = getValidationFailureReason(err)
+					firstValidationReason = reason
 				}
 				continue
 			}
@@ -338,6 +333,6 @@ func (s *ScoreBasedConsolidation) ConsolidationType() string {
 	return ScoreBasedConsolidationType
 }
 
-func (s searchStats) canMarkConsolidated(kept int, blocked bool) bool {
-	return kept == 0 && !s.TimedOut && s.Errors == 0 && !blocked
+func (s searchStats) canMarkConsolidated(eligible int, blocked bool) bool {
+	return s.Evaluated == eligible && s.Errors == 0 && !blocked
 }
