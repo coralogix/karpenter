@@ -61,6 +61,7 @@ const (
 	DisruptionPacingPerMinuteAnnotationKey = "karpenter.coralogix.net/disruption-pacing-per-minute"
 	DisruptionPacingPerBatchAnnotationKey  = "karpenter.coralogix.net/disruption-pacing-per-batch"
 	ScoreBasedConsolidationAnnotationKey   = "karpenter.coralogix.net/score-based-consolidation"
+	EvacuationTimeoutAnnotationKey         = "karpenter.coralogix.net/evacuation-timeout"
 	ReclamationDelayAnnotationKey          = "karpenter.coralogix.net/reclamation-delay"
 	StandbyNodeAnnotationKey               = "karpenter.coralogix.net/standby"
 )

@@ -188,6 +188,9 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	// We use the number of commands in the queue as a proxy for cloud provider traffic.
 	// As the number of commands increase, we expect more delays and scale the retry duration accordingly.
 	retryDuration := q.GetMaxRetryDuration()
+	if cmd.isScoreBasedEvacuation() {
+		retryDuration = evacuationTimeout(cmd.Candidates[0].NodePool, q.recorder)
+	}
 	// Wrap an error in an unrecoverable error if it timed out
 	defer func() {
 		if q.clock.Since(cmd.CreationTimestamp) > retryDuration {
@@ -226,6 +229,13 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	// If we have any errors, don't continue
 	if err := multierr.Combine(waitErrs...); err != nil {
 		return fmt.Errorf("waiting for replacement initialization, %w", err)
+	}
+
+	if cmd.isScoreBasedEvacuation() {
+		if q.clock.Since(cmd.CreationTimestamp) >= retryDuration {
+			return NewUnrecoverableError(fmt.Errorf("command reached timeout"))
+		}
+		return q.evacuate(ctx, cmd)
 	}
 
 	// All replacements have been provisioned.
@@ -445,7 +455,7 @@ func (q *Queue) GetCommands() []*Command {
 
 // CompleteCommand fully clears the queue of all references of a hash/command
 func (q *Queue) CompleteCommand(cmd *Command) {
-	if !cmd.Succeeded {
+	if !cmd.Succeeded || cmd.isScoreBasedEvacuation() {
 		q.cluster.UnmarkForDeletion(lo.Map(cmd.Candidates, func(c *Candidate, _ int) string { return c.ProviderID() })...)
 	}
 	// Remove all candidates linked to the command

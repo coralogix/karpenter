@@ -31,15 +31,17 @@ import (
 )
 
 var _ = Describe("Standby reactivation", func() {
-	It("clears standby on a consolidation destination and still deletes the source", func() {
+	It("clears standby on an evacuation destination and leaves the source standby", func() {
 		_, destinationNode, source := givenStandbyDestinationAndSource()
 
 		reconcileThroughValidationDelay(disruptionController)
 
 		Expect(queue.GetCommands()).To(HaveLen(1))
 		expectNotStandby(destinationNode)
+		queueSourceNode := queuedSourceNode()
 		ExpectObjectReconciled(ctx, env.Client, queue, source)
-		ExpectNotFound(ctx, env.Client, source)
+		finishEvacuation(source)
+		expectMarkedStandby(queueSourceNode)
 	})
 
 	It("leaves standby unchanged when validation rejects the consolidation", func() {
