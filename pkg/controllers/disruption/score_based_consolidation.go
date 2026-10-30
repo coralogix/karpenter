@@ -19,11 +19,13 @@ package disruption
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math/rand"
-	"sort"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/awslabs/operatorpkg/option"
 
@@ -156,24 +158,17 @@ func searchOutcomeReason(candidates, eligible int, timedOut bool) string {
 
 func (s *ScoreBasedConsolidation) filterCandidates(disruptionBudgetMapping map[string]int, candidates []*Candidate) ([]*Candidate, []string) {
 	var validCandidates []*Candidate
-	blocked := map[string]bool{}
+	blocked := sets.New[string]()
 	for _, candidate := range candidates {
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
-			blocked[candidate.NodePool.Name] = true
-			continue
+			blocked.Insert(candidate.NodePool.Name)
+		} else if len(candidate.reschedulablePods) > 0 && !s.disruptionPacing.CandidateAllowed(candidate.NodePool, 0) {
+			blocked.Insert(candidate.NodePool.Name)
+		} else {
+			validCandidates = append(validCandidates, candidate)
 		}
-		if len(candidate.reschedulablePods) > 0 && !s.disruptionPacing.CandidateAllowed(candidate.NodePool, 0) {
-			blocked[candidate.NodePool.Name] = true
-			continue
-		}
-		validCandidates = append(validCandidates, candidate)
 	}
-	names := []string{}
-	for name := range blocked {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return validCandidates, names
+	return validCandidates, slices.Sorted(maps.Keys(blocked))
 }
 
 func (s *ScoreBasedConsolidation) waitForValidation(ctx context.Context, start time.Time) error {
@@ -204,9 +199,10 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, candida
 	for i, c := range candidates {
 		moves[i] = moveSet{Nodes: []*Candidate{c}}
 	}
+	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec
 	evals, stats := searchMoves(ctx, moves, deadline, func(ctx context.Context, candidates ...*Candidate) (Command, error) {
 		return s.computeConsolidation(ctx, simulator, candidates...)
-	}, prices, rand.New(rand.NewSource(time.Now().UnixNano())), s.clock) //nolint:gosec
+	}, prices, rng, s.clock)
 	return evals, stats, nil
 }
 
@@ -216,7 +212,7 @@ func (s *ScoreBasedConsolidation) nodePrices(ctx context.Context) (map[string]fl
 		return nil, err
 	}
 	prices := map[string]float64{}
-	for _, node := range s.cluster.DeepCopyNodes() {
+	for node := range s.cluster.Nodes() {
 		poolName := node.Labels()[v1.NodePoolLabelKey]
 		it := instanceTypes[poolName][node.Labels()[corev1.LabelInstanceTypeStable]]
 		if it == nil {
