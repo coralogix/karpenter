@@ -89,7 +89,7 @@ fi
 if $lint; then
     echo 'Running configured linters on selected packages'
     GOTOOLCHAIN="$formatter_toolchain" \
-        GOLANGCI_LINT_CACHE="$(git rev-parse --absolute-git-dir)/golangci-lint-cache" \
+        GOLANGCI_LINT_CACHE="$(git rev-parse --show-toplevel)/.cache/golangci-lint" \
         go tool -modfile=go.tools.mod golangci-lint-kube-api-linter run \
         --fix=false --modules-download-mode=readonly "${packages[@]}"
 fi

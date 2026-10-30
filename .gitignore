@@ -9,6 +9,7 @@ go.work.sum
 report.json
 *__debug_*
 bin/
+.cache/
 
 # Local cluster benchmark fixtures (see cluster-fixture-scraper/README.md)
 testdata/clusterfixtures/
