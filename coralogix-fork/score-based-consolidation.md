@@ -102,7 +102,9 @@ Lifecycle metrics show the outcome of score-based moves and the capacity held in
 
 ## Tracing
 
-With tracing enabled, each score-based pass has a `karpenter.disruption.score_based_consolidation` span. Its `search` child contains `single`, `batch`, and `pair` spans for phases that run. Each phase records `candidate_count`, `evaluated_move_count`, and `deadline_hit`; scheduling simulation spans are nested under the phase. The `validation_wait` span measures the remaining delay, and `validate` records the selected move's search `rank` (one-based) and `kind` when a move is selected.
+With tracing enabled, each disruption controller pass has a `karpenter.disruption.loop` span. Each method that runs has a child named for its Go type, with an `outcome` attribute: `command` when it produces a command, `nothing` when it produces none, or `failed` on error. The score-based pass is nested under its method span.
+
+Each score-based pass has a `karpenter.disruption.score_based_consolidation` span. Its `search` child contains `single`, `batch`, and `pair` spans for phases that run. Each phase records `candidate_count`, `evaluated_move_count`, and `deadline_hit`; scheduling simulation spans are nested under the phase. The `validation_wait` span measures the remaining delay, and `validate` records the selected move's search `rank` (one-based) and `kind` when a move is selected.
 
 ## Rollback to upstream
 
