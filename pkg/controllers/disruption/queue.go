@@ -177,6 +177,15 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 		log.FromContext(ctx).V(1).Info("command succeeded")
 		cmd.Succeeded = true
 	}
+	if cmd.isScoreBasedEvacuation() {
+		outcome := "failed"
+		duration := q.clock.Since(cmd.CreationTimestamp)
+		if cmd.Succeeded {
+			outcome = "succeeded"
+			duration = cmd.allSourcesStandbyAt.Sub(cmd.CreationTimestamp)
+		}
+		EvacuationDurationSeconds.Observe(duration.Seconds(), map[string]string{"outcome": outcome})
+	}
 	q.CompleteCommand(cmd)
 	return reconcile.Result{}, nil
 }
@@ -355,7 +364,7 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	cmd.Candidates = markedCandidates
 
 	// Pods evicted from the candidates can only bind to standby destinations after standby is cleared.
-	if err := q.provisioner.ReactivateStandby(ctx, cmd.Results); err != nil {
+	if err := q.provisioner.ReactivateStandby(ctx, cmd.Results, "disruption"); err != nil {
 		return serrors.Wrap(fmt.Errorf("reactivating standby destinations, %w", err), "command-id", cmd.ID)
 	}
 

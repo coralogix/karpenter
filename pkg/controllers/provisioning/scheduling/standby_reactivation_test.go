@@ -20,6 +20,12 @@ import (
 	"context"
 	"time"
 
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+
+	"sigs.k8s.io/karpenter/pkg/metrics"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -50,12 +56,15 @@ var _ = Describe("Standby reactivation", func() {
 	It("places a pending pod on a standby node and clears standby without a new NodeClaim", func() {
 		node := givenMarkedStandbyNode(nodePool)
 		pod := test.UnschedulablePod()
+		counter := metrics.StandbyReactivatedTotal.(*opmetrics.PrometheusCounter).WithLabelValues(nodePool.Name, "provisioning")
+		before := metricCounterValue(counter)
 
 		ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, pod)
 
 		Expect(ExpectScheduled(ctx, env.Client, pod).Name).To(Equal(node.Name))
 		Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
 		expectNotStandby(node)
+		Expect(metricCounterValue(counter)).To(Equal(before + 1))
 		Expect(cluster.IsNodeNominated(node.Spec.ProviderID)).To(BeTrue())
 	})
 
@@ -113,4 +122,10 @@ func expectNotStandby(node *corev1.Node) {
 	Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(node), node)).To(Succeed())
 	Expect(standby.HasStandbyTaint(node)).To(BeFalse())
 	Expect(node.Annotations).NotTo(HaveKey(v1.StandbyNodeAnnotationKey))
+}
+
+func metricCounterValue(counter prometheus.Counter) float64 {
+	sample := &dto.Metric{}
+	Expect(counter.Write(sample)).To(Succeed())
+	return sample.GetCounter().GetValue()
 }

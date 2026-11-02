@@ -19,6 +19,10 @@ package disruption_test
 import (
 	"time"
 
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
+
+	"sigs.k8s.io/karpenter/pkg/metrics"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -33,12 +37,15 @@ import (
 
 var _ = Describe("Standby reactivation", func() {
 	It("clears standby on an evacuation destination and leaves the source standby", func() {
-		_, destinationNode, source := givenStandbyDestinationAndSource()
+		pool, destinationNode, source := givenStandbyDestinationAndSource()
+		counter := metrics.StandbyReactivatedTotal.(*opmetrics.PrometheusCounter).WithLabelValues(pool.Name, "disruption")
+		before := metricCounterValue(counter)
 
 		reconcileThroughValidationDelay(disruptionController)
 
 		Expect(queue.GetCommands()).To(HaveLen(1))
 		expectNotStandby(destinationNode)
+		Expect(metricCounterValue(counter)).To(Equal(before + 1))
 		queueSourceNode := queuedSourceNode()
 		ExpectObjectReconciled(ctx, env.Client, queue, source)
 		finishEvacuation(source)

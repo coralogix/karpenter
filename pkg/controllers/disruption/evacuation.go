@@ -36,6 +36,7 @@ import (
 	terminatorevents "sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
@@ -91,10 +92,18 @@ func (q *Queue) evacuateSource(ctx context.Context, cmd *Command, candidate *Can
 			return false, multierr.Append(errs, fmt.Errorf("waiting for %d evacuation pods", len(waiting)))
 		}
 		// Persist standby before removing the temporary disruption taint.
-		if err := standby.Mark(ctx, q.kubeClient, candidate.Node, q.clock.Now()); err != nil {
+		marked, err := standby.MarkIfPresent(ctx, q.kubeClient, candidate.Node, q.clock.Now())
+		if err != nil {
 			return false, fmt.Errorf("marking evacuated node standby, %w", err)
 		}
+		if !marked {
+			return false, NewUnrecoverableError(fmt.Errorf("evacuation source is being deleted"))
+		}
 		cmd.evacuatedSources[candidate.ProviderID()] = evacuationMarkedStandby
+		if len(cmd.evacuatedSources) == len(cmd.Candidates) && cmd.allSourcesStandbyAt.IsZero() {
+			cmd.allSourcesStandbyAt = q.clock.Now()
+		}
+		metrics.NodeClaimsEvacuatedTotal.Inc(map[string]string{metrics.NodePoolLabel: candidate.NodeClaim.Labels[v1.NodePoolLabelKey], metrics.CapacityTypeLabel: candidate.NodeClaim.Labels[v1.CapacityTypeLabelKey]})
 	}
 	if err := state.RequireNoScheduleTaint(ctx, q.kubeClient, false, candidate.StateNode); err != nil {
 		return false, err

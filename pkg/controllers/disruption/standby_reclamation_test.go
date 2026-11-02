@@ -19,6 +19,8 @@ package disruption_test
 import (
 	"time"
 
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -43,10 +45,14 @@ const (
 var _ = Describe("Standby and reclamation", func() {
 	DescribeTable("marks an empty score-based node standby instead of deleting it",
 		func(policy v1.ConsolidationPolicy) {
-			_, _, node := givenStandbyNode(policy, nil)
+			pool, claim, node := givenStandbyNode(policy, nil)
 			reconcileDisruption()
 
 			expectMarkedStandby(node)
+			refreshStandbyState(node, claim)
+			reconcileDisruption()
+			gauge := disruption.StandbyNodes.(*opmetrics.PrometheusGauge).WithLabelValues(pool.Name)
+			Expect(metricGaugeValue(gauge)).To(Equal(float64(1)))
 			Expect(queue.GetCommands()).To(BeEmpty())
 		},
 		Entry("WhenEmptyOrUnderutilized", v1.ConsolidationPolicyWhenEmptyOrUnderutilized),
