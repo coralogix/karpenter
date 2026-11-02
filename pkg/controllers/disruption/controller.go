@@ -31,6 +31,8 @@ import (
 	"github.com/awslabs/operatorpkg/singleton"
 
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
@@ -42,6 +44,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
@@ -158,6 +161,8 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
+	ctx, endPass := cxtracing.Start(ctx, "karpenter.disruption.loop")
+	defer endPass()
 
 	// this won't catch if the reconciler loop hangs forever, but it will catch other issues
 	c.logAbnormalRuns(ctx)
@@ -215,7 +220,12 @@ func (c *Controller) reconcileMethods(ctx context.Context) (reconciler.Result, e
 	// Attempt different disruption methods. We'll only let one method perform an action
 	for _, m := range c.methods {
 		c.recordRun(fmt.Sprintf("%T", m))
-		success, err := c.disrupt(ctx, m)
+		methodCtx, endMethod := cxtracing.Start(ctx, fmt.Sprintf("%T", m), attribute.String("outcome", "nothing"))
+		success, err := c.disrupt(methodCtx, m)
+		if err != nil {
+			trace.SpanFromContext(methodCtx).SetAttributes(attribute.String("outcome", "failed"))
+		}
+		endMethod()
 		if err != nil {
 			if errors.IsConflict(err) {
 				return reconciler.Result{Requeue: true}, nil
@@ -268,6 +278,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 	if len(cmds) == 0 {
 		return false, nil
 	}
+	trace.SpanFromContext(ctx).SetAttributes(attribute.String("outcome", "command"))
 	return c.dispatchCommands(ctx, disruption, cmds)
 }
 
