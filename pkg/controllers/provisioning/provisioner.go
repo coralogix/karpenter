@@ -196,11 +196,15 @@ func (p *Provisioner) CreateNodeClaims(ctx context.Context, nodeClaims []*schedu
 
 // ReactivateStandby clears standby on every existing node the results place pods on, so those pods can bind.
 // Only results that are acted on may be passed; simulations never change standby.
-func (p *Provisioner) ReactivateStandby(ctx context.Context, results scheduler.Results) error {
+func (p *Provisioner) ReactivateStandby(ctx context.Context, results scheduler.Results, source string) error {
 	var errs []error
 	for _, n := range results.ExistingNodes {
 		if len(n.Pods) > 0 && standby.HasStandbyTaint(n.Node) {
-			errs = append(errs, standby.Clear(ctx, p.kubeClient, n.Node))
+			reactivated, err := standby.Reactivate(ctx, p.kubeClient, n.Node)
+			errs = append(errs, err)
+			if reactivated {
+				metrics.StandbyReactivatedTotal.Inc(map[string]string{metrics.NodePoolLabel: n.Node.Labels[v1.NodePoolLabelKey], "source": source})
+			}
 		}
 	}
 	return multierr.Combine(errs...)
@@ -534,7 +538,7 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 		// these nodeClaims don't have a name until they are created
 		filterVirtualPodMapping(results.ExistingNodeToPodMapping()))
 	results.Record(ctx, p.recorder, p.cluster)
-	if err := p.ReactivateStandby(ctx, results); err != nil {
+	if err := p.ReactivateStandby(ctx, results, "provisioning"); err != nil {
 		log.FromContext(ctx).Error(err, "reactivating standby nodes")
 	}
 	return results, nil

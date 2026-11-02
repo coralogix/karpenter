@@ -207,6 +207,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{}, serrors.Wrap(fmt.Errorf("repairing standby state, %w", err), "operation", "standby-repair")
 	}
 
+	c.recordStandbyNodes(nodePoolMap)
 	return c.reconcileMethods(ctx)
 }
 

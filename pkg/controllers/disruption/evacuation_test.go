@@ -19,6 +19,12 @@ package disruption_test
 import (
 	"time"
 
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+
+	"sigs.k8s.io/karpenter/pkg/metrics"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -38,6 +44,13 @@ import (
 var _ = Describe("Evacuation", func() {
 	DescribeTable("blocks new pods while evacuating and leaves the source NodeClaim in standby", func(policy v1.ConsolidationPolicy) {
 		pool, destination, source := givenStandbyDestinationAndSource()
+		labels := map[string]string{metrics.NodePoolLabel: pool.Name, metrics.CapacityTypeLabel: source.Labels[v1.CapacityTypeLabelKey]}
+		counter := metrics.NodeClaimsEvacuatedTotal.(*opmetrics.PrometheusCounter).With(labels)
+		before := metricCounterValue(counter)
+		histogram := disruption.EvacuationDurationSeconds.(*opmetrics.PrometheusHistogram).WithLabelValues("succeeded")
+		sample := &dto.Metric{}
+		Expect(histogram.(prometheus.Metric).Write(sample)).To(Succeed())
+		beforeCount := sample.GetHistogram().GetSampleCount()
 		pool.Spec.Disruption.ConsolidationPolicy = policy
 		pool.Annotations[v1.DisruptionPacingPerMinuteAnnotationKey] = "0.1"
 		ExpectApplied(ctx, env.Client, pool)
@@ -62,6 +75,9 @@ var _ = Describe("Evacuation", func() {
 		expectMarkedStandby(node)
 		Expect(node.Spec.Taints).NotTo(ContainElement(v1.DisruptedNoScheduleTaint))
 		Expect(queue.IsEmpty()).To(BeTrue())
+		Expect(metricCounterValue(counter)).To(Equal(before + 1))
+		Expect(histogram.(prometheus.Metric).Write(sample)).To(Succeed())
+		Expect(sample.GetHistogram().GetSampleCount()).To(Equal(beforeCount + 1))
 	},
 		Entry("WhenEmptyOrUnderutilized", v1.ConsolidationPolicyWhenEmptyOrUnderutilized),
 		Entry("Balanced", v1.ConsolidationPolicyBalanced),
@@ -103,6 +119,10 @@ var _ = Describe("Evacuation", func() {
 
 	DescribeTable("stops retrying blocked evictions after evacuation times out", func(annotation string, timeout time.Duration) {
 		pool, _, source := givenStandbyDestinationAndSource()
+		histogram := disruption.EvacuationDurationSeconds.(*opmetrics.PrometheusHistogram).WithLabelValues("failed").(prometheus.Metric)
+		sample := &dto.Metric{}
+		Expect(histogram.Write(sample)).To(Succeed())
+		beforeCount := sample.GetHistogram().GetSampleCount()
 		if annotation != "" {
 			pool.Annotations["karpenter.coralogix.net/evacuation-timeout"] = annotation
 			ExpectApplied(ctx, env.Client, pool)
@@ -130,6 +150,8 @@ var _ = Describe("Evacuation", func() {
 		Expect(queue.IsEmpty()).To(BeTrue())
 		expectNoDisruptedTaint(sourceNode)
 		expectNodeClaimRetained(source)
+		Expect(histogram.Write(sample)).To(Succeed())
+		Expect(sample.GetHistogram().GetSampleCount()).To(Equal(beforeCount + 1))
 	}, Entry("default timeout", "", 5*time.Minute), Entry("custom timeout", "20m", 20*time.Minute))
 
 	It("does not evacuate a node running a pod that tolerates the disruption taint", func() {
@@ -270,4 +292,16 @@ func expectNoDisruptedTaint(node *corev1.Node) {
 	GinkgoHelper()
 	Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(node), node)).To(Succeed())
 	Expect(node.Spec.Taints).NotTo(ContainElement(v1.DisruptedNoScheduleTaint))
+}
+
+func metricCounterValue(counter prometheus.Counter) float64 {
+	sample := &dto.Metric{}
+	Expect(counter.Write(sample)).To(Succeed())
+	return sample.GetCounter().GetValue()
+}
+
+func metricGaugeValue(gauge prometheus.Gauge) float64 {
+	sample := &dto.Metric{}
+	Expect(gauge.Write(sample)).To(Succeed())
+	return sample.GetGauge().GetValue()
 }

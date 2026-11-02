@@ -93,6 +93,13 @@ The existing `karpenter_voluntary_disruption_decision_evaluation_duration_second
 
 `karpenter_voluntary_disruption_score_based_move_evaluations_total` counts simulations by `result`: `feasible`, `no_op`, `no_savings`, `non_positive_score`, or `error`. `karpenter_voluntary_disruption_score_based_moves_selected_total` counts chosen moves by `kind` (`single`, `batch`, or `pair`).
 
+Lifecycle metrics show the outcome of score-based moves and the capacity held in standby:
+
+- `karpenter_nodeclaims_evacuated_total{nodepool, capacity_type}` counts each source handed to standby, including sources in a command that later fails.
+- `karpenter_voluntary_disruption_evacuation_duration_seconds{outcome}` records the time from command start to completion or failure, with `outcome` `succeeded` or `failed`.
+- `karpenter_nodes_standby_reactivated_total{nodepool, source}` counts standby nodes reactivated by `provisioning` or `disruption`.
+- `karpenter_nodepools_standby_nodes{nodepool}` reports standby nodes on each score-based NodePool per disruption pass. Its series disappears when the pool leaves score-based consolidation or is deleted.
+
 ## Rollback to upstream
 
 Rolling back the controller to upstream Karpenter is safe:

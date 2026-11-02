@@ -230,6 +230,7 @@ type Command struct {
 	Succeeded bool
 
 	evacuatedSources                    map[string]evacuationProgress
+	allSourcesStandbyAt                 time.Time
 	staticNodeCountReservationHandedOff bool
 
 	CreationTimestamp time.Time
