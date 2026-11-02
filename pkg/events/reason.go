@@ -28,6 +28,7 @@ const (
 	ConsolidationRejected      = "ConsolidationRejected"
 	ConsolidationApproved      = "ConsolidationApproved"
 	InvalidEvacuationTimeout   = "InvalidEvacuationTimeout"
+	InvalidUtilizationWeight   = "InvalidUtilizationWeight"
 	InvalidReclamationDelay    = "InvalidReclamationDelay"
 
 	// provisioning/scheduling

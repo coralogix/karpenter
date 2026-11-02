@@ -42,6 +42,7 @@ import (
 // in one disruption search. Candidate policy stays in the disruption methods;
 // this value only captures the pod and node data needed to evaluate scenarios.
 type SchedulingSimulator struct {
+	nodes               state.StateNodes
 	inputs              *provisioning.PreparedSimulationInputs
 	pendingPodIDs       []provisioning.SimulationPodID
 	deletingNodePodIDs  []provisioning.SimulationPodID
@@ -183,6 +184,7 @@ func newSchedulingSimulator(ctx context.Context, kubeClient client.Client, clust
 		return client.ObjectKeyFromObject(pod), struct{}{}
 	})
 	return &SchedulingSimulator{
+		nodes:               snapshot.nodes,
 		inputs:              inputs,
 		pendingPodIDs:       pendingPodIDs,
 		deletingNodePodIDs:  deletingNodePodIDs,

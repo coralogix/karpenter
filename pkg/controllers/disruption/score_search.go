@@ -27,11 +27,8 @@ import (
 	"k8s.io/utils/clock"
 
 	"github.com/destel/rill"
-	"github.com/samber/lo"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
-
-	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 )
 
 var scoreBasedValidEvaluationsTarget = 10
@@ -44,14 +41,16 @@ type moveSet struct {
 
 type moveSetEvaluation struct {
 	Command Command
-	// Score is the savings from the search simulation.
+	// Score is the total from the search simulation.
 	Score float64
-	// RescoredScore is the savings after validation re-simulation.
+	// RescoredScore is the total after validation re-simulation.
 	RescoredScore float64
 	// StandbyPrices holds the hourly price of each standby node the move reactivates.
-	StandbyPrices map[string]float64
-	Validation    string
-	Selected      bool
+	Breakdown       scoreBreakdown
+	SearchBreakdown scoreBreakdown
+	StandbyPrices   map[string]float64
+	Validation      string
+	Selected        bool
 }
 
 type consolidationComputer func(ctx context.Context, candidates ...*Candidate) (Command, error)
@@ -64,8 +63,8 @@ type searchStats struct {
 	TimedOut  bool
 }
 
-// searchMoves simulates every move and keeps the most profitable ones. nodePrices gives the hourly price of each cluster node, which prices the standby nodes a move reactivates.
-func searchMoves(ctx context.Context, moves []moveSet, deadline time.Time, compute consolidationComputer, nodePrices map[string]float64, random *rand.Rand, clk clock.Clock) ([]*moveSetEvaluation, searchStats) {
+// searchMoves simulates every move and keeps the highest-scoring ones. nodePrices gives the hourly price of each cluster node, which prices the standby nodes a move reactivates.
+func searchMoves(ctx context.Context, moves []moveSet, deadline time.Time, compute consolidationComputer, inputs scoreInputs, random *rand.Rand, clk clock.Clock) ([]*moveSetEvaluation, searchStats) {
 	moves = append([]moveSet(nil), moves...)
 	random.Shuffle(len(moves), func(i, j int) { moves[i], moves[j] = moves[j], moves[i] })
 	var stats searchStats
@@ -98,30 +97,18 @@ func searchMoves(ctx context.Context, moves []moveSet, deadline time.Time, compu
 			stats.NoOp++
 			return nil, false, nil
 		}
-		savings, standbyPrices := scoreMove(cmd, cmd.Results, nodePrices)
-		if savings <= 0 {
+		breakdown, standbyPrices := inputs.score(cmd, cmd.Results)
+		if breakdown.Savings <= 0 || breakdown.Total <= 0 {
 			stats.NoSavings++
 			return nil, false, nil
 		}
-		return &moveSetEvaluation{Command: cmd, Score: savings, StandbyPrices: standbyPrices, Validation: "not_attempted"}, true, nil
+		return &moveSetEvaluation{Command: cmd, Score: breakdown.Total, Breakdown: breakdown, SearchBreakdown: breakdown, StandbyPrices: standbyPrices, Validation: "not_attempted"}, true, nil
 	})
-	evals := topMovesBySavings(valid, scoreBasedValidEvaluationsTarget)
+	evals := topMovesByScore(valid, scoreBasedValidEvaluationsTarget)
 	return evals, stats
 }
 
-// scoreMove is the command's estimated savings minus the price of the standby nodes that results reactivate. Results
-// are passed separately because a re-simulation changes the standbys but its replacement options are not price-filtered,
-// so the savings must keep coming from the command the search built.
-func scoreMove(cmd Command, results pscheduling.Results, nodePrices map[string]float64) (score float64, standbyPrices map[string]float64) {
-	standbyPrices = map[string]float64{}
-	for _, name := range standbyDestinations(results) {
-		standbyPrices[name] = nodePrices[name]
-	}
-	score = cmd.EstimatedSavings() - lo.Sum(lo.Values(standbyPrices))
-	return score, standbyPrices
-}
-
-func topMovesBySavings(valid <-chan rill.Try[*moveSetEvaluation], limit int) []*moveSetEvaluation {
+func topMovesByScore(valid <-chan rill.Try[*moveSetEvaluation], limit int) []*moveSetEvaluation {
 	evals := []*moveSetEvaluation{}
 	for a := range valid {
 		evals = append(evals, a.Value)

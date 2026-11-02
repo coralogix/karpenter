@@ -65,14 +65,18 @@ func logScoreDecision(ctx context.Context, evals []*moveSetEvaluation, stats sea
 
 func moveLog(eval *moveSetEvaluation) map[string]interface{} {
 	cmd := eval.Command
-	savings := eval.Score
-	rescored := eval.Validation == "passed" || eval.Validation == "failed: no_savings"
+	savings := eval.SearchBreakdown.Savings
+	rescored := eval.Validation == "passed" || eval.Validation == "failed: no_savings" || eval.Validation == "failed: non_positive_score"
 	if rescored {
-		savings = eval.RescoredScore
+		savings = eval.Breakdown.Savings
 	}
 	sources := []map[string]interface{}{}
-	for _, c := range cmd.Candidates {
-		sources = append(sources, map[string]interface{}{"node": c.Name(), "nodePool": c.NodePool.Name, "instanceType": c.Labels()[corev1.LabelInstanceTypeStable], "capacityType": c.Labels()[v1.CapacityTypeLabelKey], "price": c.Price})
+	for i, c := range cmd.Candidates {
+		price := c.Price
+		if i < len(eval.Breakdown.Sources) {
+			price = eval.Breakdown.Sources[i].Price
+		}
+		sources = append(sources, map[string]interface{}{"node": c.Name(), "nodePool": c.NodePool.Name, "instanceType": c.Labels()[corev1.LabelInstanceTypeStable], "capacityType": c.Labels()[v1.CapacityTypeLabelKey], "price": price})
 	}
 	destinations := []map[string]interface{}{}
 	for _, name := range slices.Sorted(maps.Keys(eval.StandbyPrices)) {
@@ -85,9 +89,9 @@ func moveLog(eval *moveSetEvaluation) map[string]interface{} {
 			newNode = map[string]interface{}{"instanceType": n.InstanceTypeOptions[0].Name, "price": cmd.SourceCost() - cmd.EstimatedSavings()}
 		}
 	}
-	entry := map[string]interface{}{"kind": "single", "sources": sources, "newNode": newNode, "reactivatedStandbyNodes": destinations, "savings": savings, "validation": eval.Validation}
+	entry := map[string]interface{}{"kind": "single", "sources": sources, "newNode": newNode, "reactivatedStandbyNodes": destinations, "savings": savings, "score": eval.Breakdown, "validation": eval.Validation}
 	if rescored && eval.Score != eval.RescoredScore {
-		entry["searchScore"] = eval.Score
+		entry["searchScore"] = eval.SearchBreakdown
 	}
 	return entry
 }

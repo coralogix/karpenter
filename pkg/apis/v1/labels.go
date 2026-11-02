@@ -60,6 +60,7 @@ const (
 	DisruptionPacingGroupAnnotationKey     = "karpenter.coralogix.net/disruption-pacing-group"
 	DisruptionPacingPerMinuteAnnotationKey = "karpenter.coralogix.net/disruption-pacing-per-minute"
 	DisruptionPacingPerBatchAnnotationKey  = "karpenter.coralogix.net/disruption-pacing-per-batch"
+	UtilizationWeightAnnotationKey         = "karpenter.coralogix.net/utilization-weight"
 	ScoreBasedConsolidationAnnotationKey   = "karpenter.coralogix.net/score-based-consolidation"
 	EvacuationTimeoutAnnotationKey         = "karpenter.coralogix.net/evacuation-timeout"
 	ReclamationDelayAnnotationKey          = "karpenter.coralogix.net/reclamation-delay"
