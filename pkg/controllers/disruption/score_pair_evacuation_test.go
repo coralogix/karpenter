@@ -33,30 +33,35 @@ import (
 var _ = Describe("Pair evacuation", func() {
 	It("launches one replacement and leaves both sources standby", func() {
 		claims, nodes, pods := givenPairSources()
-		reconcileThroughValidationDelay(disruptionController)
-		commands := queue.GetCommands()
-		Expect(commands).To(HaveLen(1))
-		Expect(commands[0].Candidates).To(HaveLen(2))
-		Expect(commands[0].Replacements).To(HaveLen(1))
-		replacement := &v1.NodeClaim{}
-		Expect(env.Client.Get(ctx, client.ObjectKey{Name: commands[0].Replacements[0].Name}, replacement)).To(Succeed())
-		ExpectObjectReconciled(ctx, env.Client, queue, claims[0])
-		for _, pod := range pods {
-			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(pod), pod)).To(Succeed())
-			Expect(pod.DeletionTimestamp.IsZero()).To(BeTrue())
-		}
-		replacement, replacementNode := ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, replacement)
-		refreshStandbyState(replacementNode, replacement)
-		ExpectObjectReconciled(ctx, env.Client, queue, claims[0])
-		for _, pod := range pods {
-			ExpectDeleted(ctx, env.Client, pod)
-		}
-		ExpectObjectReconciled(ctx, env.Client, queue, claims[0])
+		evacuatePair(claims[0], pods)
 		for _, node := range nodes {
 			expectMarkedStandby(node)
 		}
 	})
 })
+
+func evacuatePair(claim *v1.NodeClaim, pods []*corev1.Pod) {
+	GinkgoHelper()
+	reconcileThroughValidationDelay(disruptionController)
+	commands := queue.GetCommands()
+	Expect(commands).To(HaveLen(1))
+	Expect(commands[0].Candidates).To(HaveLen(2))
+	Expect(commands[0].Replacements).To(HaveLen(1))
+	replacement := &v1.NodeClaim{}
+	Expect(env.Client.Get(ctx, client.ObjectKey{Name: commands[0].Replacements[0].Name}, replacement)).To(Succeed())
+	ExpectObjectReconciled(ctx, env.Client, queue, claim)
+	for _, pod := range pods {
+		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(pod), pod)).To(Succeed())
+		Expect(pod.DeletionTimestamp.IsZero()).To(BeTrue())
+	}
+	replacement, replacementNode := ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, replacement)
+	refreshStandbyState(replacementNode, replacement)
+	ExpectObjectReconciled(ctx, env.Client, queue, claim)
+	for _, pod := range pods {
+		ExpectDeleted(ctx, env.Client, pod)
+	}
+	ExpectObjectReconciled(ctx, env.Client, queue, claim)
+}
 
 func givenPairSources() ([]*v1.NodeClaim, []*corev1.Node, []*corev1.Pod) {
 	GinkgoHelper()
