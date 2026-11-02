@@ -11,7 +11,7 @@ A move can be chosen only if it saves real dollars and its total score is positi
 All baselines use one set of **baseline nodes** per pass, taken from the simulation's node snapshot: managed, initialized, not deleting, and not standby. Standby nodes are excluded everywhere because they are about to be reclaimed.
 
 - **Cost**: `f × Σ aᵢ` over sources. `aᵢ = priceᵢ / (allocatableCPUᵢ × baseline)`, where `baseline` is `Σ price / Σ allocatable CPU` of the baseline nodes in the source's NodePool and capacity type, and `f = savings / Σ source price`. Comparing a node with the average price per CPU of its own pool and capacity type stops cheap Spot nodes from always losing to on-demand nodes on raw dollars. `f` makes a move that keeps most of the cost score low.
-- **Utilisation**: `Σ w × (allocatableCPUᵢ − requestedCPUᵢ) / allocatableCPUᵢ` over sources, with requests clamped to the allocatable range.
+- **Utilization**: `Σ w × (allocatableCPUᵢ − requestedCPUᵢ) / allocatableCPUᵢ` over sources, with requests clamped to the allocatable range.
 - **Memory balance**: shapes are allocatable CPU and memory minus DaemonSet requests. Per pool, `q` is the baseline nodes' memory per CPU, and `t = (1 + surplus) × requested memory / requested CPU` of their non-DaemonSet pods. `pressure` is 0 when `0.95 ≤ q/t ≤ 1.05`, otherwise `clamp(log2(q/t), −1, 1)`. A shape's delta is `memory / q − CPU`. A pool's delta is the removed source deltas minus the added deltas of the new node and the reactivated standby nodes in that pool. Its contribution is `weight × pressure × clamp(delta / total CPU removed, −1, 1) × number of sources`, summed over the affected pools.
 - **Instance-type concentration**: each source whose instance type makes up more than `threshold` of its pool's baseline nodes adds `weight`.
 
@@ -21,7 +21,7 @@ A term that cannot be computed contributes 0. That covers a missing price (treat
 
 | NodePool annotation (`karpenter.coralogix.net/…`) | Default | Valid |
 |---|---|---|
-| `utilisation-weight` | 1 | finite, > 0 |
+| `utilization-weight` | 1 | finite, > 0 |
 | `memory-surplus` | 0.2 | finite, ≥ 0 |
 | `memory-balance-weight` | 0 (term off) | finite, ≥ 0 |
 | `instance-type-concentration-threshold` | 0.5 | finite, in `[0, 1)` |

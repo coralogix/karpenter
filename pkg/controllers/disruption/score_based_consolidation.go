@@ -31,6 +31,7 @@ import (
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
@@ -101,7 +102,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	validCandidates, blocked := s.filterCandidates(disruptionBudgetMapping, candidates)
 	var reason string
 	var evals []*moveSetEvaluation
-	var nodePrices map[string]float64
+	var inputs scoreInputs
 	var stats searchStats
 	eligible := len(validCandidates)
 	var searchDuration time.Duration
@@ -112,7 +113,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		}
 	}()
 
-	evals, nodePrices, stats, err = s.searchForMoveSets(ctx, validCandidates, deadline)
+	evals, inputs, stats, err = s.searchForMoveSets(ctx, validCandidates, deadline)
 	searchDuration = s.clock.Since(start)
 	if err != nil {
 		return []Command{}, err
@@ -132,7 +133,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		return []Command{}, err
 	}
 	reason = "all_rejected_by_validation"
-	cmd, err := selectBestRescoredCommand(ctx, scoreMoveValidator{s.validator, s.disruptionPacing}, s.recorder, evals, nodePrices)
+	cmd, err := selectBestRescoredCommand(ctx, scoreMoveValidator{s.validator, s.disruptionPacing}, s.recorder, evals, inputs)
 	if err != nil {
 		return []Command{}, err
 	}
@@ -182,36 +183,37 @@ func (s *ScoreBasedConsolidation) waitForValidation(ctx context.Context, start t
 	return nil
 }
 
-func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, candidates []*Candidate, deadline time.Time) ([]*moveSetEvaluation, map[string]float64, searchStats, error) {
+func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, candidates []*Candidate, deadline time.Time) ([]*moveSetEvaluation, scoreInputs, searchStats, error) {
 	if len(candidates) == 0 {
-		return nil, nil, searchStats{}, nil
+		return nil, scoreInputs{}, searchStats{}, nil
 	}
 	simulator, err := NewConsolidationSchedulingSimulator(ctx, s.kubeClient, s.cluster, s.provisioner, s.clock, s.recorder, candidates...)
 	if err != nil {
-		return nil, nil, searchStats{}, err
+		return nil, scoreInputs{}, searchStats{}, err
 	}
-	prices, err := s.nodePrices(ctx)
+	prices, err := s.nodePrices(ctx, simulator.nodes)
 	if err != nil {
-		return nil, nil, searchStats{}, err
+		return nil, scoreInputs{}, searchStats{}, err
 	}
 	moves := make([]moveSet, len(candidates))
 	for i, c := range candidates {
 		moves[i] = moveSet{Nodes: []*Candidate{c}}
 	}
+	inputs := newScoreInputs(simulator.nodes, candidates, prices, s.recorder)
 	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec
 	evals, stats := searchMoves(ctx, moves, deadline, func(ctx context.Context, candidates ...*Candidate) (Command, error) {
 		return s.computeConsolidation(ctx, simulator, candidates...)
-	}, prices, rng, s.clock)
-	return evals, prices, stats, nil
+	}, inputs, rng, s.clock)
+	return evals, inputs, stats, nil
 }
 
-func (s *ScoreBasedConsolidation) nodePrices(ctx context.Context) (map[string]float64, error) {
+func (s *ScoreBasedConsolidation) nodePrices(ctx context.Context, nodes state.StateNodes) (map[string]float64, error) {
 	_, instanceTypes, err := BuildNodePoolMap(ctx, s.kubeClient, s.cloudProvider)
 	if err != nil {
 		return nil, err
 	}
 	prices := map[string]float64{}
-	for node := range s.cluster.Nodes() {
+	for _, node := range nodes {
 		poolName := node.Labels()[v1.NodePoolLabelKey]
 		it := instanceTypes[poolName][node.Labels()[corev1.LabelInstanceTypeStable]]
 		if it == nil {
@@ -222,7 +224,8 @@ func (s *ScoreBasedConsolidation) nodePrices(ctx context.Context) (map[string]fl
 	return prices, nil
 }
 
-func selectBestRescoredCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation, nodePrices map[string]float64) (Command, error) {
+//nolint:gocyclo // Validation errors, rescoring, and selection are handled in one pass.
+func selectBestRescoredCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation, inputs scoreInputs) (Command, error) {
 	var firstValidationReason string
 	var bestCmd Command
 	var bestScore float64
@@ -241,11 +244,16 @@ func selectBestRescoredCommand(ctx context.Context, validator Validator, recorde
 			}
 			return Command{}, fmt.Errorf("validating score-based consolidation, %w", err)
 		}
-		score, standbyPrices := scoreMove(eval.Command, validated.Results, nodePrices)
+		breakdown, standbyPrices := inputs.score(eval.Command, validated.Results)
+		score := breakdown.Total
+		eval.Breakdown = breakdown
 		eval.RescoredScore = score
 		eval.StandbyPrices = standbyPrices
-		if score <= 0 {
+		if breakdown.Savings <= 0 || score <= 0 {
 			eval.Validation = "failed: no_savings"
+			if breakdown.Savings > 0 {
+				eval.Validation = "failed: non_positive_score"
+			}
 			continue
 		}
 		eval.Validation = "passed"

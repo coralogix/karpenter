@@ -153,7 +153,7 @@ func TestSearchMoves_ranksSavings(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	winner, stats := searchMoves(ctx, moveSets, time.Now().Add(time.Second), compute, nil, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	winner, stats := searchMoves(ctx, moveSets, time.Now().Add(time.Second), compute, testScoreInputs(moveSets, nil), rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
 	evaluated := stats.Evaluated
 	if len(winner) != 2 {
 		t.Fatalf("evaluations = %d, want 2", len(winner))
@@ -183,7 +183,7 @@ func TestSearchMoves_stopsOnDeadline(t *testing.T) {
 		}
 	}
 
-	winner, stats := searchMoves(ctx, moveSets, time.Now().Add(-time.Millisecond), compute, nil, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	winner, stats := searchMoves(ctx, moveSets, time.Now().Add(-time.Millisecond), compute, testScoreInputs(moveSets, nil), rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
 	evaluated := stats.Evaluated
 	if len(winner) != 0 {
 		t.Fatalf("evaluations = %d, want 0", len(winner))
@@ -209,7 +209,7 @@ func TestSearchMoves_keepsTenBest(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	evals, stats := searchMoves(ctx, moveSets, time.Now().Add(time.Second), compute, nil, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	evals, stats := searchMoves(ctx, moveSets, time.Now().Add(time.Second), compute, testScoreInputs(moveSets, nil), rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
 	evaluated := stats.Evaluated
 	if len(evals) != scoreBasedValidEvaluationsTarget {
 		t.Fatalf("evaluations = %d, want %d", len(evals), scoreBasedValidEvaluationsTarget)
@@ -247,7 +247,7 @@ func TestSearchMoves_returnsPartialOnTimeout(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	evals, stats := searchMoves(ctx, moveSets, deadline, compute, nil, rand.New(rand.NewSource(1)), fakeClock) //nolint:gosec
+	evals, stats := searchMoves(ctx, moveSets, deadline, compute, testScoreInputs(moveSets, nil), rand.New(rand.NewSource(1)), fakeClock) //nolint:gosec
 	if !stats.TimedOut {
 		t.Fatal("expected stats.TimedOut")
 	}
@@ -287,7 +287,7 @@ func TestSelectBestRescoredCommand_prefersHigherRescoredSavings(t *testing.T) {
 		},
 	}
 
-	cmd, err := selectBestRescoredCommand(ctx, validator, recorder, evals, prices)
+	cmd, err := selectBestRescoredCommand(ctx, validator, recorder, evals, testEvalScoreInputs(evals, prices))
 	if err != nil {
 		t.Fatalf("selectBestRescoredCommand() error = %v", err)
 	}
@@ -319,7 +319,7 @@ func TestSelectBestRescoredCommand_rejectsNonPositiveRescoredSavings(t *testing.
 	}}
 	validator := rescoreTestValidator{byCandidate: map[string]pscheduling.Results{"source": evals[0].Command.Results}}
 
-	cmd, err := selectBestRescoredCommand(ctx, validator, recorder, evals, map[string]float64{"standby-a": 0.10})
+	cmd, err := selectBestRescoredCommand(ctx, validator, recorder, evals, testEvalScoreInputs(evals, map[string]float64{"standby-a": 0.10}))
 	if err != nil {
 		t.Fatalf("selectBestRescoredCommand() error = %v", err)
 	}
@@ -364,7 +364,7 @@ func TestSelectFirstValidatedCommand_validationFallback(t *testing.T) {
 	}
 	validator := rejectFirstCommandValidator{}
 
-	cmd, err := selectBestRescoredCommand(ctx, validator, recorder, evals, nil)
+	cmd, err := selectBestRescoredCommand(ctx, validator, recorder, evals, testEvalScoreInputs(evals, nil))
 	if err != nil {
 		t.Fatalf("selectFirstValidatedCommand() error = %v", err)
 	}
@@ -394,7 +394,7 @@ func TestSelectFirstValidatedCommand_emitsRejectedEventOnlyForFirstEvalWhenAllFa
 		{Command: Command{Candidates: []*Candidate{lowScoreCandidate}}, Score: 0.10},
 	}
 
-	cmd, err := selectBestRescoredCommand(ctx, rejectAllCommandValidator{}, recorder, evals, nil)
+	cmd, err := selectBestRescoredCommand(ctx, rejectAllCommandValidator{}, recorder, evals, testEvalScoreInputs(evals, nil))
 	if err != nil {
 		t.Fatalf("selectFirstValidatedCommand() error = %v", err)
 	}
@@ -524,4 +524,22 @@ func scoreBasedTestCandidate(scoreBasedConsolidation bool) *Candidate {
 		DisruptionCost:           PerNodeBaseDisruptionCost + 1,
 		RescheduleDisruptionCost: PerNodeBaseDisruptionCost + 1,
 	}
+}
+
+func testScoreInputs(moves []moveSet, prices map[string]float64) scoreInputs {
+	inputs := scoreInputs{prices: prices, sources: map[*Candidate]scoreSource{}}
+	for _, m := range moves {
+		for _, c := range m.Nodes {
+			inputs.sources[c] = scoreSource{Price: c.Price, AllocatableCPU: 1, RequestedCPU: 1, Baseline: 1, Weight: 1}
+		}
+	}
+	return inputs
+}
+
+func testEvalScoreInputs(evals []*moveSetEvaluation, prices map[string]float64) scoreInputs {
+	moves := make([]moveSet, 0, len(evals))
+	for _, e := range evals {
+		moves = append(moves, moveSet{Nodes: e.Command.Candidates})
+	}
+	return testScoreInputs(moves, prices)
 }
