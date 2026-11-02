@@ -89,9 +89,16 @@ func moveLog(eval *moveSetEvaluation) map[string]interface{} {
 			newNode = map[string]interface{}{"instanceType": n.InstanceTypeOptions[0].Name, "price": cmd.SourceCost() - cmd.EstimatedSavings()}
 		}
 	}
-	entry := map[string]interface{}{"kind": "single", "sources": sources, "newNode": newNode, "reactivatedStandbyNodes": destinations, "savings": savings, "score": eval.Breakdown, "validation": eval.Validation}
+	entry := map[string]interface{}{"kind": scoreMoveKind(cmd), "sources": sources, "newNode": newNode, "reactivatedStandbyNodes": destinations, "savings": savings, "score": eval.Breakdown, "validation": eval.Validation}
 	if rescored && eval.Score != eval.RescoredScore {
 		entry["searchScore"] = eval.SearchBreakdown
 	}
 	return entry
+}
+
+func scoreMoveKind(cmd Command) string {
+	if len(cmd.Candidates) > 1 {
+		return "batch"
+	}
+	return "single"
 }

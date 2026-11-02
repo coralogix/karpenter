@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/awslabs/operatorpkg/serrors"
+	"go.uber.org/multierr"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,47 +41,68 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-//nolint:gocyclo
+type evacuationProgress uint8
+
+const (
+	evacuationMarkedStandby evacuationProgress = iota + 1
+	evacuationComplete
+)
+
 func (q *Queue) evacuate(ctx context.Context, cmd *Command) error {
+	if cmd.evacuatedSources == nil {
+		cmd.evacuatedSources = map[string]evacuationProgress{}
+	}
+	var errs error
 	for _, candidate := range cmd.Candidates {
+		if cmd.evacuatedSources[candidate.ProviderID()] == evacuationComplete {
+			continue
+		}
+		done, err := q.evacuateSource(ctx, cmd, candidate)
+		errs = multierr.Append(errs, err)
+		if done {
+			cmd.evacuatedSources[candidate.ProviderID()] = evacuationComplete
+		}
+	}
+	return errs
+}
+
+//nolint:gocyclo // Eviction and standby cleanup share the source's progress.
+func (q *Queue) evacuateSource(ctx context.Context, cmd *Command, candidate *Candidate) (bool, error) {
+	if cmd.evacuatedSources[candidate.ProviderID()] != evacuationMarkedStandby {
 		pods, err := nodeutils.GetPods(ctx, q.kubeClient, candidate.Node)
 		if err != nil {
-			return fmt.Errorf("listing evacuation pods, %w", err)
+			return false, fmt.Errorf("listing evacuation pods, %w", err)
 		}
 		waiting := lo.Filter(pods, func(p *corev1.Pod, _ int) bool {
 			return !podutils.IsOwnedByDaemonSet(p) && (podutils.IsReschedulable(p) || podutils.IsWaitingEviction(p, q.clock))
 		})
 		if len(waiting) > 0 {
-			// Drain ordinary workloads before system-critical workloads, as termination does.
 			ordinary := lo.Reject(waiting, func(p *corev1.Pod, _ int) bool {
 				return p.Spec.PriorityClassName == "system-cluster-critical" || p.Spec.PriorityClassName == "system-node-critical"
 			})
 			if len(ordinary) > 0 {
 				waiting = ordinary
 			}
-			evictable := lo.Filter(waiting, func(p *corev1.Pod, _ int) bool {
-				return podutils.IsEvictable(p, q.clock, q.recorder)
-			})
+			evictable := lo.Filter(waiting, func(p *corev1.Pod, _ int) bool { return podutils.IsEvictable(p, q.clock, q.recorder) })
+			var errs error
 			for _, pod := range evictable {
-				if err := q.evictEvacuationPod(ctx, candidate.Node, pod, string(cmd.Reason())); err != nil {
-					return err
-				}
+				errs = multierr.Append(errs, q.evictEvacuationPod(ctx, candidate.Node, pod, string(cmd.Reason())))
 			}
-			return fmt.Errorf("waiting for %d evacuation pods", len(waiting))
+			return false, multierr.Append(errs, fmt.Errorf("waiting for %d evacuation pods", len(waiting)))
 		}
-		// Persist standby before removing the temporary disruption taint, so the
-		// source never opens to ordinary scheduling between the two states.
+		// Persist standby before removing the temporary disruption taint.
 		if err := standby.Mark(ctx, q.kubeClient, candidate.Node, q.clock.Now()); err != nil {
-			return fmt.Errorf("marking evacuated node standby, %w", err)
+			return false, fmt.Errorf("marking evacuated node standby, %w", err)
 		}
-		if err := state.RequireNoScheduleTaint(ctx, q.kubeClient, false, candidate.StateNode); err != nil {
-			return err
-		}
-		if err := state.ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, candidate.StateNode); err != nil {
-			return err
-		}
+		cmd.evacuatedSources[candidate.ProviderID()] = evacuationMarkedStandby
 	}
-	return nil
+	if err := state.RequireNoScheduleTaint(ctx, q.kubeClient, false, candidate.StateNode); err != nil {
+		return false, err
+	}
+	if err := state.ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, candidate.StateNode); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (q *Queue) evictEvacuationPod(ctx context.Context, node *corev1.Node, pod *corev1.Pod, reason string) error {
