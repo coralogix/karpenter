@@ -26,7 +26,11 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/utils/clock"
+
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 
 	"github.com/destel/rill"
 
@@ -69,13 +73,27 @@ type searchStats struct {
 
 //nolint:gocyclo // Batch growth keeps simulation, limits, and search accounting together.
 func searchAllMoves(ctx context.Context, moves []moveSet, deadline time.Time, compute consolidationComputer, inputs scoreInputs, random *rand.Rand, clk clock.Clock, budgets map[string]int, pacing *DisruptionPacing) ([]*moveSetEvaluation, searchStats) {
-	singles, stats := searchSingleMoves(ctx, moves, deadline, compute, inputs, random, clk, len(moves))
+	singleCtx, endSingle := cxtracing.Start(ctx, "single")
+	singles, stats := searchSingleMoves(singleCtx, moves, deadline, compute, inputs, random, clk, len(moves))
+	trace.SpanFromContext(singleCtx).SetAttributes(attribute.Int("candidate_count", len(moves)), attribute.Int("evaluated_move_count", stats.Evaluated), attribute.Bool("deadline_hit", stats.TimedOut))
+	endSingle()
 	if len(singles) == 0 {
 		if !stats.PositiveSavings && !stats.TimedOut && ctx.Err() == nil {
-			return searchPairMoves(ctx, moves, deadline, compute, inputs, random, clk, budgets, pacing, stats)
+			pairCtx, endPair := cxtracing.Start(ctx, "pair")
+			before := stats.Evaluated
+			evals, pairStats := searchPairMoves(pairCtx, moves, deadline, compute, inputs, random, clk, budgets, pacing, stats)
+			trace.SpanFromContext(pairCtx).SetAttributes(attribute.Int("candidate_count", len(moves)), attribute.Int("evaluated_move_count", pairStats.Evaluated-before), attribute.Bool("deadline_hit", pairStats.TimedOut))
+			endPair()
+			return evals, pairStats
 		}
 		return singles, stats
 	}
+	batchCtx, endBatch := cxtracing.Start(ctx, "batch")
+	before := stats.Evaluated
+	defer func() {
+		trace.SpanFromContext(batchCtx).SetAttributes(attribute.Int("candidate_count", len(moves)), attribute.Int("evaluated_move_count", stats.Evaluated-before), attribute.Bool("deadline_hit", stats.TimedOut))
+		endBatch()
+	}()
 	evals := append([]*moveSetEvaluation(nil), singles...)
 	ids := map[*Candidate]int{}
 	for i, move := range moves {
@@ -106,7 +124,7 @@ func searchAllMoves(ctx context.Context, moves []moveSet, deadline time.Time, co
 				continue
 			}
 			attempts++
-			cmd, err := compute(ctx, proposed...)
+			cmd, err := compute(batchCtx, proposed...)
 			stats.Evaluated++
 			var result string
 			if err != nil {

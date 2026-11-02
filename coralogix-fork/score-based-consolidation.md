@@ -100,6 +100,10 @@ Lifecycle metrics show the outcome of score-based moves and the capacity held in
 - `karpenter_nodes_standby_reactivated_total{nodepool, source}` counts standby nodes reactivated by `provisioning` or `disruption`.
 - `karpenter_nodepools_standby_nodes{nodepool}` reports standby nodes on each score-based NodePool per disruption pass. Its series disappears when the pool leaves score-based consolidation or is deleted.
 
+## Tracing
+
+With tracing enabled, each score-based pass has a `karpenter.disruption.score_based_consolidation` span. Its `search` child contains `single`, `batch`, and `pair` spans for phases that run. Each phase records `candidate_count`, `evaluated_move_count`, and `deadline_hit`; scheduling simulation spans are nested under the phase. The `validation_wait` span measures the remaining delay, and `validate` records the selected move's search `rank` (one-based) and `kind` when a move is selected.
+
 ## Rollback to upstream
 
 Rolling back the controller to upstream Karpenter is safe:

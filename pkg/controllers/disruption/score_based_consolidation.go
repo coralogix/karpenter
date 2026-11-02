@@ -25,6 +25,8 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
@@ -33,6 +35,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/events"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
@@ -93,11 +96,13 @@ func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candida
 	return s.consolidation.ShouldDisrupt(ctx, cn)
 }
 
+//nolint:gocyclo // Pass orchestration keeps search, validation, and tracing together.
 func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (_ []Command, err error) {
+	ctx, endPass := cxtracing.Start(ctx, "karpenter.disruption.score_based_consolidation")
+	defer endPass()
 	if s.IsConsolidated() {
 		return []Command{}, nil
 	}
-
 	start := s.clock.Now()
 	deadline := start.Add(ScoreBasedConsolidationTimeoutDuration)
 	validCandidates, blocked := s.filterCandidates(disruptionBudgetMapping, candidates)
@@ -130,11 +135,22 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		return []Command{}, nil
 	}
 
-	if err := s.waitForValidation(ctx, start); err != nil {
-		return []Command{}, err
+	waitCtx, endWait := cxtracing.Start(ctx, "validation_wait")
+	waitErr := s.waitForValidation(waitCtx, start)
+	endWait()
+	if waitErr != nil {
+		return []Command{}, waitErr
 	}
 	reason = "all_rejected_by_validation"
-	cmd, err := selectBestRescoredCommand(ctx, scoreMoveValidator{s.validator, s.disruptionPacing}, s.recorder, evals, inputs)
+	validateCtx, endValidate := cxtracing.Start(ctx, "validate")
+	cmd, err := selectBestRescoredCommand(validateCtx, scoreMoveValidator{s.validator, s.disruptionPacing}, s.recorder, evals, inputs)
+	for i, eval := range evals {
+		if err == nil && eval.Selected {
+			trace.SpanFromContext(validateCtx).SetAttributes(attribute.Int("rank", i+1), attribute.String("kind", scoreMoveKind(cmd)))
+			break
+		}
+	}
+	endValidate()
 	if err != nil {
 		return []Command{}, err
 	}
@@ -194,6 +210,8 @@ func (s *ScoreBasedConsolidation) waitForValidation(ctx context.Context, start t
 }
 
 func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, candidates []*Candidate, deadline time.Time, budgets map[string]int) ([]*moveSetEvaluation, scoreInputs, searchStats, error) {
+	ctx, endSearch := cxtracing.Start(ctx, "search")
+	defer endSearch()
 	if len(candidates) == 0 {
 		return nil, scoreInputs{}, searchStats{}, nil
 	}
