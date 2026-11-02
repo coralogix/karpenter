@@ -88,17 +88,25 @@ func searchMoves(ctx context.Context, moves []moveSet, deadline time.Time, compu
 		mu.Lock()
 		defer mu.Unlock()
 		stats.Evaluated++
+		result := "feasible"
+		defer func() { ScoreBasedMoveEvaluationsTotal.Inc(map[string]string{"result": result}) }()
 		if err != nil {
+			result = "error"
 			stats.Errors++
 			log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
 			return nil, false, nil
 		}
 		if cmd.Decision() == NoOpDecision || len(cmd.Replacements) > 1 {
+			result = "no_op"
 			stats.NoOp++
 			return nil, false, nil
 		}
 		breakdown, standbyPrices := inputs.score(cmd, cmd.Results)
 		if breakdown.Savings <= 0 || breakdown.Total <= 0 {
+			result = "no_savings"
+			if breakdown.Savings > 0 {
+				result = "non_positive_score"
+			}
 			stats.NoSavings++
 			return nil, false, nil
 		}

@@ -354,7 +354,7 @@ func BuildDisruptionBudgetMapping(ctx context.Context, cluster *state.Cluster, c
 		NodePoolNodesConsumingBudgets.Set(float64(disrupting[nodePool.Name]), map[string]string{
 			metrics.NodePoolLabel: nodePool.Name, metrics.ReasonLabel: string(reason),
 		})
-		if numNodes[nodePool.Name] != 0 && allowedDisruptions == 0 {
+		if numNodes[nodePool.Name] != 0 && (allowedDisruptions == 0 || (reason == v1.DisruptionReasonUnderutilized && NodePoolUsesScoreBasedConsolidation(nodePool) && disrupting[nodePool.Name] > 0 && disruptionBudgetMapping[nodePool.Name] == 0)) {
 			recorder.Publish(disruptionevents.NodePoolBlockedForDisruptionReason(nodePool, reason))
 		}
 	}
