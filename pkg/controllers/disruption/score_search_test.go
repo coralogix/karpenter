@@ -43,13 +43,13 @@ func TestSearchMovesRejectsUnprofitableAndMultipleReplacements(t *testing.T) {
 		{Nodes: []*Candidate{candidateWithPrice(t, 2)}},
 		{Nodes: []*Candidate{candidateWithPrice(t, 3)}},
 	}
-	evals, stats := searchMoves(context.Background(), moves, time.Now().Add(time.Second), func(_ context.Context, c ...*Candidate) (Command, error) {
+	evals, stats := searchSingleMoves(context.Background(), moves, time.Now().Add(time.Second), func(_ context.Context, c ...*Candidate) (Command, error) {
 		cmd := Command{Candidates: c}
 		if c[0].Price == 2 {
 			cmd.Replacements = []*Replacement{{}, {}}
 		}
 		return cmd, nil
-	}, testScoreInputs(moves, nil), rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	}, testScoreInputs(moves, nil), rand.New(rand.NewSource(1)), clock.RealClock{}, scoreBasedValidEvaluationsTarget) //nolint:gosec
 	if len(evals) != 1 || evals[0].Score != 3 || stats.Evaluated != 3 {
 		t.Fatalf("got %v, stats %+v", evals, stats)
 	}
@@ -57,12 +57,12 @@ func TestSearchMovesRejectsUnprofitableAndMultipleReplacements(t *testing.T) {
 
 func TestSearchMovesPreservesSuccessOnSimulationError(t *testing.T) {
 	moves := []moveSet{{Nodes: []*Candidate{candidateWithPrice(t, 1)}}, {Nodes: []*Candidate{candidateWithPrice(t, 2)}}}
-	evals, stats := searchMoves(context.Background(), moves, time.Now().Add(time.Second), func(_ context.Context, c ...*Candidate) (Command, error) {
+	evals, stats := searchSingleMoves(context.Background(), moves, time.Now().Add(time.Second), func(_ context.Context, c ...*Candidate) (Command, error) {
 		if c[0].Price == 2 {
 			return Command{}, fmt.Errorf("simulation failed")
 		}
 		return Command{Candidates: c}, nil
-	}, testScoreInputs(moves, nil), rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	}, testScoreInputs(moves, nil), rand.New(rand.NewSource(1)), clock.RealClock{}, scoreBasedValidEvaluationsTarget) //nolint:gosec
 	if len(evals) != 1 || evals[0].Score != 1 || stats.Errors != 1 || stats.Evaluated != 2 {
 		t.Fatalf("got %v, stats %+v", evals, stats)
 	}
@@ -86,9 +86,9 @@ func (acceptScoreCommand) Validate(_ context.Context, cmd Command, _ time.Durati
 }
 
 func TestSearchMovesErrorPreventsConsolidatedState(t *testing.T) {
-	_, stats := searchMoves(context.Background(), []moveSet{{Nodes: []*Candidate{candidateWithPrice(t, 1)}}}, time.Now().Add(time.Second), func(context.Context, ...*Candidate) (Command, error) {
+	_, stats := searchSingleMoves(context.Background(), []moveSet{{Nodes: []*Candidate{candidateWithPrice(t, 1)}}}, time.Now().Add(time.Second), func(context.Context, ...*Candidate) (Command, error) {
 		return Command{}, fmt.Errorf("simulation failed")
-	}, scoreInputs{}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	}, scoreInputs{}, rand.New(rand.NewSource(1)), clock.RealClock{}, scoreBasedValidEvaluationsTarget) //nolint:gosec
 	if stats.canMarkConsolidated(1, false) {
 		t.Fatal("failed search must not mark cluster consolidated")
 	}
@@ -98,14 +98,14 @@ func TestSearchMovesFiltersMoveWhenStandbyCostExceedsSavings(t *testing.T) {
 	expensive := candidateWithPrice(t, 10)
 	cheap := candidateWithPrice(t, 5)
 	moves := []moveSet{{Nodes: []*Candidate{expensive}}, {Nodes: []*Candidate{cheap}}}
-	evals, stats := searchMoves(context.Background(), moves, time.Now().Add(time.Second), func(_ context.Context, c ...*Candidate) (Command, error) {
+	evals, stats := searchSingleMoves(context.Background(), moves, time.Now().Add(time.Second), func(_ context.Context, c ...*Candidate) (Command, error) {
 		if c[0].Price == 10 {
 			cmd := Command{Candidates: c}
 			cmd.Results.ExistingNodes = standbyReactivationResults("standby-a")
 			return cmd, nil
 		}
 		return Command{Candidates: c}, nil
-	}, testScoreInputs(moves, map[string]float64{"standby-a": 12}), rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	}, testScoreInputs(moves, map[string]float64{"standby-a": 12}), rand.New(rand.NewSource(1)), clock.RealClock{}, scoreBasedValidEvaluationsTarget) //nolint:gosec
 	if len(evals) != 1 || evals[0].Score != 5 || stats.NoSavings != 1 {
 		t.Fatalf("got %v, stats %+v", evals, stats)
 	}
@@ -125,9 +125,9 @@ func TestSearchMovesRejectsPositiveSavingsWithZeroScore(t *testing.T) {
 	candidate := candidateWithPrice(t, 1)
 	moves := []moveSet{{Nodes: []*Candidate{candidate}}}
 	inputs := scoreInputs{sources: map[*Candidate]scoreSource{candidate: {Price: 1, AllocatableCPU: 1, RequestedCPU: 1, Weight: 1}}}
-	evals, _ := searchMoves(context.Background(), moves, time.Now().Add(time.Second), func(_ context.Context, c ...*Candidate) (Command, error) {
+	evals, _ := searchSingleMoves(context.Background(), moves, time.Now().Add(time.Second), func(_ context.Context, c ...*Candidate) (Command, error) {
 		return Command{Candidates: c}, nil
-	}, inputs, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	}, inputs, rand.New(rand.NewSource(1)), clock.RealClock{}, scoreBasedValidEvaluationsTarget) //nolint:gosec
 	if len(evals) != 0 {
 		t.Fatalf("kept %d moves, want none", len(evals))
 	}
@@ -147,9 +147,9 @@ func TestInvalidUtilizationWeightWarnsOnce(t *testing.T) {
 	moves := []moveSet{{Nodes: []*Candidate{candidate}}}
 	for range 2 {
 		inputs := newScoreInputs(state.StateNodes{candidate.StateNode}, []*Candidate{candidate}, map[string]float64{candidate.Name(): 1}, recorder)
-		evals, _ := searchMoves(context.Background(), moves, time.Now().Add(time.Second), func(_ context.Context, c ...*Candidate) (Command, error) {
+		evals, _ := searchSingleMoves(context.Background(), moves, time.Now().Add(time.Second), func(_ context.Context, c ...*Candidate) (Command, error) {
 			return Command{Candidates: c}, nil
-		}, inputs, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+		}, inputs, rand.New(rand.NewSource(1)), clock.RealClock{}, scoreBasedValidEvaluationsTarget) //nolint:gosec
 		if len(evals) != 1 || evals[0].Score != 2 {
 			t.Fatalf("evaluations = %+v, want score 2 using default weight", evals)
 		}
