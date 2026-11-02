@@ -18,6 +18,7 @@ package disruption
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"runtime"
 	"sort"
@@ -65,6 +66,105 @@ type searchStats struct {
 
 // searchMoves simulates every move and keeps the highest-scoring ones. nodePrices gives the hourly price of each cluster node, which prices the standby nodes a move reactivates.
 func searchMoves(ctx context.Context, moves []moveSet, deadline time.Time, compute consolidationComputer, inputs scoreInputs, random *rand.Rand, clk clock.Clock) ([]*moveSetEvaluation, searchStats) {
+	return searchSingleMoves(ctx, moves, deadline, compute, inputs, random, clk, scoreBasedValidEvaluationsTarget)
+}
+
+//nolint:gocyclo // Batch growth keeps simulation, limits, and search accounting together.
+func searchAllMoves(ctx context.Context, moves []moveSet, deadline time.Time, compute consolidationComputer, inputs scoreInputs, random *rand.Rand, clk clock.Clock, budgets map[string]int, pacing *DisruptionPacing) ([]*moveSetEvaluation, searchStats) {
+	singles, stats := searchSingleMoves(ctx, moves, deadline, compute, inputs, random, clk, len(moves))
+	if len(singles) == 0 {
+		return singles, stats
+	}
+	evals := append([]*moveSetEvaluation(nil), singles...)
+	ids := map[*Candidate]int{}
+	for i, move := range moves {
+		ids[move.Nodes[0]] = i
+	}
+	seen := map[string]bool{}
+	seeds := []*moveSetEvaluation{}
+	for _, single := range singles {
+		if len(single.Command.Replacements) == 0 {
+			seeds = append(seeds, single)
+		}
+	}
+	for _, seed := range seeds[:min(3, len(seeds))] {
+		batch := append([]*Candidate(nil), seed.Command.Candidates...)
+		attempts := 0
+		for _, single := range seeds {
+			if ctx.Err() != nil || clk.Now().After(deadline) {
+				stats.TimedOut = clk.Now().After(deadline)
+				break
+			}
+			candidate := single.Command.Candidates[0]
+			if candidate == batch[0] || attempts >= 256 {
+				continue
+			}
+			proposed := append(append([]*Candidate(nil), batch...), candidate)
+			counts := map[string]int{}
+			allowed := true
+			for _, c := range proposed {
+				counts[c.NodePool.Name]++
+				if budgets != nil && counts[c.NodePool.Name] > budgets[c.NodePool.Name] {
+					allowed = false
+				}
+			}
+			if !allowed || !pacing.CommandAllowed(Command{Candidates: proposed}) {
+				continue
+			}
+			attempts++
+			cmd, err := compute(ctx, proposed...)
+			stats.Evaluated++
+			result := "feasible"
+			if err != nil {
+				stats.Errors++
+				result = "error"
+				log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
+			} else if cmd.Decision() == NoOpDecision || len(cmd.Replacements) != 0 {
+				stats.NoOp++
+				result = "no_op"
+			} else {
+				batch = proposed
+				breakdown, prices := inputs.score(cmd, cmd.Results)
+				if breakdown.Savings <= 0 || breakdown.Total <= 0 {
+					stats.NoSavings++
+					result = "no_savings"
+					if breakdown.Savings > 0 {
+						result = "non_positive_score"
+					}
+				} else {
+					indices := make([]int, len(proposed))
+					for i, c := range proposed {
+						indices[i] = ids[c]
+					}
+					sort.Ints(indices)
+					key := fmt.Sprint(indices)
+					if !seen[key] {
+						seen[key] = true
+						evals = append(evals, &moveSetEvaluation{Command: cmd, Score: breakdown.Total, Breakdown: breakdown, SearchBreakdown: breakdown, StandbyPrices: prices, Validation: "not_attempted"})
+					}
+				}
+			}
+			ScoreBasedMoveEvaluationsTotal.Inc(map[string]string{"result": result})
+		}
+	}
+	sort.SliceStable(evals, func(i, j int) bool { return evals[i].Score > evals[j].Score })
+	if len(evals) > scoreBasedValidEvaluationsTarget {
+		evals = evals[:scoreBasedValidEvaluationsTarget]
+		found := false
+		for _, eval := range evals {
+			if eval == singles[0] {
+				found = true
+				break
+			}
+		}
+		if !found {
+			evals = append(evals, singles[0])
+		}
+	}
+	return evals, stats
+}
+
+func searchSingleMoves(ctx context.Context, moves []moveSet, deadline time.Time, compute consolidationComputer, inputs scoreInputs, random *rand.Rand, clk clock.Clock, limit int) ([]*moveSetEvaluation, searchStats) {
 	moves = append([]moveSet(nil), moves...)
 	random.Shuffle(len(moves), func(i, j int) { moves[i], moves[j] = moves[j], moves[i] })
 	var stats searchStats
@@ -112,7 +212,7 @@ func searchMoves(ctx context.Context, moves []moveSet, deadline time.Time, compu
 		}
 		return &moveSetEvaluation{Command: cmd, Score: breakdown.Total, Breakdown: breakdown, SearchBreakdown: breakdown, StandbyPrices: standbyPrices, Validation: "not_attempted"}, true, nil
 	})
-	evals := topMovesByScore(valid, scoreBasedValidEvaluationsTarget)
+	evals := topMovesByScore(valid, limit)
 	return evals, stats
 }
 

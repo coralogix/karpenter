@@ -114,7 +114,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 		}
 	}()
 
-	evals, inputs, stats, err = s.searchForMoveSets(ctx, validCandidates, deadline)
+	evals, inputs, stats, err = s.searchForMoveSets(ctx, validCandidates, deadline, disruptionBudgetMapping)
 	searchDuration = s.clock.Since(start)
 	if err != nil {
 		return []Command{}, err
@@ -193,7 +193,7 @@ func (s *ScoreBasedConsolidation) waitForValidation(ctx context.Context, start t
 	return nil
 }
 
-func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, candidates []*Candidate, deadline time.Time) ([]*moveSetEvaluation, scoreInputs, searchStats, error) {
+func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, candidates []*Candidate, deadline time.Time, budgets map[string]int) ([]*moveSetEvaluation, scoreInputs, searchStats, error) {
 	if len(candidates) == 0 {
 		return nil, scoreInputs{}, searchStats{}, nil
 	}
@@ -213,9 +213,9 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, candida
 	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec
 	searchConsolidation := s.consolidation
 	searchConsolidation.recorder = candidateEventFilter{s.recorder}
-	evals, stats := searchMoves(ctx, moves, deadline, func(ctx context.Context, candidates ...*Candidate) (Command, error) {
+	evals, stats := searchAllMoves(ctx, moves, deadline, func(ctx context.Context, candidates ...*Candidate) (Command, error) {
 		return searchConsolidation.computeConsolidation(ctx, simulator, candidates...)
-	}, inputs, rng, s.clock)
+	}, inputs, rng, s.clock, budgets, s.disruptionPacing)
 	return evals, inputs, stats, nil
 }
 
@@ -289,7 +289,7 @@ func selectBestRescoredCommand(ctx context.Context, validator Validator, recorde
 		return Command{}, nil
 	}
 	bestCmd.EmitCandidateEvents(recorder)
-	ScoreBasedMovesSelectedTotal.Inc(map[string]string{"kind": "single"})
+	ScoreBasedMovesSelectedTotal.Inc(map[string]string{"kind": scoreMoveKind(bestCmd)})
 	return bestCmd, nil
 }
 
