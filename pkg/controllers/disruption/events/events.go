@@ -125,6 +125,17 @@ func NodePoolBlockedForDisruptionReason(nodePool *v1.NodePool, reason v1.Disrupt
 	}
 }
 
+func NodePoolBlockedByPacing(nodePool *v1.NodePool) events.Event {
+	return events.Event{
+		InvolvedObject: nodePool,
+		Type:           corev1.EventTypeNormal,
+		Reason:         events.DisruptionBlocked,
+		Message:        "All candidates are held back by disruption pacing",
+		DedupeValues:   []string{string(nodePool.UID), "pacing"},
+		DedupeTimeout:  time.Minute,
+	}
+}
+
 func InvalidDuration(nodePool *v1.NodePool, annotation, raw string, fallback time.Duration, reason string) events.Event {
 	return events.Event{
 		InvolvedObject: nodePool,

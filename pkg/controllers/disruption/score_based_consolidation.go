@@ -22,6 +22,7 @@ import (
 	"maps"
 	"math/rand"
 	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -159,13 +160,22 @@ func searchOutcomeReason(candidates, eligible int, timedOut bool) string {
 func (s *ScoreBasedConsolidation) filterCandidates(disruptionBudgetMapping map[string]int, candidates []*Candidate) ([]*Candidate, []string) {
 	var validCandidates []*Candidate
 	blocked := sets.New[string]()
+	paced := map[string]*v1.NodePool{}
+	allowed := sets.New[string]()
 	for _, candidate := range candidates {
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			blocked.Insert(candidate.NodePool.Name)
 		} else if len(candidate.reschedulablePods) > 0 && !s.disruptionPacing.CandidateAllowed(candidate.NodePool, 0) {
 			blocked.Insert(candidate.NodePool.Name)
+			paced[candidate.NodePool.Name] = candidate.NodePool
 		} else {
+			allowed.Insert(candidate.NodePool.Name)
 			validCandidates = append(validCandidates, candidate)
+		}
+	}
+	for name, pool := range paced {
+		if !allowed.Has(name) {
+			s.recorder.Publish(disruptionevents.NodePoolBlockedByPacing(pool))
 		}
 	}
 	return validCandidates, slices.Sorted(maps.Keys(blocked))
@@ -201,8 +211,10 @@ func (s *ScoreBasedConsolidation) searchForMoveSets(ctx context.Context, candida
 	}
 	inputs := newScoreInputs(simulator.nodes, candidates, prices, s.recorder)
 	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec
+	searchConsolidation := s.consolidation
+	searchConsolidation.recorder = candidateEventFilter{s.recorder}
 	evals, stats := searchMoves(ctx, moves, deadline, func(ctx context.Context, candidates ...*Candidate) (Command, error) {
-		return s.computeConsolidation(ctx, simulator, candidates...)
+		return searchConsolidation.computeConsolidation(ctx, simulator, candidates...)
 	}, inputs, rng, s.clock)
 	return evals, inputs, stats, nil
 }
@@ -226,20 +238,17 @@ func (s *ScoreBasedConsolidation) nodePrices(ctx context.Context, nodes state.St
 
 //nolint:gocyclo // Validation errors, rescoring, and selection are handled in one pass.
 func selectBestRescoredCommand(ctx context.Context, validator Validator, recorder events.Recorder, evals []*moveSetEvaluation, inputs scoreInputs) (Command, error) {
-	var firstValidationReason string
 	var bestCmd Command
 	var bestScore float64
 	var bestEval *moveSetEvaluation
 
-	for i, eval := range evals {
+	for _, eval := range evals {
 		validated, err := validator.Validate(ctx, eval.Command, 0)
 		if err != nil {
 			reason := scoreBasedValidationFailureReason(err)
 			eval.Validation = "failed: " + reason
 			if IsValidationError(err) {
-				if i == 0 {
-					firstValidationReason = reason
-				}
+				FailedValidationsTotal.Inc(map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
 				continue
 			}
 			return Command{}, fmt.Errorf("validating score-based consolidation, %w", err)
@@ -254,6 +263,7 @@ func selectBestRescoredCommand(ctx context.Context, validator Validator, recorde
 			if breakdown.Savings > 0 {
 				eval.Validation = "failed: non_positive_score"
 			}
+			FailedValidationsTotal.Inc(map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
 			continue
 		}
 		eval.Validation = "passed"
@@ -267,12 +277,19 @@ func selectBestRescoredCommand(ctx context.Context, validator Validator, recorde
 			eval.Selected = true
 		}
 	}
-	if bestEval == nil {
-		if firstValidationReason != "" {
-			evals[0].Command.EmitRejectedEvents(recorder, firstValidationReason)
+	for _, eval := range evals {
+		if eval == bestEval {
+			break
 		}
+		if reason, failed := strings.CutPrefix(eval.Validation, "failed: "); failed {
+			eval.Command.EmitRejectedEvents(recorder, reason)
+		}
+	}
+	if bestEval == nil {
 		return Command{}, nil
 	}
+	bestCmd.EmitCandidateEvents(recorder)
+	ScoreBasedMovesSelectedTotal.Inc(map[string]string{"kind": "single"})
 	return bestCmd, nil
 }
 
@@ -286,4 +303,15 @@ func (s *ScoreBasedConsolidation) Class() string {
 
 func (s *ScoreBasedConsolidation) ConsolidationType() string {
 	return ScoreBasedConsolidationType
+}
+
+// candidateEventFilter preserves simulation blockers while suppressing speculative candidates.
+type candidateEventFilter struct{ events.Recorder }
+
+func (r candidateEventFilter) Publish(evts ...events.Event) {
+	for _, event := range evts {
+		if event.Reason != events.ConsolidationCandidate {
+			r.Recorder.Publish(event)
+		}
+	}
 }

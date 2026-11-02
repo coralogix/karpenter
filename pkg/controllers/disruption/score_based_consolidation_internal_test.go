@@ -264,8 +264,10 @@ func TestSelectBestRescoredCommand_prefersHigherRescoredSavings(t *testing.T) {
 	recorder := events.NewRecorder(record.NewFakeRecorder(10))
 	highSearch := candidateWithPrice(t, 10)
 	highSearch.Node.Name = "high-search"
+	highSearch.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "high-search"}}
 	lowSearch := candidateWithPrice(t, 5)
 	lowSearch.Node.Name = "low-search"
+	lowSearch.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "low-search"}}
 	evals := []*moveSetEvaluation{
 		{
 			Command: Command{
@@ -310,6 +312,7 @@ func TestSelectBestRescoredCommand_rejectsNonPositiveRescoredSavings(t *testing.
 	recorder := events.NewRecorder(record.NewFakeRecorder(10))
 	candidate := candidateWithPrice(t, 0.10)
 	candidate.Node.Name = "source"
+	candidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "source"}}
 	evals := []*moveSetEvaluation{{
 		Command: Command{
 			Candidates: []*Candidate{candidate},
@@ -354,10 +357,12 @@ func TestSelectFirstValidatedCommand_validationFallback(t *testing.T) {
 	recorder := events.NewRecorder(fakeRecorder)
 	highScoreCandidate := candidateWithPrice(t, 0.50)
 	highScoreCandidate.Node.Name = "high-score"
-	highScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "high-score"}}
+	highScoreCandidate.Node.UID = "high-node"
+	highScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "high-score", UID: "high-claim"}}
 	lowScoreCandidate := candidateWithPrice(t, 0.10)
 	lowScoreCandidate.Node.Name = "low-score"
-	lowScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "low-score"}}
+	lowScoreCandidate.Node.UID = "low-node"
+	lowScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "low-score", UID: "low-claim"}}
 	evals := []*moveSetEvaluation{
 		{Command: Command{Candidates: []*Candidate{highScoreCandidate}}, Score: 0.50},
 		{Command: Command{Candidates: []*Candidate{lowScoreCandidate}}, Score: 0.10},
@@ -374,21 +379,23 @@ func TestSelectFirstValidatedCommand_validationFallback(t *testing.T) {
 	if cmd.Candidates[0] != lowScoreCandidate {
 		t.Fatal("expected fallback to lower-scored command after validation rejection")
 	}
-	if got := len(collectFakeRecorderEvents(fakeRecorder)); got != 0 {
-		t.Fatalf("rejected events = %d, want 0 when a fallback command passes validation", got)
+	if got := len(collectFakeRecorderEvents(fakeRecorder)); got != 4 {
+		t.Fatalf("events = %d, want rejected and candidate events", got)
 	}
 }
 
-func TestSelectFirstValidatedCommand_emitsRejectedEventOnlyForFirstEvalWhenAllFail(t *testing.T) {
+func TestSelectFirstValidatedCommand_emitsRejectedEventsWhenAllFail(t *testing.T) {
 	ctx := context.Background()
 	fakeRecorder := record.NewFakeRecorder(10)
 	recorder := events.NewRecorder(fakeRecorder)
 	highScoreCandidate := candidateWithPrice(t, 0.50)
 	highScoreCandidate.Node.Name = "high-score"
-	highScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "high-score"}}
+	highScoreCandidate.Node.UID = "high-node"
+	highScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "high-score", UID: "high-claim"}}
 	lowScoreCandidate := candidateWithPrice(t, 0.10)
 	lowScoreCandidate.Node.Name = "low-score"
-	lowScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "low-score"}}
+	lowScoreCandidate.Node.UID = "low-node"
+	lowScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "low-score", UID: "low-claim"}}
 	evals := []*moveSetEvaluation{
 		{Command: Command{Candidates: []*Candidate{highScoreCandidate}}, Score: 0.50},
 		{Command: Command{Candidates: []*Candidate{lowScoreCandidate}}, Score: 0.10},
@@ -403,8 +410,8 @@ func TestSelectFirstValidatedCommand_emitsRejectedEventOnlyForFirstEvalWhenAllFa
 	}
 
 	rejectedEvents := collectFakeRecorderEvents(fakeRecorder)
-	if eventsMentioningNode(rejectedEvents, "low-score") {
-		t.Fatal("did not expect rejected events for fallback eval")
+	if !eventsMentioningNode(rejectedEvents, "low-score") {
+		t.Fatal("expected rejected events for fallback eval")
 	}
 	if !eventsMentioningNode(rejectedEvents, "high-score") {
 		t.Fatal("expected rejected events for the first eval when all validations fail")

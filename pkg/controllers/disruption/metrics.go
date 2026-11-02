@@ -44,6 +44,14 @@ func init() {
 }
 
 var (
+	ScoreBasedMoveEvaluationsTotal = opmetrics.NewPrometheusCounter(crmetrics.Registry, prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: voluntaryDisruptionSubsystem,
+		Name: "score_based_move_evaluations_total", Help: "Score-based move evaluations by result.",
+	}, []string{"result"})
+	ScoreBasedMovesSelectedTotal = opmetrics.NewPrometheusCounter(crmetrics.Registry, prometheus.CounterOpts{
+		Namespace: metrics.Namespace, Subsystem: voluntaryDisruptionSubsystem,
+		Name: "score_based_moves_selected_total", Help: "Score-based moves selected by kind.",
+	}, []string{"kind"})
 	EvaluationDurationSeconds = opmetrics.NewPrometheusHistogram(
 		crmetrics.Registry,
 		prometheus.HistogramOpts{
