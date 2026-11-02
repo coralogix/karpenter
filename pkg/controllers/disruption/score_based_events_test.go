@@ -46,12 +46,12 @@ func TestScoreBasedSelectionEvents(t *testing.T) {
 	inputs := testScoreInputs(moves, nil)
 	recorder := test.NewEventRecorder()
 	searchRecorder := candidateEventFilter{recorder}
-	evals, _ := searchMoves(context.Background(), moves, time.Now().Add(time.Second), func(_ context.Context, candidates ...*Candidate) (Command, error) {
+	evals, _ := searchSingleMoves(context.Background(), moves, time.Now().Add(time.Second), func(_ context.Context, candidates ...*Candidate) (Command, error) {
 		cmd := Command{Candidates: candidates}
 		cmd.EmitCandidateEvents(searchRecorder)
 		searchRecorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, "blocker")...)
 		return cmd, nil
-	}, inputs, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	}, inputs, rand.New(rand.NewSource(1)), clock.RealClock{}, scoreBasedValidEvaluationsTarget) //nolint:gosec
 	cmd, err := selectBestRescoredCommand(context.Background(), rejectFirstCommandValidator{}, recorder, evals, inputs)
 	if err != nil || len(cmd.Candidates) != 1 || cmd.Candidates[0] != chosen {
 		t.Fatalf("selection = %+v, error = %v", cmd, err)
@@ -108,7 +108,7 @@ func TestScoreBasedSearchMetrics(t *testing.T) {
 	}
 	inputs := testScoreInputs(moves, nil)
 	inputs.sources[moves[3].Nodes[0]] = scoreSource{Price: 3, AllocatableCPU: 1, RequestedCPU: 1, Weight: 1}
-	evals, _ := searchMoves(context.Background(), moves, time.Now().Add(time.Second), func(_ context.Context, c ...*Candidate) (Command, error) {
+	evals, _ := searchSingleMoves(context.Background(), moves, time.Now().Add(time.Second), func(_ context.Context, c ...*Candidate) (Command, error) {
 		switch c[0].Price {
 		case 1:
 			return Command{}, nil
@@ -117,7 +117,7 @@ func TestScoreBasedSearchMetrics(t *testing.T) {
 		default:
 			return Command{Candidates: c}, nil
 		}
-	}, inputs, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	}, inputs, rand.New(rand.NewSource(1)), clock.RealClock{}, scoreBasedValidEvaluationsTarget) //nolint:gosec
 	for _, result := range []string{"feasible", "no_op", "no_savings", "non_positive_score", "error"} {
 		counter := ScoreBasedMoveEvaluationsTotal.(*opmetrics.PrometheusCounter).WithLabelValues(result)
 		metric := &dto.Metric{}

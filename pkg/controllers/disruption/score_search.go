@@ -64,11 +64,6 @@ type searchStats struct {
 	TimedOut  bool
 }
 
-// searchMoves simulates every move and keeps the highest-scoring ones. nodePrices gives the hourly price of each cluster node, which prices the standby nodes a move reactivates.
-func searchMoves(ctx context.Context, moves []moveSet, deadline time.Time, compute consolidationComputer, inputs scoreInputs, random *rand.Rand, clk clock.Clock) ([]*moveSetEvaluation, searchStats) {
-	return searchSingleMoves(ctx, moves, deadline, compute, inputs, random, clk, scoreBasedValidEvaluationsTarget)
-}
-
 //nolint:gocyclo // Batch growth keeps simulation, limits, and search accounting together.
 func searchAllMoves(ctx context.Context, moves []moveSet, deadline time.Time, compute consolidationComputer, inputs scoreInputs, random *rand.Rand, clk clock.Clock, budgets map[string]int, pacing *DisruptionPacing) ([]*moveSetEvaluation, searchStats) {
 	singles, stats := searchSingleMoves(ctx, moves, deadline, compute, inputs, random, clk, len(moves))
@@ -114,7 +109,7 @@ func searchAllMoves(ctx context.Context, moves []moveSet, deadline time.Time, co
 			attempts++
 			cmd, err := compute(ctx, proposed...)
 			stats.Evaluated++
-			result := "feasible"
+			var result string
 			if err != nil {
 				stats.Errors++
 				result = "error"
@@ -124,13 +119,10 @@ func searchAllMoves(ctx context.Context, moves []moveSet, deadline time.Time, co
 				result = "no_op"
 			} else {
 				batch = proposed
-				breakdown, prices := inputs.score(cmd, cmd.Results)
-				if breakdown.Savings <= 0 || breakdown.Total <= 0 {
+				eval, scoreResult := evaluateScore(cmd, inputs)
+				result = scoreResult
+				if eval == nil {
 					stats.NoSavings++
-					result = "no_savings"
-					if breakdown.Savings > 0 {
-						result = "non_positive_score"
-					}
 				} else {
 					indices := make([]int, len(proposed))
 					for i, c := range proposed {
@@ -140,7 +132,7 @@ func searchAllMoves(ctx context.Context, moves []moveSet, deadline time.Time, co
 					key := fmt.Sprint(indices)
 					if !seen[key] {
 						seen[key] = true
-						evals = append(evals, &moveSetEvaluation{Command: cmd, Score: breakdown.Total, Breakdown: breakdown, SearchBreakdown: breakdown, StandbyPrices: prices, Validation: "not_attempted"})
+						evals = append(evals, eval)
 					}
 				}
 			}
@@ -201,19 +193,27 @@ func searchSingleMoves(ctx context.Context, moves []moveSet, deadline time.Time,
 			stats.NoOp++
 			return nil, false, nil
 		}
-		breakdown, standbyPrices := inputs.score(cmd, cmd.Results)
-		if breakdown.Savings <= 0 || breakdown.Total <= 0 {
-			result = "no_savings"
-			if breakdown.Savings > 0 {
-				result = "non_positive_score"
-			}
+		eval, scoreResult := evaluateScore(cmd, inputs)
+		result = scoreResult
+		if eval == nil {
 			stats.NoSavings++
 			return nil, false, nil
 		}
-		return &moveSetEvaluation{Command: cmd, Score: breakdown.Total, Breakdown: breakdown, SearchBreakdown: breakdown, StandbyPrices: standbyPrices, Validation: "not_attempted"}, true, nil
+		return eval, true, nil
 	})
 	evals := topMovesByScore(valid, limit)
 	return evals, stats
+}
+
+func evaluateScore(cmd Command, inputs scoreInputs) (*moveSetEvaluation, string) {
+	breakdown, prices := inputs.score(cmd, cmd.Results)
+	if breakdown.Savings <= 0 {
+		return nil, "no_savings"
+	}
+	if breakdown.Total <= 0 {
+		return nil, "non_positive_score"
+	}
+	return &moveSetEvaluation{Command: cmd, Score: breakdown.Total, Breakdown: breakdown, SearchBreakdown: breakdown, StandbyPrices: prices, Validation: "not_attempted"}, "feasible"
 }
 
 func topMovesByScore(valid <-chan rill.Try[*moveSetEvaluation], limit int) []*moveSetEvaluation {
