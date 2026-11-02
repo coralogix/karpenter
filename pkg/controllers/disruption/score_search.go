@@ -19,6 +19,7 @@ package disruption
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"runtime"
 	"sort"
@@ -57,17 +58,22 @@ type moveSetEvaluation struct {
 type consolidationComputer func(ctx context.Context, candidates ...*Candidate) (Command, error)
 
 type searchStats struct {
-	Evaluated int
-	Errors    int
-	NoOp      int
-	NoSavings int
-	TimedOut  bool
+	Evaluated       int
+	Errors          int
+	NoOp            int
+	NoSavings       int
+	TimedOut        bool
+	PositiveSavings bool
+	Blocked         bool
 }
 
 //nolint:gocyclo // Batch growth keeps simulation, limits, and search accounting together.
 func searchAllMoves(ctx context.Context, moves []moveSet, deadline time.Time, compute consolidationComputer, inputs scoreInputs, random *rand.Rand, clk clock.Clock, budgets map[string]int, pacing *DisruptionPacing) ([]*moveSetEvaluation, searchStats) {
 	singles, stats := searchSingleMoves(ctx, moves, deadline, compute, inputs, random, clk, len(moves))
 	if len(singles) == 0 {
+		if !stats.PositiveSavings && !stats.TimedOut && ctx.Err() == nil {
+			return searchPairMoves(ctx, moves, deadline, compute, inputs, random, clk, budgets, pacing, stats)
+		}
 		return singles, stats
 	}
 	evals := append([]*moveSetEvaluation(nil), singles...)
@@ -95,15 +101,8 @@ func searchAllMoves(ctx context.Context, moves []moveSet, deadline time.Time, co
 				continue
 			}
 			proposed := append(append([]*Candidate(nil), batch...), candidate)
-			counts := map[string]int{}
-			allowed := true
-			for _, c := range proposed {
-				counts[c.NodePool.Name]++
-				if budgets != nil && counts[c.NodePool.Name] > budgets[c.NodePool.Name] {
-					allowed = false
-				}
-			}
-			if !allowed || !pacing.CommandAllowed(Command{Candidates: proposed}) {
+			if !scoreMoveAllowed(proposed, budgets, pacing) {
+				stats.Blocked = true
 				continue
 			}
 			attempts++
@@ -156,6 +155,109 @@ func searchAllMoves(ctx context.Context, moves []moveSet, deadline time.Time, co
 	return evals, stats
 }
 
+//nolint:gocyclo // Sampling, deadline checks, and simulation accounting form one search phase.
+func searchPairMoves(ctx context.Context, moves []moveSet, deadline time.Time, compute consolidationComputer, inputs scoreInputs, random *rand.Rand, clk clock.Clock, budgets map[string]int, pacing *DisruptionPacing, stats searchStats) ([]*moveSetEvaluation, searchStats) {
+	moves = append([]moveSet(nil), moves...)
+	random.Shuffle(len(moves), func(i, j int) { moves[i], moves[j] = moves[j], moves[i] })
+	pairs := [][2]int{}
+	n := len(moves)
+	if n*(n-1)/2 <= 256 {
+		for i := 0; i < n; i++ {
+			for j := i + 1; j < n; j++ {
+				pairs = append(pairs, [2]int{i, j})
+			}
+		}
+	} else {
+		weights := make([]float64, n)
+		total := 0.0
+		for i, move := range moves {
+			source := inputs.sources[move.Nodes[0]]
+			utilization := 0.0
+			if source.AllocatableCPU > 0 {
+				utilization = source.RequestedCPU / source.AllocatableCPU
+			}
+			weights[i] = math.Max(0.05, 1-math.Max(0, utilization))
+			total += weights[i]
+		}
+		draw := func() int {
+			x := random.Float64() * total
+			for i, weight := range weights {
+				x -= weight
+				if x < 0 {
+					return i
+				}
+			}
+			return n - 1
+		}
+		seen := map[[2]int]bool{}
+		for len(pairs) < 256 {
+			if ctx.Err() != nil || clk.Now().After(deadline) {
+				stats.TimedOut = clk.Now().After(deadline)
+				break
+			}
+			i, j := draw(), draw()
+			if i == j {
+				continue
+			}
+			if i > j {
+				i, j = j, i
+			}
+			pair := [2]int{i, j}
+			if !seen[pair] {
+				seen[pair] = true
+				pairs = append(pairs, pair)
+			}
+		}
+	}
+	evals := []*moveSetEvaluation{}
+	for _, pair := range pairs {
+		if ctx.Err() != nil || clk.Now().After(deadline) {
+			stats.TimedOut = clk.Now().After(deadline)
+			break
+		}
+		candidates := []*Candidate{moves[pair[0]].Nodes[0], moves[pair[1]].Nodes[0]}
+		if !scoreMoveAllowed(candidates, budgets, pacing) {
+			stats.Blocked = true
+			continue
+		}
+		cmd, err := compute(ctx, candidates...)
+		stats.Evaluated++
+		result := "no_op"
+		if err != nil {
+			stats.Errors++
+			result = "error"
+			log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
+		} else if cmd.Decision() == NoOpDecision || len(cmd.Replacements) != 1 {
+			stats.NoOp++
+		} else {
+			eval, scoreResult := evaluateScore(cmd, inputs)
+			result = scoreResult
+			if eval == nil {
+				stats.NoSavings++
+			} else {
+				evals = append(evals, eval)
+			}
+		}
+		ScoreBasedMoveEvaluationsTotal.Inc(map[string]string{"result": result})
+	}
+	sort.SliceStable(evals, func(i, j int) bool { return evals[i].Score > evals[j].Score })
+	if len(evals) > scoreBasedValidEvaluationsTarget {
+		evals = evals[:scoreBasedValidEvaluationsTarget]
+	}
+	return evals, stats
+}
+
+func scoreMoveAllowed(candidates []*Candidate, budgets map[string]int, pacing *DisruptionPacing) bool {
+	counts := map[string]int{}
+	for _, c := range candidates {
+		counts[c.NodePool.Name]++
+		if budgets != nil && counts[c.NodePool.Name] > budgets[c.NodePool.Name] {
+			return false
+		}
+	}
+	return pacing.CommandAllowed(Command{Candidates: candidates})
+}
+
 func searchSingleMoves(ctx context.Context, moves []moveSet, deadline time.Time, compute consolidationComputer, inputs scoreInputs, random *rand.Rand, clk clock.Clock, limit int) ([]*moveSetEvaluation, searchStats) {
 	moves = append([]moveSet(nil), moves...)
 	random.Shuffle(len(moves), func(i, j int) { moves[i], moves[j] = moves[j], moves[i] })
@@ -195,6 +297,9 @@ func searchSingleMoves(ctx context.Context, moves []moveSet, deadline time.Time,
 		}
 		eval, scoreResult := evaluateScore(cmd, inputs)
 		result = scoreResult
+		if scoreResult == "feasible" || scoreResult == "non_positive_score" {
+			stats.PositiveSavings = true
+		}
 		if eval == nil {
 			stats.NoSavings++
 			return nil, false, nil
@@ -229,5 +334,5 @@ func topMovesByScore(valid <-chan rill.Try[*moveSetEvaluation], limit int) []*mo
 }
 
 func (s searchStats) canMarkConsolidated(eligible int, blocked bool) bool {
-	return s.Evaluated == eligible && s.Errors == 0 && !blocked
+	return s.Evaluated >= eligible && s.Errors == 0 && !s.TimedOut && !s.Blocked && !blocked
 }

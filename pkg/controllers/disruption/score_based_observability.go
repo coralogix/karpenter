@@ -98,6 +98,9 @@ func moveLog(eval *moveSetEvaluation) map[string]interface{} {
 
 func scoreMoveKind(cmd Command) string {
 	if len(cmd.Candidates) > 1 {
+		if len(cmd.Replacements) == 1 {
+			return "pair"
+		}
 		return "batch"
 	}
 	return "single"
