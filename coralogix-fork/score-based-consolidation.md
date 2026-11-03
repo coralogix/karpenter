@@ -32,6 +32,8 @@ Optional [disruption pacing](disruption-pacing.md) annotations apply as well.
 
 Annotated NodePools are handled by the score-based method instead of standard emptiness, single-node and multi-node consolidation. Drift is unchanged and still uses the standard drift methods and `Drifted` budgets.
 
+The fork limits single-node consolidation of other NodePools to one minute per search (upstream: three), because it runs in the same disruption loop and delays the score-based method, standby marking and reclamation while it runs.
+
 ### Standby and reclamation
 
 Empty nodes are tainted `karpenter.coralogix.net/standby:NoSchedule` and annotated with the time they entered standby, rather than deleted. Standby requires `spec.disruption.consolidateAfter` to be set. Karpenter manages these marks; do not set them in manifests. Marking evicts nothing and uses no disruption budget.
