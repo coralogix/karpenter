@@ -251,12 +251,19 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	// All we need to do now is get a successful delete call for each node claim,
 	// then the termination controller will handle the eventual deletion of the nodes.
 	errs := make([]error, len(cmd.Candidates))
+	var reclaimedNodeClaims []string
+	if cmd.Method != nil && cmd.ConsolidationType() == ReclamationConsolidationType {
+		reclaimedNodeClaims = make([]string, len(cmd.Candidates))
+	}
 	workqueue.ParallelizeUntil(ctx, len(cmd.Candidates), len(cmd.Candidates), func(i int) {
 		if err := retry.OnError(retry.DefaultBackoff, func(err error) bool { return client.IgnoreNotFound(err) != nil }, func() error {
 			return q.kubeClient.Delete(ctx, cmd.Candidates[i].NodeClaim)
 		}); err != nil {
 			errs[i] = client.IgnoreNotFound(err)
 			return
+		}
+		if reclaimedNodeClaims != nil {
+			reclaimedNodeClaims[i] = cmd.Candidates[i].NodeClaim.Name
 		}
 		q.recorder.Publish(disruptionevents.Terminating(cmd.Candidates[i].Node, cmd.Candidates[i].NodeClaim, string(cmd.Reason()))...)
 		metrics.NodeClaimsDisruptedTotal.Inc(map[string]string{
@@ -265,6 +272,9 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 			metrics.CapacityTypeLabel: cmd.Candidates[i].NodeClaim.Labels[v1.CapacityTypeLabelKey],
 		})
 	})
+	if names := lo.Without(reclaimedNodeClaims, ""); len(names) > 0 {
+		log.FromContext(ctx).Info("requested standby nodeclaim deletion", "nodeclaims", names, "nodeclaim-count", len(names))
+	}
 	// If there were any deletion failures, we should requeue.
 	// In the case where we requeue, but the timeout for the command is reached, we'll mark this as a failure.
 	return multierr.Combine(errs...)
@@ -409,9 +419,17 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 
 func (q *Queue) executeStandbyMarking(ctx context.Context, cmd *Command) error {
 	errs := make([]error, len(cmd.Candidates))
+	markedNodeClaims := make([]string, len(cmd.Candidates))
 	workqueue.ParallelizeUntil(ctx, len(cmd.Candidates), len(cmd.Candidates), func(i int) {
-		errs[i] = standby.Mark(ctx, q.kubeClient, cmd.Candidates[i].Node, q.clock.Now())
+		marked, err := standby.MarkIfPresent(ctx, q.kubeClient, cmd.Candidates[i].Node, q.clock.Now())
+		errs[i] = err
+		if marked && err == nil {
+			markedNodeClaims[i] = cmd.Candidates[i].NodeClaim.Name
+		}
 	})
+	if names := lo.Without(markedNodeClaims, ""); len(names) > 0 {
+		log.FromContext(ctx).Info("marked nodes standby", "nodeclaims", names, "nodeclaim-count", len(names))
+	}
 	if err := multierr.Combine(errs...); err != nil {
 		return serrors.Wrap(fmt.Errorf("marking standby, %w", err), "command-id", cmd.ID)
 	}

@@ -87,6 +87,8 @@ The utilization term adds `utilization-weight × (allocatable CPU − requested 
 
 ## Events and metrics
 
+Standby marking logs `marked nodes standby` after applying standby marks. Reclamation logs `requested standby nodeclaim deletion` after successful NodeClaim deletion requests; node termination completes asynchronously. Each non-empty execution logs one summary with `nodeclaims` (NodeClaim names) and `nodeclaim-count`, including successful operations when other operations in the same execution fail.
+
 `ConsolidationCandidate` events identify the chosen move's source Node and NodeClaim after validation. Kept moves that fail validation before the chosen move receive `ConsolidationRejected` events; simulation continues to emit upstream `Unconsolidatable` events. A NodePool receives a deduplicated `DisruptionBlocked` event when its Underutilized budget is exhausted, including by disruptions already in progress, or pacing holds back all its candidates.
 
 The existing `karpenter_voluntary_disruption_decision_evaluation_duration_seconds`, `karpenter_voluntary_disruption_decisions_total`, `karpenter_voluntary_disruption_failed_validations_total`, and `karpenter_voluntary_disruption_consolidation_timeouts_total` metrics use `consolidation_type="score-based"`. Failed validations count kept moves, and a timeout counts a search cut short by the deadline even if it finds a move.
