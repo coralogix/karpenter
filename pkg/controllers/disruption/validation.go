@@ -194,6 +194,9 @@ func (c *ConsolidationValidator) Validate(ctx context.Context, cmd Command, vali
 	if err != nil {
 		return Command{}, err
 	}
+	if c.validationType != ScoreBasedConsolidationType {
+		return cmd, nil
+	}
 	// Keep the launch options used for pricing while retaining the re-simulated pod placements.
 	if len(results.NewNodeClaims) > 0 && len(cmd.Results.NewNodeClaims) > 0 {
 		results.NewNodeClaims[0].InstanceTypeOptions = cmd.Results.NewNodeClaims[0].InstanceTypeOptions
