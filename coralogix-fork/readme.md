@@ -4,6 +4,10 @@ This directory documents Coralogix-specific extensions in this Karpenter fork. T
 
 Warning: At the moment this documentation is mostly LLM generated (quality may vary).
 
+## CI
+
+Pull-request validation is described in [ci-workflows.md](ci-workflows.md) (minimal **presubmit** workflow on `coralogix/karpenter`).
+
 ## Features
 
 - [Disruption pacing](disruption-pacing.md) — optional per-NodePool or per-NodePool-group rate limit for non-empty node disruptions
