@@ -47,6 +47,8 @@ On `WhenEmptyOrUnderutilized` pools, the method picks the single-node move with 
 
 Savings account for the price of any new node and of standby nodes that would be reactivated. Moves needing more than one new node are rejected. Each searched pass logs its decision, including why no move was chosen.
 
+After the 15-second validation delay, the method re-simulates its best moves on a fresh view of the cluster and runs the one that still saves the most.
+
 ## Rollback to upstream
 
 Rolling back to upstream Karpenter is safe and needs no manifest or CRD changes. Upstream ignores the annotations, and the NodePools resume standard emptiness and consolidation. Nodes may keep the standby taint; remove it manually so scheduling is not blocked:

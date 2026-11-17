@@ -47,9 +47,11 @@ var _ = Describe("Standby reactivation", func() {
 
 	It("leaves standby unchanged when validation rejects the consolidation", func() {
 		nodePool, destinationNode, _ := givenStandbyDestinationAndSource()
-		validator := NewTestScoreBasedConsolidationValidator(nodePool, WithUnderutilizedBlockingBudget())
 
-		reconcileThroughValidationDelay(scoreBasedDisruptionController(validator))
+		reconcileThroughValidationDelay(disruptionController, func() {
+			nodePool.Spec.Disruption.Budgets = []v1.Budget{{Nodes: "0"}}
+			ExpectApplied(ctx, env.Client, nodePool)
+		})
 
 		Expect(queue.GetCommands()).To(BeEmpty())
 		expectMarkedStandby(destinationNode)
@@ -91,17 +93,14 @@ func givenStandbyDestinationAndSource() (nodePool *v1.NodePool, destinationNode 
 	return nodePool, nodes[0], nodeClaims[1]
 }
 
-// scoreBasedDisruptionController runs only score-based consolidation, validated by the given validator.
-func scoreBasedDisruptionController(validator disruption.Validator) *disruption.Controller {
-	c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)
-	method := disruption.NewScoreBasedConsolidation(c, disruption.WithValidator(validator))
-	return disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost, disruption.WithMethods(method))
-}
-
-// reconcileThroughValidationDelay runs a disruption pass that waits out the score-based validation delay.
-func reconcileThroughValidationDelay(controller *disruption.Controller) {
+// reconcileThroughValidationDelay runs a disruption pass that waits out the score-based validation delay, applying
+// duringDelay between the search and the rescore.
+func reconcileThroughValidationDelay(controller *disruption.Controller, duringDelay ...func()) {
 	ExpectParallelized(func() { ExpectSingletonReconciled(ctx, controller) }, func() {
 		Eventually(env.Clock.HasWaiters, 10*time.Second).Should(BeTrue())
+		for _, f := range duringDelay {
+			f()
+		}
 		env.Clock.Step(15 * time.Second)
 	})
 }

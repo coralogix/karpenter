@@ -18,7 +18,6 @@ package disruption
 
 import (
 	"context"
-	"fmt"
 	"math/rand"
 	"strconv"
 	"strings"
@@ -100,33 +99,19 @@ func TestScoreBasedConsolidationCandidateFiltering(t *testing.T) {
 	})
 }
 
-func TestScoreBasedConsolidationValidatorFilter(t *testing.T) {
+func TestScoreBasedConsolidationShouldDisruptOnlyScoreBasedPools(t *testing.T) {
 	ctx := context.Background()
 	c := MakeConsolidation(nil, nil, nil, nil, nil, events.NewRecorder(&record.FakeRecorder{}), nil, nil)
 	candidate := scoreBasedTestCandidate(true)
 
 	scoreBased := &ScoreBasedConsolidation{consolidation: c}
 	singleNode := &SingleNodeConsolidation{consolidation: c}
-	scoreValidator := NewScoreBasedConsolidationValidator(c)
-	defaultValidator := NewScoreBasedConsolidation(c).validator.(*ConsolidationValidator)
 
 	if singleNode.ShouldDisrupt(ctx, candidate) {
 		t.Fatal("single-node ShouldDisrupt must reject score-based pools")
 	}
 	if !scoreBased.ShouldDisrupt(ctx, candidate) {
 		t.Fatal("score-based ShouldDisrupt must accept score-based pools")
-	}
-	if scoreValidator.validationType != ScoreBasedConsolidationType {
-		t.Fatalf("score validator type = %q, want %q", scoreValidator.validationType, ScoreBasedConsolidationType)
-	}
-	if defaultValidator.validationType != ScoreBasedConsolidationType {
-		t.Fatalf("default score-based validator type = %q, want %q", defaultValidator.validationType, ScoreBasedConsolidationType)
-	}
-	if !scoreValidator.filter(ctx, candidate) {
-		t.Fatal("score-based validator filter must accept score-based pools")
-	}
-	if defaultValidator.filter(ctx, candidate) != scoreBased.ShouldDisrupt(ctx, candidate) {
-		t.Fatal("score-based consolidation must wire ScoreBasedConsolidation.ShouldDisrupt into its validator")
 	}
 }
 
@@ -259,155 +244,125 @@ func TestSearchMoves_returnsPartialOnTimeout(t *testing.T) {
 	}
 }
 
-func TestSelectBestRescoredCommand_prefersHigherRescoredSavings(t *testing.T) {
-	ctx := context.Background()
-	recorder := events.NewRecorder(record.NewFakeRecorder(10))
-	highSearch := candidateWithPrice(t, 10)
-	highSearch.Node.Name = "high-search"
-	lowSearch := candidateWithPrice(t, 5)
-	lowSearch.Node.Name = "low-search"
+func TestSelectBestRescoredCommand_runsHigherRescoredMoveAsResimulated(t *testing.T) {
+	highSearch, lowSearch := namedCandidate(t, "high-search", 10), namedCandidate(t, "low-search", 5)
 	moves := []*move{
-		{
-			Command: Command{
-				Candidates: []*Candidate{highSearch},
-				Results:    pscheduling.Results{ExistingNodes: standbyReactivationResults("standby-expensive", 1)},
-			},
-			SearchScore: moveScore{Savings: 9},
-		},
-		{
-			Command:     Command{Candidates: []*Candidate{lowSearch}},
-			SearchScore: moveScore{Savings: 5},
-		},
+		{Command: Command{Candidates: []*Candidate{highSearch}, Results: pscheduling.Results{ExistingNodes: standbyReactivationResults("standby-expensive", 1)}}, SearchScore: moveScore{Savings: 9}},
+		{Command: Command{Candidates: []*Candidate{lowSearch}}, SearchScore: moveScore{Savings: 5}},
 	}
-	validator := rescoreTestValidator{
-		byCandidate: map[string]pscheduling.Results{
-			"high-search": {ExistingNodes: standbyReactivationResults("standby-costly", 6)},
-			"low-search":  {ExistingNodes: standbyReactivationResults("standby-cheap", 0.01)},
-		},
-	}
+	compute := resimulatedTo(map[string]pscheduling.Results{
+		"high-search": {ExistingNodes: standbyReactivationResults("standby-costly", 6)},
+		"low-search":  {ExistingNodes: standbyReactivationResults("standby-cheap", 0.01)},
+	})
 
-	cmd, err := selectBestRescoredCommand(ctx, validator, recorder, moves)
-	if err != nil {
-		t.Fatalf("selectBestRescoredCommand() error = %v", err)
-	}
+	cmd := expectRescore(t, compute, moves)
+
 	if cmd.Candidates[0].Name() != "low-search" {
 		t.Fatalf("chosen candidate = %q, want low-search", cmd.Candidates[0].Name())
 	}
 	if got := cmd.Results.ExistingNodes[0].Name(); got != "standby-cheap" {
 		t.Fatalf("executed standby = %q, want standby-cheap", got)
 	}
-	if moves[0].Selected || !moves[1].Selected {
-		t.Fatal("expected only low-search move to be selected after rescoring")
-	}
-	if moves[1].ValidationScore.Savings <= moves[0].ValidationScore.Savings {
-		t.Fatalf("low-search rescored score = %v, want greater than high-search score %v", moves[1].ValidationScore.Savings, moves[0].ValidationScore.Savings)
-	}
 }
 
-func TestSelectBestRescoredCommand_rejectsNonPositiveRescoredSavings(t *testing.T) {
-	ctx := context.Background()
-	recorder := events.NewRecorder(record.NewFakeRecorder(10))
-	candidate := candidateWithPrice(t, 0.10)
-	candidate.Node.Name = "source"
-	moves := []*move{{
-		Command: Command{
-			Candidates: []*Candidate{candidate},
-			Results:    pscheduling.Results{ExistingNodes: standbyReactivationResults("standby-a", 0.10)},
-		},
-		SearchScore: moveScore{Savings: 0.10},
-	}}
-	validator := rescoreTestValidator{byCandidate: map[string]pscheduling.Results{"source": moves[0].Command.Results}}
+func TestSelectBestRescoredCommand_rejectsNonPositiveRescoredScore(t *testing.T) {
+	source := namedCandidate(t, "source", 0.10)
+	results := pscheduling.Results{ExistingNodes: standbyReactivationResults("standby-a", 0.10)}
+	moves := []*move{{Command: Command{Candidates: []*Candidate{source}, Results: results}, SearchScore: moveScore{Savings: 0.10}}}
 
-	cmd, err := selectBestRescoredCommand(ctx, validator, recorder, moves)
-	if err != nil {
-		t.Fatalf("selectBestRescoredCommand() error = %v", err)
-	}
+	cmd := expectRescore(t, resimulatedTo(map[string]pscheduling.Results{"source": results}), moves)
+
 	if len(cmd.Candidates) != 0 {
 		t.Fatalf("command candidates = %d, want 0", len(cmd.Candidates))
 	}
-	if moves[0].Validation != validationNoSavings {
+	if moves[0].validationText() != "failed: no_savings" {
 		t.Fatalf("validation = %q, want failed: no_savings", moves[0].validationText())
 	}
 }
 
-type rescoreTestValidator struct {
-	byCandidate map[string]pscheduling.Results
-}
-
-func (v rescoreTestValidator) Validate(_ context.Context, cmd Command, _ time.Duration) (Command, error) {
-	if len(cmd.Candidates) == 0 {
-		return Command{}, nil
-	}
-	name := cmd.Candidates[0].Name()
-	results, ok := v.byCandidate[name]
-	if !ok {
-		return cmd, nil
-	}
-	cmd.Results = results
-	return cmd, nil
-}
-
-func TestSelectBestRescoredCommand_validationFallback(t *testing.T) {
-	ctx := context.Background()
-	fakeRecorder := record.NewFakeRecorder(10)
-	recorder := events.NewRecorder(fakeRecorder)
-	highScoreCandidate := candidateWithPrice(t, 0.50)
-	highScoreCandidate.Node.Name = "high-score"
-	highScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "high-score"}}
-	lowScoreCandidate := candidateWithPrice(t, 0.10)
-	lowScoreCandidate.Node.Name = "low-score"
-	lowScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "low-score"}}
+func TestSelectBestRescoredCommand_noOpFailsWithSchedulingAndNextMoveRuns(t *testing.T) {
+	high, low := namedCandidate(t, "high-score", 0.50), namedCandidate(t, "low-score", 0.10)
 	moves := []*move{
-		{Command: Command{Candidates: []*Candidate{highScoreCandidate}}, SearchScore: moveScore{Savings: 0.50}},
-		{Command: Command{Candidates: []*Candidate{lowScoreCandidate}}, SearchScore: moveScore{Savings: 0.10}},
+		{Command: Command{Candidates: []*Candidate{high}}, SearchScore: moveScore{Savings: 0.50}},
+		{Command: Command{Candidates: []*Candidate{low}}, SearchScore: moveScore{Savings: 0.10}},
 	}
-	validator := rejectFirstCommandValidator{}
 
-	cmd, err := selectBestRescoredCommand(ctx, validator, recorder, moves)
-	if err != nil {
-		t.Fatalf("selectBestRescoredCommand() error = %v", err)
+	cmd := expectRescore(t, resimulatedTo(map[string]pscheduling.Results{"low-score": {}}), moves)
+
+	if len(cmd.Candidates) != 1 || cmd.Candidates[0] != low {
+		t.Fatalf("command candidates = %v, want low-score", cmd.Candidates)
 	}
-	if len(cmd.Candidates) != 1 {
-		t.Fatalf("command candidates = %d, want 1", len(cmd.Candidates))
-	}
-	if cmd.Candidates[0] != lowScoreCandidate {
-		t.Fatal("expected fallback to lower-scored command after validation rejection")
-	}
-	if got := len(collectFakeRecorderEvents(fakeRecorder)); got != 0 {
-		t.Fatalf("rejected events = %d, want 0 when a fallback command passes validation", got)
+	if moves[0].validationText() != "failed: scheduling" {
+		t.Fatalf("validation = %q, want failed: scheduling", moves[0].validationText())
 	}
 }
 
-func TestSelectBestRescoredCommand_emitsRejectedEventOnlyForFirstEvalWhenAllFail(t *testing.T) {
-	ctx := context.Background()
+func TestSelectBestRescoredCommand_emitsRejectedEventOnlyForFirstMoveWhenAllFail(t *testing.T) {
 	fakeRecorder := record.NewFakeRecorder(10)
-	recorder := events.NewRecorder(fakeRecorder)
-	highScoreCandidate := candidateWithPrice(t, 0.50)
-	highScoreCandidate.Node.Name = "high-score"
-	highScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "high-score"}}
-	lowScoreCandidate := candidateWithPrice(t, 0.10)
-	lowScoreCandidate.Node.Name = "low-score"
-	lowScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "low-score"}}
 	moves := []*move{
-		{Command: Command{Candidates: []*Candidate{highScoreCandidate}}, SearchScore: moveScore{Savings: 0.50}},
-		{Command: Command{Candidates: []*Candidate{lowScoreCandidate}}, SearchScore: moveScore{Savings: 0.10}},
+		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "high-score", 0.50)}}, SearchScore: moveScore{Savings: 0.50}},
+		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "low-score", 0.10)}}, SearchScore: moveScore{Savings: 0.10}},
 	}
 
-	cmd, err := selectBestRescoredCommand(ctx, rejectAllCommandValidator{}, recorder, moves)
-	if err != nil {
-		t.Fatalf("selectBestRescoredCommand() error = %v", err)
-	}
+	cmd := selectBestRescoredCommand(context.Background(), resimulatedTo(nil), events.NewRecorder(fakeRecorder), moves)
+
 	if len(cmd.Candidates) != 0 {
 		t.Fatalf("command candidates = %d, want 0", len(cmd.Candidates))
 	}
-
 	rejectedEvents := collectFakeRecorderEvents(fakeRecorder)
-	if eventsMentioningNode(rejectedEvents, "low-score") {
-		t.Fatal("did not expect rejected events for fallback move")
+	if eventsMentioningNode(rejectedEvents, "low-score") || !eventsMentioningNode(rejectedEvents, "high-score") {
+		t.Fatalf("rejected events = %v, want only high-score", rejectedEvents)
 	}
-	if !eventsMentioningNode(rejectedEvents, "high-score") {
-		t.Fatal("expected rejected events for the first move when all validations fail")
+}
+
+func TestSelectBestRescoredCommand_rejectsMoveByWholeCommandPacing(t *testing.T) {
+	pool := paceTestNodePool("1", "1")
+	clk := clocktesting.NewFakeClock(time.Now())
+	pacing := NewDisruptionPacing(clk)
+	pacing.Refresh([]*v1.NodePool{pool}, nil)
+	a, b := namedCandidate(t, "a", 1), namedCandidate(t, "b", 1)
+	for _, c := range []*Candidate{a, b} {
+		c.NodePool, c.reschedulablePods = pool, []*corev1.Pod{{}}
 	}
+	checks := rescoreChecks{
+		candidates:                 map[string]*Candidate{"a": a, "b": b},
+		disruptionBudgetByNodePool: map[string]int{pool.Name: 2},
+		cluster:                    state.NewCluster(clk, nil, nil),
+		pacing:                     pacing,
+	}
+	moves := []*move{{Command: Command{Candidates: []*Candidate{a, b}}, SearchScore: moveScore{Savings: 2}}}
+
+	cmd := expectRescore(t, checks.wrap(resimulatedTo(map[string]pscheduling.Results{"a": {}})), moves)
+
+	if len(cmd.Candidates) != 0 {
+		t.Fatalf("command candidates = %d, want 0", len(cmd.Candidates))
+	}
+	if moves[0].validationText() != "failed: pacing" {
+		t.Fatalf("validation = %q, want failed: pacing", moves[0].validationText())
+	}
+}
+
+func resimulatedTo(byFirstSource map[string]pscheduling.Results) consolidationComputer {
+	return func(_ context.Context, candidates ...*Candidate) (Command, error) {
+		results, ok := byFirstSource[candidates[0].Name()]
+		if !ok {
+			return Command{}, nil
+		}
+		return Command{Candidates: candidates, Results: results}, nil
+	}
+}
+
+func expectRescore(t *testing.T, compute consolidationComputer, moves []*move) Command {
+	t.Helper()
+	return selectBestRescoredCommand(context.Background(), compute, events.NewRecorder(record.NewFakeRecorder(10)), moves)
+}
+
+func namedCandidate(t *testing.T, name string, price float64) *Candidate {
+	t.Helper()
+	c := candidateWithPrice(t, price)
+	c.Node.Name = name
+	c.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	return c
 }
 
 func collectFakeRecorderEvents(fakeRecorder *record.FakeRecorder) []string {
@@ -425,21 +380,6 @@ func eventsMentioningNode(events []string, nodeName string) bool {
 		}
 	}
 	return false
-}
-
-type rejectFirstCommandValidator struct{}
-
-func (rejectFirstCommandValidator) Validate(_ context.Context, cmd Command, _ time.Duration) (Command, error) {
-	if len(cmd.Candidates) > 0 && cmd.Candidates[0].Name() == "high-score" {
-		return Command{}, NewSchedulingValidationError(fmt.Errorf("rejected high-score command"))
-	}
-	return cmd, nil
-}
-
-type rejectAllCommandValidator struct{}
-
-func (rejectAllCommandValidator) Validate(_ context.Context, _ Command, _ time.Duration) (Command, error) {
-	return Command{}, NewSchedulingValidationError(fmt.Errorf("rejected"))
 }
 
 func candidateWithPrice(t *testing.T, price float64) *Candidate {

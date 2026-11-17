@@ -19,26 +19,132 @@ package disruption
 import (
 	"context"
 	"errors"
-	"time"
+	"fmt"
+
+	"github.com/samber/lo"
+	"k8s.io/apimachinery/pkg/util/sets"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/events"
 )
 
 var errWholeCommandPacing = errors.New("whole-command pacing")
 
-// scoreMoveValidator rechecks pacing for the whole move after the consolidation validator has passed it.
-type scoreMoveValidator struct {
-	Validator
-	pacing *DisruptionPacing
-}
-
-func (v scoreMoveValidator) Validate(ctx context.Context, cmd Command, delay time.Duration) (Command, error) {
-	validated, err := v.Validator.Validate(ctx, cmd, delay)
+// rescoreKeptMoves repeats the search on a fresh snapshot of the kept moves' sources and returns the move with the
+// highest positive rescored score, exactly as re-simulated.
+func (s *ScoreBasedConsolidation) rescoreKeptMoves(ctx context.Context, moves []*move) (Command, error) {
+	sources := sets.New[string]()
+	for _, m := range moves {
+		for _, c := range m.Command.Candidates {
+			sources.Insert(c.Name())
+		}
+	}
+	snapshot, err := s.prepare(ctx, sources)
 	if err != nil {
 		return Command{}, err
 	}
-	if !v.pacing.CommandAllowed(validated) {
-		return Command{}, NewValidationError(errWholeCommandPacing)
+	compute, err := s.newComputer(ctx, snapshot.candidates)
+	if err != nil {
+		return Command{}, err
 	}
-	return validated, nil
+	checks := rescoreChecks{
+		candidates:                 lo.KeyBy(snapshot.candidates, func(c *Candidate) string { return c.Name() }),
+		disruptionBudgetByNodePool: snapshot.disruptionBudgetByNodePool,
+		cluster:                    s.cluster,
+		pacing:                     s.disruptionPacing,
+	}
+	return selectBestRescoredCommand(ctx, checks.wrap(compute), s.recorder, moves), nil
+}
+
+type rescoreChecks struct {
+	candidates                 map[string]*Candidate
+	disruptionBudgetByNodePool map[string]int
+	cluster                    *state.Cluster
+	pacing                     *DisruptionPacing
+}
+
+func (r rescoreChecks) wrap(compute consolidationComputer) consolidationComputer {
+	return func(ctx context.Context, sources ...*Candidate) (Command, error) {
+		fresh, err := r.freshSources(sources)
+		if err != nil {
+			return Command{}, err
+		}
+		cmd, err := compute(ctx, fresh...)
+		if err != nil {
+			return Command{}, err
+		}
+		// Recheck nomination after simulating, see https://github.com/kubernetes-sigs/karpenter/issues/1167.
+		if err := r.checkNotNominated(cmd.Candidates); err != nil {
+			return Command{}, err
+		}
+		if !r.pacing.CommandAllowed(cmd) {
+			return Command{}, NewValidationError(errWholeCommandPacing)
+		}
+		return cmd, nil
+	}
+}
+
+func (r rescoreChecks) freshSources(sources []*Candidate) ([]*Candidate, error) {
+	fresh := make([]*Candidate, 0, len(sources))
+	perPool := map[string]int{}
+	for _, source := range sources {
+		c, ok := r.candidates[source.Name()]
+		if !ok {
+			return nil, NewChurnValidationError(fmt.Errorf("candidate %s is no longer valid", source.Name()))
+		}
+		perPool[c.NodePool.Name]++
+		if perPool[c.NodePool.Name] > r.disruptionBudgetByNodePool[c.NodePool.Name] {
+			return nil, NewBudgetValidationError(fmt.Errorf("the move can no longer run without violating budgets"))
+		}
+		fresh = append(fresh, c)
+	}
+	return fresh, r.checkNotNominated(fresh)
+}
+
+func (r rescoreChecks) checkNotNominated(candidates []*Candidate) error {
+	for _, c := range candidates {
+		if r.cluster.IsNodeNominated(c.ProviderID()) {
+			return NewBudgetValidationError(fmt.Errorf("a candidate was nominated during validation"))
+		}
+	}
+	return nil
+}
+
+func selectBestRescoredCommand(ctx context.Context, compute consolidationComputer, recorder events.Recorder, moves []*move) Command {
+	for _, m := range moves {
+		rescore(ctx, compute, m)
+	}
+	passed := lo.Filter(moves, func(e *move, _ int) bool { return e.Validation == validationPassed })
+	if len(passed) == 0 {
+		if moves[0].Validation == validationFailed {
+			moves[0].Command.EmitRejectedEvents(recorder, moves[0].FailureReason)
+		}
+		return Command{}
+	}
+	best := lo.MaxBy(passed, func(a, b *move) bool { return a.ValidationScore.Savings > b.ValidationScore.Savings })
+	best.Selected = true
+	return best.Command
+}
+
+func rescore(ctx context.Context, compute consolidationComputer, m *move) {
+	fresh, err := evaluateMove(ctx, compute, m.Command.Candidates)
+	if err == nil && fresh == nil {
+		err = NewSchedulingValidationError(errors.New("move no longer consolidates"))
+	}
+	if err != nil {
+		if !IsValidationError(err) {
+			log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
+			m.Validation, m.FailureReason = validationFailed, "error"
+			return
+		}
+		FailedValidationsTotal.Inc(map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
+		m.Validation, m.FailureReason = validationFailed, scoreBasedValidationFailureReason(err)
+		return
+	}
+	m.Command, m.ValidationScore = fresh.Command, fresh.Score
+	m.Validation = lo.Ternary(fresh.Score.Savings > 0, validationPassed, validationNoSavings)
 }
 
 func scoreBasedValidationFailureReason(err error) string {
