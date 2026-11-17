@@ -26,12 +26,8 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	"github.com/awslabs/operatorpkg/option"
-	"github.com/samber/lo"
-
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
-	"sigs.k8s.io/karpenter/pkg/events"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
 
@@ -49,33 +45,10 @@ func NodePoolUsesScoreBasedConsolidation(np *v1.NodePool) bool {
 
 type ScoreBasedConsolidation struct {
 	consolidation
-	validator Validator
 }
 
-func NewScoreBasedConsolidation(c consolidation, opts ...option.Function[MethodOptions]) *ScoreBasedConsolidation {
-	o := option.Resolve(append([]option.Function[MethodOptions]{WithValidator(NewScoreBasedConsolidationValidator(c))}, opts...)...)
-	return &ScoreBasedConsolidation{
-		consolidation: c,
-		validator:     o.validator,
-	}
-}
-
-func NewScoreBasedConsolidationValidator(c consolidation) *ConsolidationValidator {
-	s := &ScoreBasedConsolidation{consolidation: c}
-	return &ConsolidationValidator{
-		validation: validation{
-			clock:         c.clock,
-			cluster:       c.cluster,
-			kubeClient:    c.kubeClient,
-			provisioner:   c.provisioner,
-			cloudProvider: c.cloudProvider,
-			recorder:      c.recorder,
-			queue:         c.queue,
-			reason:        v1.DisruptionReasonUnderutilized,
-		},
-		filter:         s.ShouldDisrupt,
-		validationType: s.ConsolidationType(),
-	}
+func NewScoreBasedConsolidation(c consolidation) *ScoreBasedConsolidation {
+	return &ScoreBasedConsolidation{consolidation: c}
 }
 
 func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candidate) bool {
@@ -91,15 +64,21 @@ func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candida
 	return s.consolidation.ShouldDisrupt(ctx, cn)
 }
 
+// ComputeCommands builds its candidates and budgets from its own snapshot, so it ignores the controller's.
+//
 // nolint:gocyclo
-func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) (_ []Command, err error) {
+func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, _ map[string]int, _ ...*Candidate) (_ []Command, err error) {
 	if s.IsConsolidated() {
 		return []Command{}, nil
 	}
 
 	start := s.clock.Now()
 	deadline := start.Add(ScoreBasedConsolidationTimeoutDuration)
-	validCandidates, budgetBlockedPools, pacingBlockedPools := s.filterCandidates(disruptionBudgetMapping, candidates)
+	snapshot, err := s.prepare(ctx, nil)
+	if err != nil {
+		return []Command{}, err
+	}
+	validCandidates, budgetBlockedPools, pacingBlockedPools := s.filterCandidates(snapshot)
 	var moves []*move
 	var stats searchStats
 	eligible := len(validCandidates)
@@ -107,7 +86,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	defer func() {
 		// A failed pass writes no decision log; the controller reports the error.
 		if err == nil {
-			logScoreDecision(ctx, moves, stats, len(candidates), eligible, budgetBlockedPools, pacingBlockedPools, searchDuration)
+			logScoreDecision(ctx, moves, stats, len(snapshot.candidates), eligible, budgetBlockedPools, pacingBlockedPools, searchDuration)
 		}
 	}()
 
@@ -129,7 +108,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	if err := s.waitForValidation(ctx, start); err != nil {
 		return []Command{}, err
 	}
-	cmd, err := selectBestRescoredCommand(ctx, scoreMoveValidator{s.validator, s.disruptionPacing}, s.recorder, moves)
+	cmd, err := s.rescoreKeptMoves(ctx, moves)
 	if err != nil {
 		return []Command{}, err
 	}
@@ -139,13 +118,13 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, disruptio
 	return []Command{cmd}, nil
 }
 
-func (s *ScoreBasedConsolidation) filterCandidates(disruptionBudgetMapping map[string]int, candidates []*Candidate) ([]*Candidate, []string, []string) {
+func (s *ScoreBasedConsolidation) filterCandidates(snapshot clusterSnapshot) ([]*Candidate, []string, []string) {
 	var validCandidates []*Candidate
 	budgetBlockedPools := sets.New[string]()
 	pacingBlockedPools := sets.New[string]()
-	for _, candidate := range candidates {
+	for _, candidate := range snapshot.candidates {
 		pool := candidate.NodePool.Name
-		if disruptionBudgetMapping[pool] == 0 {
+		if snapshot.disruptionBudgetByNodePool[pool] == 0 {
 			budgetBlockedPools.Insert(pool)
 			continue
 		}
@@ -176,7 +155,7 @@ func (s *ScoreBasedConsolidation) searchForMoves(ctx context.Context, candidates
 	if len(candidates) == 0 {
 		return nil, searchStats{}, nil
 	}
-	simulator, err := NewConsolidationSchedulingSimulator(ctx, s.kubeClient, s.cluster, s.provisioner, s.clock, s.recorder, candidates...)
+	compute, err := s.newComputer(ctx, candidates)
 	if err != nil {
 		return nil, searchStats{}, err
 	}
@@ -185,44 +164,18 @@ func (s *ScoreBasedConsolidation) searchForMoves(ctx context.Context, candidates
 		sources[i] = []*Candidate{c}
 	}
 	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec
-	moves, stats := searchMoves(ctx, sources, deadline, func(ctx context.Context, candidates ...*Candidate) (Command, error) {
-		return s.computeConsolidation(ctx, simulator, candidates...)
-	}, rng, s.clock)
+	moves, stats := searchMoves(ctx, sources, deadline, compute, rng, s.clock)
 	return moves, stats, nil
 }
 
-func selectBestRescoredCommand(ctx context.Context, validator Validator, recorder events.Recorder, moves []*move) (Command, error) {
-	for _, m := range moves {
-		if err := rescore(ctx, validator, m); err != nil {
-			return Command{}, err
-		}
-	}
-	passed := lo.Filter(moves, func(e *move, _ int) bool { return e.Validation == validationPassed })
-	if len(passed) == 0 {
-		if moves[0].Validation == validationFailed {
-			moves[0].Command.EmitRejectedEvents(recorder, moves[0].FailureReason)
-		}
-		return Command{}, nil
-	}
-	best := lo.MaxBy(passed, func(a, b *move) bool { return a.ValidationScore.Savings > b.ValidationScore.Savings })
-	best.Selected = true
-	return best.Command, nil
-}
-
-// rescore validates the move and records the outcome on m. Only errors other than validation failures are returned.
-func rescore(ctx context.Context, validator Validator, m *move) error {
-	validated, err := validator.Validate(ctx, m.Command, 0)
+func (s *ScoreBasedConsolidation) newComputer(ctx context.Context, candidates []*Candidate) (consolidationComputer, error) {
+	simulator, err := NewConsolidationSchedulingSimulator(ctx, s.kubeClient, s.cluster, s.provisioner, s.clock, s.recorder, candidates...)
 	if err != nil {
-		if !IsValidationError(err) {
-			return fmt.Errorf("validating score-based consolidation, %w", err)
-		}
-		m.Validation, m.FailureReason = validationFailed, scoreBasedValidationFailureReason(err)
-		return nil
+		return nil, err
 	}
-	m.Command = validated
-	m.ValidationScore = scoreMove(validated)
-	m.Validation = lo.Ternary(m.ValidationScore.Savings > 0, validationPassed, validationNoSavings)
-	return nil
+	return func(ctx context.Context, candidates ...*Candidate) (Command, error) {
+		return s.computeConsolidation(ctx, simulator, candidates...)
+	}, nil
 }
 
 func (s *ScoreBasedConsolidation) Reason() v1.DisruptionReason {

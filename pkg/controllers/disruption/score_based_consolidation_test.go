@@ -133,7 +133,7 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			disruption.FailedValidationsTotal.Reset()
 		})
 
-		DescribeTable("should correctly report invalidated commands for score-based consolidation", func(validatorOpt TestConsolidationValidatorOption) {
+		DescribeTable("should correctly report invalidated commands for score-based consolidation", func(duringValidationDelay func(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim)) {
 			labels := map[string]string{"app": "test"}
 			rs := test.ReplicaSet()
 			ExpectApplied(ctx, env.Client, rs)
@@ -169,40 +169,32 @@ var _ = Describe("ScoreBasedConsolidation", func() {
 			ExpectManualBinding(ctx, env.Client, pod, node)
 			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 
-			c := disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)
-			scoreBasedConsolidation := disruption.NewScoreBasedConsolidation(c, disruption.WithValidator(NewTestScoreBasedConsolidationValidator(scoreBasedNodePool, validatorOpt)))
-			budgets, err := disruption.BuildDisruptionBudgetMapping(ctx, cluster, env.Clock, env.Client, cloudProvider, recorder, scoreBasedConsolidation.Reason())
-			Expect(err).To(Succeed())
-
-			candidates, err := disruption.GetCandidates(ctx, cluster, env.Client, recorder, env.Clock, cloudProvider, scoreBasedConsolidation.ShouldDisrupt, scoreBasedConsolidation.Class(), queue)
-			Expect(err).To(Succeed())
-
 			var cmds []disruption.Command
+			var err error
 			ExpectParallelized(
 				func() {
-					cmds, err = scoreBasedConsolidation.ComputeCommands(ctx, budgets, candidates...)
+					cmds, err = scoreBased.ComputeCommands(ctx, nil)
 				},
 				func() {
 					Eventually(env.Clock.HasWaiters, time.Second*10).Should(BeTrue())
+					duringValidationDelay([]*corev1.Node{node}, []*v1.NodeClaim{nodeClaim})
 					env.Clock.Step(15 * time.Second)
 				},
 			)
 			Expect(err).To(Succeed())
 			Expect(cmds).To(Equal([]disruption.Command{}))
 
-			Expect(scoreBasedConsolidation.IsConsolidated()).To(BeFalse())
-			ExpectMetricCounterValue(disruption.FailedValidationsTotal, 1, map[string]string{disruption.ConsolidationTypeLabel: scoreBasedConsolidation.ConsolidationType()})
+			Expect(scoreBased.IsConsolidated()).To(BeFalse())
+			ExpectMetricCounterValue(disruption.FailedValidationsTotal, 1, map[string]string{disruption.ConsolidationTypeLabel: scoreBased.ConsolidationType()})
 		},
-			Entry("when a candidate is blocked by budgets", WithUnderutilizedBlockingBudget()),
-			Entry("when candidates are filtered out due to pod churn", WithUnderutilizedChurn()),
-			Entry("when candidates are filtered out due to candidate being nominated", WithUnderutilizedNodeNomination()),
+			Entry("when a candidate is blocked by budgets", func(nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
+				blockingBudget(nodes, nodeClaims, scoreBasedNodePool)
+			}),
+			Entry("when candidates are filtered out due to pod churn", churn),
+			Entry("when candidates are filtered out due to candidate being nominated", nominated),
 		)
 	})
 })
-
-func NewTestScoreBasedConsolidationValidator(nodePool *v1.NodePool, opts ...TestConsolidationValidatorOption) disruption.Validator {
-	return newTestConsolidationValidator(nodePool, disruption.NewScoreBasedConsolidationValidator(disruption.MakeConsolidation(env.Clock, cluster, env.Client, prov, cloudProvider, recorder, queue, nil)), opts...)
-}
 
 func createScoreBasedCandidateForPool(np *v1.NodePool, instanceType *cloudprovider.InstanceType, pods ...*corev1.Pod) (*disruption.Candidate, error) {
 	offering := instanceType.Offerings[0]
