@@ -18,9 +18,10 @@ package disruption
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
+	"slices"
 	"strconv"
-	"strings"
 
 	"testing"
 	"time"
@@ -29,9 +30,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/clock"
 	clocktesting "k8s.io/utils/clock/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
@@ -39,6 +43,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/test"
 )
 
 func TestNodePoolUsesScoreBasedConsolidation(t *testing.T) {
@@ -140,7 +145,7 @@ func TestSearchMoves_ranksScore(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	winner, stats := searchMoves(ctx, sources, time.Now().Add(time.Second), compute, testScoreInputs(sources), rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	winner, stats := searchMoves(ctx, sources, time.Now().Add(time.Second), moveEvaluator{compute: compute, inputs: testScoreInputs(sources)}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
 	evaluated := stats.Evaluated
 	if len(winner) != 2 {
 		t.Fatalf("evaluations = %d, want 2", len(winner))
@@ -170,7 +175,7 @@ func TestSearchMoves_stopsOnDeadline(t *testing.T) {
 		}
 	}
 
-	winner, stats := searchMoves(ctx, sources, time.Now().Add(-time.Millisecond), compute, scoreInputs{}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	winner, stats := searchMoves(ctx, sources, time.Now().Add(-time.Millisecond), moveEvaluator{compute: compute}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
 	evaluated := stats.Evaluated
 	if len(winner) != 0 {
 		t.Fatalf("evaluations = %d, want 0", len(winner))
@@ -196,7 +201,7 @@ func TestSearchMoves_keepsTenBest(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	moves, stats := searchMoves(ctx, sources, time.Now().Add(time.Second), compute, testScoreInputs(sources), rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	moves, stats := searchMoves(ctx, sources, time.Now().Add(time.Second), moveEvaluator{compute: compute, inputs: testScoreInputs(sources)}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
 	evaluated := stats.Evaluated
 	if len(moves) != scoreBasedValidEvaluationsTarget {
 		t.Fatalf("evaluations = %d, want %d", len(moves), scoreBasedValidEvaluationsTarget)
@@ -234,7 +239,7 @@ func TestSearchMoves_returnsPartialOnTimeout(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	moves, stats := searchMoves(ctx, sources, deadline, compute, testScoreInputs(sources), rand.New(rand.NewSource(1)), fakeClock) //nolint:gosec
+	moves, stats := searchMoves(ctx, sources, deadline, moveEvaluator{compute: compute, inputs: testScoreInputs(sources)}, rand.New(rand.NewSource(1)), fakeClock) //nolint:gosec
 	if !stats.TimedOut {
 		t.Fatal("expected stats.TimedOut")
 	}
@@ -267,7 +272,7 @@ func TestSelectBestRescoredCommand_runsHigherRescoredMoveAsResimulated(t *testin
 	}
 }
 
-func TestSelectBestRescoredCommand_rejectsNonPositiveRescoredScore(t *testing.T) {
+func TestSelectBestRescoredCommand_rejectsRescoredMoveWithoutSavings(t *testing.T) {
 	source := namedCandidate(t, "source", 0.10)
 	results := pscheduling.Results{ExistingNodes: standbyReactivationResults("standby-a", 0.10)}
 	moves := []*move{{Command: Command{Candidates: []*Candidate{source}, Results: results}, SearchScore: moveScore{Total: 0.10}}}
@@ -279,6 +284,22 @@ func TestSelectBestRescoredCommand_rejectsNonPositiveRescoredScore(t *testing.T)
 	}
 	if moves[0].validationText() != "failed: no_savings" {
 		t.Fatalf("validation = %q, want failed: no_savings", moves[0].validationText())
+	}
+}
+
+func TestSelectBestRescoredCommand_rejectsPositiveSavingsWithNonPositiveRescoredScore(t *testing.T) {
+	source := namedCandidate(t, "source", 1)
+	moves := []*move{{Command: Command{Candidates: []*Candidate{source}}, SearchScore: moveScore{Total: 2}}}
+	inputs := testScoreInputs(sourcesOf(moves))
+	source.Node.Status.Allocatable = nil
+
+	cmd := expectRescore(t, resimulatedTo(map[string]pscheduling.Results{"source": {}}), inputs, moves)
+
+	if len(cmd.Candidates) != 0 {
+		t.Fatalf("command candidates = %d, want 0", len(cmd.Candidates))
+	}
+	if moves[0].ValidationScore.Savings <= 0 || moves[0].validationText() != "failed: non_positive_score" {
+		t.Fatalf("rescored savings %v, validation = %q, want positive savings and failed: non_positive_score", moves[0].ValidationScore.Savings, moves[0].validationText())
 	}
 }
 
@@ -299,21 +320,73 @@ func TestSelectBestRescoredCommand_noOpFailsWithSchedulingAndNextMoveRuns(t *tes
 	}
 }
 
-func TestSelectBestRescoredCommand_emitsRejectedEventOnlyForFirstMoveWhenAllFail(t *testing.T) {
-	fakeRecorder := record.NewFakeRecorder(10)
+func TestSelectBestRescoredCommand_candidateEventsOnlyOnChosenMoveAndRejectedEventsOnFailedMovesRankedAboveIt(t *testing.T) {
+	recorder := test.NewEventRecorder()
+	moves := []*move{
+		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "fails-first", 0.50)}}, SearchScore: moveScore{Total: 0.50}},
+		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "chosen", 0.30)}}, SearchScore: moveScore{Total: 0.30}},
+		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "fails-last", 0.10)}}, SearchScore: moveScore{Total: 0.10}},
+	}
+
+	selectBestRescoredCommand(context.Background(), moveEvaluator{compute: resimulatedTo(map[string]pscheduling.Results{"chosen": {}}), inputs: testScoreInputs(sourcesOf(moves))}, recorder, moves)
+
+	if got := involvedObjectNames(recorder, events.ConsolidationCandidate); !slices.Equal(got, []string{"chosen"}) {
+		t.Errorf("ConsolidationCandidate events on %v, want only the chosen move's source", got)
+	}
+	if got := involvedObjectNames(recorder, events.ConsolidationRejected); !slices.Equal(got, []string{"fails-first"}) {
+		t.Errorf("ConsolidationRejected events on %v, want only the failed move ranked above the chosen one", got)
+	}
+}
+
+func TestSelectBestRescoredCommand_rejectedEventsOnEveryFailedMoveWhenNoneIsChosen(t *testing.T) {
+	recorder := test.NewEventRecorder()
 	moves := []*move{
 		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "high-score", 0.50)}}, SearchScore: moveScore{Total: 0.50}},
 		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "low-score", 0.10)}}, SearchScore: moveScore{Total: 0.10}},
 	}
 
-	cmd := selectBestRescoredCommand(context.Background(), resimulatedTo(nil), scoreInputs{}, events.NewRecorder(fakeRecorder), moves)
+	cmd := selectBestRescoredCommand(context.Background(), moveEvaluator{compute: resimulatedTo(nil)}, recorder, moves)
 
 	if len(cmd.Candidates) != 0 {
 		t.Fatalf("command candidates = %d, want 0", len(cmd.Candidates))
 	}
-	rejectedEvents := collectFakeRecorderEvents(fakeRecorder)
-	if eventsMentioningNode(rejectedEvents, "low-score") || !eventsMentioningNode(rejectedEvents, "high-score") {
-		t.Fatalf("rejected events = %v, want only high-score", rejectedEvents)
+	if got := involvedObjectNames(recorder, events.ConsolidationRejected); !slices.Equal(got, []string{"high-score", "low-score"}) {
+		t.Errorf("ConsolidationRejected events on %v, want both failed moves", got)
+	}
+	if got := involvedObjectNames(recorder, events.ConsolidationCandidate); len(got) != 0 {
+		t.Errorf("ConsolidationCandidate events on %v, want none", got)
+	}
+}
+
+func TestSelectBestRescoredCommand_countsSelectedKindAndEveryFailedValidation(t *testing.T) {
+	moves := []*move{
+		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "no-longer-fits", 0.50)}}, SearchScore: moveScore{Total: 0.50}},
+		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "chosen", 0.30)}}, SearchScore: moveScore{Total: 0.30}},
+		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "no-longer-saves", 0.10)}}, SearchScore: moveScore{Total: 0.10}},
+		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "simulation-errors", 0.05)}}, SearchScore: moveScore{Total: 0.05}},
+	}
+	resimulate := resimulatedTo(map[string]pscheduling.Results{
+		"chosen":          {},
+		"no-longer-saves": {ExistingNodes: standbyReactivationResults("standby-costly", 1)},
+	})
+	compute := func(ctx context.Context, candidates ...*Candidate) (Command, error) {
+		if candidates[0].Name() == "simulation-errors" {
+			return Command{}, fmt.Errorf("simulation failed")
+		}
+		return resimulate(ctx, candidates...)
+	}
+	selectedBefore := counterValuesByLabel(t, "karpenter_voluntary_disruption_score_based_moves_selected_total", "kind")
+	failedBefore := counterValuesByLabel(t, "karpenter_voluntary_disruption_failed_validations_total", ConsolidationTypeLabel)
+
+	expectRescore(t, compute, testScoreInputs(sourcesOf(moves)), moves)
+
+	selected := counterValuesByLabel(t, "karpenter_voluntary_disruption_score_based_moves_selected_total", "kind")
+	if delta := selected[moveKindSingle] - selectedBefore[moveKindSingle]; delta != 1 {
+		t.Errorf("selected single moves = %v, want 1", delta)
+	}
+	failed := counterValuesByLabel(t, "karpenter_voluntary_disruption_failed_validations_total", ConsolidationTypeLabel)
+	if delta := failed[ScoreBasedConsolidationType] - failedBefore[ScoreBasedConsolidationType]; delta != 2 {
+		t.Errorf("score-based failed validations = %v, want 2", delta)
 	}
 }
 
@@ -353,6 +426,45 @@ func TestSelectBestRescoredCommand_rejectsMoveByWholeCommandPacing(t *testing.T)
 	}
 }
 
+func TestFilterCandidates_poolHeldBackByPacingExplainsItself(t *testing.T) {
+	clk := clocktesting.NewFakeClock(time.Now())
+	paced, unpaced := paceTestNodePool("1", ""), &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "unpaced", UID: "unpaced"}}
+	paced.Name, paced.UID = "paced", "paced"
+	pacing := NewDisruptionPacing(clk)
+	pacing.Refresh([]*v1.NodePool{paced, unpaced}, nil)
+	pacing.ChargePass([]DisruptionPacingSuccessfulStart{{Command: &Command{Candidates: []*Candidate{{NodePool: paced, reschedulablePods: []*corev1.Pod{{}}}}}, StartTime: clk.Now()}})
+	held, kept := namedCandidate(t, "held", 1), namedCandidate(t, "kept", 1)
+	held.NodePool, kept.NodePool = paced, unpaced
+	held.reschedulablePods, kept.reschedulablePods = []*corev1.Pod{{}}, []*corev1.Pod{{}}
+	recorder := test.NewEventRecorder()
+	s := NewScoreBasedConsolidation(consolidation{recorder: recorder, disruptionPacing: pacing})
+
+	s.filterCandidates(clusterSnapshot{candidates: []*Candidate{held, kept}, disruptionBudgetByNodePool: map[string]int{"paced": 1, "unpaced": 1}})
+
+	if got := involvedObjectNames(recorder, events.DisruptionBlocked); !slices.Equal(got, []string{"paced"}) {
+		t.Errorf("DisruptionBlocked events on %v, want only the paced pool", got)
+	}
+}
+
+func TestFilterCandidates_poolWhoseBudgetIsUsedUpByDisruptionsInProgressExplainsItself(t *testing.T) {
+	busy, closed := namedCandidate(t, "busy-node", 1), namedCandidate(t, "closed-node", 1)
+	busy.NodePool = &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "busy", UID: "busy"}}
+	// A pool whose budget allows no disruptions at all is reported by the budget mapping, not here.
+	closed.NodePool = &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "closed", UID: "closed"}}
+	recorder := test.NewEventRecorder()
+	s := NewScoreBasedConsolidation(consolidation{recorder: recorder})
+
+	s.filterCandidates(clusterSnapshot{
+		candidates:                          []*Candidate{busy, closed},
+		disruptionBudgetByNodePool:          map[string]int{"busy": 0, "closed": 0},
+		budgetUsedUpByDisruptionsInProgress: map[string]int{"busy": 1},
+	})
+
+	if got := involvedObjectNames(recorder, events.DisruptionBlocked); !slices.Equal(got, []string{"busy"}) {
+		t.Errorf("DisruptionBlocked events on %v, want only the pool with disruptions in progress", got)
+	}
+}
+
 func resimulatedTo(byFirstSource map[string]pscheduling.Results) consolidationComputer {
 	return func(_ context.Context, candidates ...*Candidate) (Command, error) {
 		results, ok := byFirstSource[candidates[0].Name()]
@@ -365,7 +477,7 @@ func resimulatedTo(byFirstSource map[string]pscheduling.Results) consolidationCo
 
 func expectRescore(t *testing.T, compute consolidationComputer, inputs scoreInputs, moves []*move) Command {
 	t.Helper()
-	return selectBestRescoredCommand(context.Background(), compute, inputs, events.NewRecorder(record.NewFakeRecorder(10)), moves)
+	return selectBestRescoredCommand(context.Background(), moveEvaluator{compute: compute, inputs: inputs}, events.NewRecorder(record.NewFakeRecorder(10)), moves)
 }
 
 func namedCandidate(t *testing.T, name string, price float64) *Candidate {
@@ -376,21 +488,44 @@ func namedCandidate(t *testing.T, name string, price float64) *Candidate {
 	return c
 }
 
+func involvedObjectNames(recorder *test.EventRecorder, reason string) []string {
+	names := sets.New[string]()
+	recorder.ForEachEvent(func(evt events.Event) {
+		if evt.Reason == reason {
+			names.Insert(evt.InvolvedObject.(client.Object).GetName())
+		}
+	})
+	return sets.List(names)
+}
+
+func counterValuesByLabel(t *testing.T, name, label string) map[string]float64 {
+	t.Helper()
+	families, err := crmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := map[string]float64{}
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, m := range family.GetMetric() {
+			for _, pair := range m.GetLabel() {
+				if pair.GetName() == label {
+					values[pair.GetValue()] = m.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return values
+}
+
 func collectFakeRecorderEvents(fakeRecorder *record.FakeRecorder) []string {
 	var events []string
 	for len(fakeRecorder.Events) > 0 {
 		events = append(events, <-fakeRecorder.Events)
 	}
 	return events
-}
-
-func eventsMentioningNode(events []string, nodeName string) bool {
-	for _, event := range events {
-		if strings.Contains(event, nodeName) {
-			return true
-		}
-	}
-	return false
 }
 
 func candidateWithPrice(t *testing.T, price float64) *Candidate {

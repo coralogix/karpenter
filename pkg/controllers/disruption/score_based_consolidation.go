@@ -19,15 +19,15 @@ package disruption
 import (
 	"context"
 	"fmt"
-	"maps"
 	"math/rand"
-	"slices"
 	"time"
 
+	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	"sigs.k8s.io/karpenter/pkg/events"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
 
@@ -120,10 +120,13 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, _ map[str
 
 func (s *ScoreBasedConsolidation) filterCandidates(snapshot clusterSnapshot) ([]*Candidate, []string, []string) {
 	var validCandidates []*Candidate
+	nodePools := map[string]*v1.NodePool{}
 	budgetBlockedPools := sets.New[string]()
 	pacingBlockedPools := sets.New[string]()
+	poolsWithValidCandidates := sets.New[string]()
 	for _, candidate := range snapshot.candidates {
 		pool := candidate.NodePool.Name
+		nodePools[pool] = candidate.NodePool
 		if snapshot.disruptionBudgetByNodePool[pool] == 0 {
 			budgetBlockedPools.Insert(pool)
 			continue
@@ -134,9 +137,18 @@ func (s *ScoreBasedConsolidation) filterCandidates(snapshot clusterSnapshot) ([]
 				continue
 			}
 		}
+		poolsWithValidCandidates.Insert(pool)
 		validCandidates = append(validCandidates, candidate)
 	}
-	return validCandidates, slices.Sorted(maps.Keys(budgetBlockedPools)), slices.Sorted(maps.Keys(pacingBlockedPools))
+	for pool := range budgetBlockedPools {
+		if inProgress := snapshot.budgetUsedUpByDisruptionsInProgress[pool]; inProgress > 0 {
+			s.recorder.Publish(disruptionevents.NodePoolBudgetUsedByDisruptionsInProgress(nodePools[pool], s.Reason(), inProgress))
+		}
+	}
+	for pool := range pacingBlockedPools.Difference(poolsWithValidCandidates) {
+		s.recorder.Publish(disruptionevents.NodePoolHeldBackByPacing(nodePools[pool], s.Reason()))
+	}
+	return validCandidates, sets.List(budgetBlockedPools), sets.List(pacingBlockedPools)
 }
 
 func (s *ScoreBasedConsolidation) waitForValidation(ctx context.Context, start time.Time) error {
@@ -164,7 +176,7 @@ func (s *ScoreBasedConsolidation) searchForMoves(ctx context.Context, candidates
 		sources[i] = []*Candidate{c}
 	}
 	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec
-	moves, stats := searchMoves(ctx, sources, deadline, compute, inputs, rng, s.clock)
+	moves, stats := searchMoves(ctx, sources, deadline, moveEvaluator{compute: compute, inputs: inputs}, rng, s.clock)
 	return moves, stats, nil
 }
 
@@ -173,9 +185,20 @@ func (s *ScoreBasedConsolidation) newComputer(ctx context.Context, candidates []
 	if err != nil {
 		return nil, err
 	}
+	// Simulation announces every move it computes, but only the chosen move's sources get ConsolidationCandidate.
+	consolidationWithoutCandidateEvents := s.consolidation
+	consolidationWithoutCandidateEvents.recorder = withoutCandidateEvents{Recorder: s.recorder}
 	return func(ctx context.Context, candidates ...*Candidate) (Command, error) {
-		return s.computeConsolidation(ctx, simulator, candidates...)
+		return consolidationWithoutCandidateEvents.computeConsolidation(ctx, simulator, candidates...)
 	}, nil
+}
+
+type withoutCandidateEvents struct {
+	events.Recorder
+}
+
+func (r withoutCandidateEvents) Publish(evts ...events.Event) {
+	r.Recorder.Publish(lo.Reject(evts, func(evt events.Event, _ int) bool { return evt.Reason == events.ConsolidationCandidate })...)
 }
 
 func (s *ScoreBasedConsolidation) Reason() v1.DisruptionReason {

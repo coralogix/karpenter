@@ -19,30 +19,29 @@ package disruption
 import (
 	"math"
 	"testing"
-
-	"github.com/samber/lo"
 )
 
 func TestCostAndUtilizationScore(t *testing.T) {
 	cases := []struct {
-		name      string
-		sources   []sourceScore
-		savings   float64
-		cost      float64
-		slackTerm float64
+		name          string
+		sources       []sourceScore
+		newNodePrice  float64
+		standbyPrices map[string]float64
+		cost          float64
+		utilization   float64
 	}{
-		{"one capacity type", []sourceScore{{Price: 4, AllocatableCPU: 4, RequestedCPU: 2, Baseline: 0.5, Weight: 1}}, 2, 1, 0.5},
-		{"two capacity types", []sourceScore{{Price: 4, AllocatableCPU: 4, RequestedCPU: 4, Baseline: 0.5, Weight: 1}, {Price: 2, AllocatableCPU: 4, RequestedCPU: 2, Baseline: 0.25, Weight: 2}}, 3, 2, 1},
-		{"zero price source", []sourceScore{{Price: 0, AllocatableCPU: 4, RequestedCPU: 0, Baseline: 1, Weight: 1}, {Price: 4, AllocatableCPU: 4, RequestedCPU: 4, Baseline: 1, Weight: 1}}, 4, 1, 1},
-		{"zero baseline", []sourceScore{{Price: 0, AllocatableCPU: 4, RequestedCPU: 4, Weight: 1}, {Price: 4, AllocatableCPU: 4, RequestedCPU: 2, Baseline: 1, Weight: 1}}, 4, 0, 0.5},
-		{"clamped requests and zero allocatable", []sourceScore{{Price: 4, AllocatableCPU: 4, RequestedCPU: -1, Baseline: 1, Weight: 2}, {Price: 0, Baseline: 1, Weight: 1}}, 4, 1, 2},
+		{"one capacity type", []sourceScore{{Price: 4, AllocatableCPU: 4, RequestedCPU: 2, Baseline: 0.5, UtilizationWeight: 1}}, 2, nil, 1, 0.5},
+		{"two capacity types", []sourceScore{{Price: 4, AllocatableCPU: 4, RequestedCPU: 4, Baseline: 0.5, UtilizationWeight: 1}, {Price: 2, AllocatableCPU: 4, RequestedCPU: 2, Baseline: 0.25, UtilizationWeight: 2}}, 3, nil, 2, 1},
+		{"zero price source", []sourceScore{{Price: 0, AllocatableCPU: 4, RequestedCPU: 0, Baseline: 1, UtilizationWeight: 1}, {Price: 4, AllocatableCPU: 4, RequestedCPU: 4, Baseline: 1, UtilizationWeight: 1}}, 0, nil, 1, 1},
+		{"zero baseline", []sourceScore{{Price: 4, AllocatableCPU: 4, RequestedCPU: 4, UtilizationWeight: 1}, {Price: 4, AllocatableCPU: 4, RequestedCPU: 2, Baseline: 1, UtilizationWeight: 1}}, 4, nil, 0, 0.5},
+		{"reactivated standby price reduces f", []sourceScore{{Price: 4, AllocatableCPU: 4, RequestedCPU: 2, Baseline: 0.5, UtilizationWeight: 1}}, 0, map[string]float64{"standby": 1}, 1.5, 0.5},
+		{"clamped requests and zero allocatable", []sourceScore{{Price: 4, AllocatableCPU: 4, RequestedCPU: -1, Baseline: 1, UtilizationWeight: 2}, {Price: 0, Baseline: 1, UtilizationWeight: 1}}, 0, nil, 1, 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			sourcePrice := lo.SumBy(tc.sources, func(s sourceScore) float64 { return s.Price })
-			got := computeScore(tc.savings, sourcePrice, tc.sources)
-			if math.Abs(got.Cost-tc.cost) > 1e-9 || math.Abs(got.Utilization-tc.slackTerm) > 1e-9 {
-				t.Fatalf("score = cost %v slack %v, want %v and %v", got.Cost, got.Utilization, tc.cost, tc.slackTerm)
+			got := computeScore(tc.newNodePrice, tc.standbyPrices, tc.sources)
+			if math.Abs(got.Cost-tc.cost) > 1e-9 || math.Abs(got.Utilization-tc.utilization) > 1e-9 {
+				t.Fatalf("score = cost %v utilization %v, want %v and %v", got.Cost, got.Utilization, tc.cost, tc.utilization)
 			}
 		})
 	}
