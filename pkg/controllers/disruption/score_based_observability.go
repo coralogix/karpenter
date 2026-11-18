@@ -22,13 +22,63 @@ import (
 	"slices"
 	"time"
 
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+const (
+	moveEvaluationResultLabel      = "result"
+	moveEvaluationFeasible         = "feasible"
+	moveEvaluationNoOp             = "no_op"
+	moveEvaluationNoSavings        = "no_savings"
+	moveEvaluationNonPositiveScore = "non_positive_score"
+	moveEvaluationError            = "error"
+
+	moveKindLabel  = "kind"
+	moveKindSingle = "single"
+)
+
+var (
+	ScoreBasedMoveEvaluationsTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "score_based_move_evaluations_total",
+			Help:      "Number of moves simulated by the score-based consolidation search. Labeled by result.",
+		},
+		[]string{moveEvaluationResultLabel},
+	)
+	ScoreBasedMovesSelectedTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "score_based_moves_selected_total",
+			Help:      "Number of moves chosen by score-based consolidation after validation. Labeled by move kind.",
+		},
+		[]string{moveKindLabel},
+	)
+)
+
+func init() {
+	for _, result := range []string{moveEvaluationFeasible, moveEvaluationNoOp, moveEvaluationNoSavings, moveEvaluationNonPositiveScore, moveEvaluationError} {
+		ScoreBasedMoveEvaluationsTotal.Add(0, map[string]string{moveEvaluationResultLabel: result})
+	}
+	ScoreBasedMovesSelectedTotal.Add(0, map[string]string{moveKindLabel: moveKindSingle})
+}
+
+func countMoveEvaluation(result string) {
+	ScoreBasedMoveEvaluationsTotal.Inc(map[string]string{moveEvaluationResultLabel: result})
+}
 
 func logScoreDecision(ctx context.Context, moves []*move, stats searchStats, candidates, eligible int, budgetBlockedPools, pacingBlockedPools []string, duration time.Duration) {
 	fields := []interface{}{
@@ -98,7 +148,7 @@ func moveLog(m *move) map[string]interface{} {
 			newNode = map[string]interface{}{"instanceType": n.InstanceTypeOptions[0].Name, "price": score.NewNodePrice}
 		}
 	}
-	entry := map[string]interface{}{"kind": "single", "sources": sources, "newNode": newNode, "reactivatedStandbyNodes": destinations, "savings": score.Savings, "score": score, "validation": m.validationText()}
+	entry := map[string]interface{}{"kind": moveKindSingle, "sources": sources, "newNode": newNode, "reactivatedStandbyNodes": destinations, "score": score, "validation": m.validationText()}
 	if rescored && m.SearchScore.Total != m.ValidationScore.Total {
 		entry["searchScore"] = m.SearchScore.Total
 	}

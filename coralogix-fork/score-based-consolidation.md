@@ -57,6 +57,32 @@ Each move's **savings** are the source nodes' hourly prices minus the estimated 
 - **Cost**: each source's price per CPU, relative to the average of its NodePool and capacity type, scaled by the fraction of the sources' price the move saves. Comparing within a capacity type stops cheap Spot nodes from always losing to on-demand ones.
 - **Utilization**: each source's unused CPU fraction, multiplied by `utilization-weight`.
 
+## Events
+
+| Event | On | When |
+|-------|----|------|
+| `ConsolidationCandidate` | Nodes and NodeClaims | The node is a source of the chosen move, after validation. Moves simulated during the search raise no candidate events. |
+| `ConsolidationRejected` | Nodes and NodeClaims | The node is a source of a kept move that failed validation and ranked above the chosen move (or of every failed move when none was chosen). The message gives the reason, such as `scheduling`, `budget`, `pacing` or `no_savings`. |
+| `Unconsolidatable` | Nodes and NodeClaims | Unchanged from upstream: simulation found the node cannot be consolidated. |
+| `DisruptionBlocked` | NodePool | The pool's `Underutilized` budget is used up by disruptions already in progress, such as running evacuations. A budget that allows no disruptions at all raises upstream's budget event instead. |
+| `DisruptionBlocked` | NodePool | [Disruption pacing](disruption-pacing.md) holds back all of the pool's candidates. |
+
+`DisruptionBlocked` events are deduplicated for one minute.
+
+## Metrics
+
+Upstream disruption metrics are filled with `consolidation_type="score-based"`:
+
+- `karpenter_voluntary_disruption_decision_evaluation_duration_seconds`: duration of each pass.
+- `karpenter_voluntary_disruption_decisions_total`: commands started.
+- `karpenter_voluntary_disruption_failed_validations_total`: once per kept move that fails validation.
+- `karpenter_voluntary_disruption_consolidation_timeouts_total`: every search the 15-second deadline cut short, including searches that still found moves.
+
+The fork adds:
+
+- `karpenter_voluntary_disruption_score_based_move_evaluations_total{result}`: moves simulated by the search. `result` is `feasible` (saves money and scores above 0), `no_op` (nothing to do, or needs more than one new node), `no_savings`, `non_positive_score`, or `error`.
+- `karpenter_voluntary_disruption_score_based_moves_selected_total{kind}`: chosen moves. `kind` is `single`.
+
 ## Rollback to upstream
 
 Rolling back to upstream Karpenter is safe and needs no manifest or CRD changes. Upstream ignores the annotations, and the NodePools resume standard emptiness and consolidation. Nodes may keep the standby taint; remove it manually so scheduling is not blocked:

@@ -349,11 +349,14 @@ func (c Command) SourceCost() float64 {
 // available compatible offering contributes 0 to destination cost and inflates
 // them.
 func (c Command) EstimatedSavings() float64 {
-	sourcePrice := c.SourceCost()
+	return c.SourceCost() - c.ReplacementCost()
+}
 
-	// For delete consolidation, all source cost is savings
+// ReplacementCost returns the estimated cost of the replacement NodeClaims, using the cheapest available offering of each.
+func (c Command) ReplacementCost() float64 {
+	// For delete consolidation, there are no replacements to pay for
 	if len(c.Replacements) == 0 {
-		return sourcePrice
+		return 0
 	}
 
 	// For replace consolidation, sum destination costs from all replacement NodeClaims.
@@ -369,7 +372,7 @@ func (c Command) EstimatedSavings() float64 {
 		}
 	}
 
-	return sourcePrice - destPrice
+	return destPrice
 }
 
 // EmitCandidateEvents emits ConsolidationCandidate events for all candidates in this command

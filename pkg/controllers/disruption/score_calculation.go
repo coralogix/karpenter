@@ -33,32 +33,34 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
+const defaultUtilizationWeight = 1.0
+
 type moveScore struct {
-	Total           float64
-	Savings         float64
-	SourcePrice     float64
-	NewNodePrice    float64
-	StandbyPrices   map[string]float64
-	SavingsFraction float64
-	Cost            float64
-	CostReason      string
-	Utilization     float64
-	Sources         []sourceScore
+	Total           float64            `json:"total"`
+	Savings         float64            `json:"savings"`
+	SourcePrice     float64            `json:"sourcePrice"`
+	NewNodePrice    float64            `json:"newNodePrice"`
+	StandbyPrices   map[string]float64 `json:"standbyPrices"`
+	SavingsFraction float64            `json:"savingsFraction"`
+	Cost            float64            `json:"cost"`
+	CostReason      string             `json:"costReason,omitempty"`
+	Utilization     float64            `json:"utilization"`
+	Sources         []sourceScore      `json:"sources"`
 }
 
 type sourceScore struct {
-	Node              string
-	NodePool          string
-	CapacityType      string
-	Price             float64
-	AllocatableCPU    float64
-	RequestedCPU      float64
-	Baseline          float64
-	Weight            float64
-	NormalizedPrice   float64
-	Slack             float64
-	CostReason        string
-	UtilizationReason string
+	Node              string  `json:"node"`
+	NodePool          string  `json:"nodePool"`
+	CapacityType      string  `json:"capacityType"`
+	Price             float64 `json:"price"`
+	AllocatableCPU    float64 `json:"allocatableCPU"`
+	RequestedCPU      float64 `json:"requestedCPU"`
+	Baseline          float64 `json:"baseline"`
+	UtilizationWeight float64 `json:"utilizationWeight"`
+	NormalizedPrice   float64 `json:"normalizedPrice"`
+	Slack             float64 `json:"slack"`
+	CostReason        string  `json:"costReason,omitempty"`
+	UtilizationReason string  `json:"utilizationReason,omitempty"`
 }
 
 type capacityKey struct {
@@ -108,12 +110,12 @@ func (m instanceTypesByNodePool) instanceTypeOf(n *state.StateNode) *cloudprovid
 func utilizationWeight(np *v1.NodePool, recorder events.Recorder) float64 {
 	raw, ok := np.Annotations[v1.UtilizationWeightAnnotationKey]
 	if !ok {
-		return 1
+		return defaultUtilizationWeight
 	}
 	weight, err := strconv.ParseFloat(raw, 64)
 	if err != nil || math.IsNaN(weight) || math.IsInf(weight, 0) || weight <= 0 {
-		recorder.Publish(events.Event{InvolvedObject: np, Type: corev1.EventTypeWarning, Reason: events.InvalidUtilizationWeight, Message: fmt.Sprintf("Invalid value %q for annotation %q; using 1", raw, v1.UtilizationWeightAnnotationKey), DedupeValues: []string{string(np.UID), v1.UtilizationWeightAnnotationKey, raw}, DedupeTimeout: 15 * time.Minute})
-		return 1
+		recorder.Publish(events.Event{InvolvedObject: np, Type: corev1.EventTypeWarning, Reason: events.InvalidUtilizationWeight, Message: fmt.Sprintf("Invalid value %q for annotation %q; using %g", raw, v1.UtilizationWeightAnnotationKey, defaultUtilizationWeight), DedupeValues: []string{string(np.UID), v1.UtilizationWeightAnnotationKey, raw}, DedupeTimeout: 15 * time.Minute})
+		return defaultUtilizationWeight
 	}
 	return weight
 }
@@ -131,33 +133,34 @@ func scoreMove(cmd Command, inputs scoreInputs) moveScore {
 	for _, c := range cmd.Candidates {
 		key := capacityKeyOf(c.StateNode)
 		sources = append(sources, sourceScore{
-			Node:           c.Name(),
-			NodePool:       key.nodePool,
-			CapacityType:   key.capacityType,
-			Price:          c.Price,
-			AllocatableCPU: cpuCores(c.Allocatable()),
-			RequestedCPU:   cpuCores(c.PodRequests()),
-			Baseline:       inputs.pricePerCPUByCapacityKey[key],
-			Weight:         inputs.utilizationWeightByNodePool[c.NodePool.Name],
+			Node:              c.Name(),
+			NodePool:          key.nodePool,
+			CapacityType:      key.capacityType,
+			Price:             c.Price,
+			AllocatableCPU:    cpuCores(c.Allocatable()),
+			RequestedCPU:      cpuCores(c.PodRequests()),
+			Baseline:          inputs.pricePerCPUByCapacityKey[key],
+			UtilizationWeight: inputs.utilizationWeightByNodePool[c.NodePool.Name],
 		})
 	}
-	score := computeScore(cmd.EstimatedSavings()-lo.Sum(lo.Values(standbyPrices)), cmd.SourceCost(), sources)
-	score.StandbyPrices = standbyPrices
-	if len(cmd.Replacements) > 0 {
-		score.NewNodePrice = score.SourcePrice - cmd.EstimatedSavings()
-	}
-	return score
+	return computeScore(cmd.ReplacementCost(), standbyPrices, sources)
 }
 
-func computeScore(savings float64, sourcePrice float64, sources []sourceScore) moveScore {
-	score := moveScore{Savings: savings, SourcePrice: sourcePrice, Sources: sources}
+func computeScore(newNodePrice float64, standbyPrices map[string]float64, sources []sourceScore) moveScore {
+	score := moveScore{
+		SourcePrice:   lo.SumBy(sources, func(s sourceScore) float64 { return s.Price }),
+		NewNodePrice:  newNodePrice,
+		StandbyPrices: standbyPrices,
+		Sources:       sources,
+	}
+	score.Savings = score.SourcePrice - newNodePrice - lo.Sum(lo.Values(standbyPrices))
 	var normalized float64
 	for i := range score.Sources {
 		s := &score.Sources[i]
 		switch {
 		case s.Baseline <= 0:
 			s.CostReason = "zero baseline"
-			score.CostReason = "zero baseline"
+			score.CostReason = s.CostReason
 		case s.Price == 0:
 			s.CostReason = "zero price"
 		case s.AllocatableCPU <= 0:
@@ -170,7 +173,7 @@ func computeScore(savings float64, sourcePrice float64, sources []sourceScore) m
 			s.UtilizationReason = "zero allocatable CPU"
 		} else {
 			s.Slack = (s.AllocatableCPU - math.Max(0, math.Min(s.RequestedCPU, s.AllocatableCPU))) / s.AllocatableCPU
-			score.Utilization += s.Weight * s.Slack
+			score.Utilization += s.UtilizationWeight * s.Slack
 		}
 	}
 	if score.SourcePrice <= 0 {
