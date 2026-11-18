@@ -28,6 +28,7 @@ import (
 type clusterSnapshot struct {
 	candidates                 []*Candidate
 	disruptionBudgetByNodePool map[string]int
+	scoreInputs                scoreInputs
 }
 
 // A nil onlyNodes builds candidates for every node.
@@ -54,5 +55,6 @@ func (s *ScoreBasedConsolidation) prepare(ctx context.Context, onlyNodes sets.Se
 			snapshot.candidates = append(snapshot.candidates, c)
 		}
 	}
+	snapshot.scoreInputs = newScoreInputs(nodes, instanceTypes, snapshot.candidates, s.recorder)
 	return snapshot, nil
 }

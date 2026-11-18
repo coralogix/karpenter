@@ -1,6 +1,6 @@
 # Score-based consolidation
 
-This fork adds an alternate consolidation disruption method for NodePools that opt in via annotation. It simulates single-node moves and ranks them by estimated hourly dollar savings. Empty nodes are not deleted right away; they go on **standby** and are reclaimed later.
+This fork adds an alternate consolidation disruption method for NodePools that opt in via annotation. It simulates single-node moves and ranks them by a score combining normalized cost savings and unused CPU. Empty nodes are not deleted right away; they go on **standby** and are reclaimed later.
 
 ## NodePool configuration
 
@@ -20,6 +20,7 @@ spec:
 | Annotation | Meaning |
 |------------|---------|
 | `karpenter.coralogix.net/score-based-consolidation` | Opts the NodePool in (presence is enough; value is ignored). |
+| `karpenter.coralogix.net/utilization-weight` | How much unused CPU counts in the score. Default **1**; anything other than a positive number falls back to the default and raises an event on the NodePool. |
 | `karpenter.coralogix.net/reclamation-delay` | How long a node stays on standby before it may be deleted. Default **15s**. |
 | `karpenter.coralogix.net/evacuation-timeout` | How long an evacuation may run before it is abandoned. Default **5m**. |
 
@@ -43,11 +44,18 @@ A standby node counts as existing capacity for provisioning and disruption. If a
 
 ### Evacuation
 
-On `WhenEmptyOrUnderutilized` pools, the method picks the single-node move with the highest savings and evacuates that node: it is tainted, its workloads are evicted (respecting PodDisruptionBudgets, after any replacement is ready), and it is left on standby with its NodeClaim intact until it is reactivated or reclaimed. Evacuation uses `Underutilized` budgets and pacing. If the node is not empty within `evacuation-timeout`, the evacuation is abandoned and the node takes pods again.
+On `WhenEmptyOrUnderutilized` pools, the method picks the single-node move with the highest score and evacuates that node: it is tainted, its workloads are evicted (respecting PodDisruptionBudgets, after any replacement is ready), and it is left on standby with its NodeClaim intact until it is reactivated or reclaimed. Evacuation uses `Underutilized` budgets and pacing. If the node is not empty within `evacuation-timeout`, the evacuation is abandoned and the node takes pods again.
 
-Savings account for the price of any new node and of standby nodes that would be reactivated. Moves needing more than one new node are rejected. Each searched pass logs its decision, including why no move was chosen.
+Moves needing more than one new node are rejected. Each searched pass logs its decision, including why no move was chosen and how the chosen move's score was computed.
 
-After the 15-second validation delay, the method re-simulates its best moves on a fresh view of the cluster and runs the one that still saves the most.
+After the 15-second validation delay, the method re-simulates its best moves on a fresh view of the cluster and runs the highest-scoring one.
+
+### Score
+
+Each move's **savings** are the source nodes' hourly prices minus the estimated price of any new node and of standby nodes that would be reactivated. A move is chosen only if both its savings and its score are positive. The score is the sum of two terms:
+
+- **Cost**: each source's price per CPU, relative to the average of its NodePool and capacity type, scaled by the fraction of the sources' price the move saves. Comparing within a capacity type stops cheap Spot nodes from always losing to on-demand ones.
+- **Utilization**: each source's unused CPU fraction, multiplied by `utilization-weight`.
 
 ## Rollback to upstream
 

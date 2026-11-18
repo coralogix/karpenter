@@ -90,7 +90,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, _ map[str
 		}
 	}()
 
-	moves, stats, err = s.searchForMoves(ctx, validCandidates, deadline)
+	moves, stats, err = s.searchForMoves(ctx, validCandidates, snapshot.scoreInputs, deadline)
 	searchDuration = s.clock.Since(start)
 	if err != nil {
 		return []Command{}, err
@@ -151,7 +151,7 @@ func (s *ScoreBasedConsolidation) waitForValidation(ctx context.Context, start t
 	return nil
 }
 
-func (s *ScoreBasedConsolidation) searchForMoves(ctx context.Context, candidates []*Candidate, deadline time.Time) ([]*move, searchStats, error) {
+func (s *ScoreBasedConsolidation) searchForMoves(ctx context.Context, candidates []*Candidate, inputs scoreInputs, deadline time.Time) ([]*move, searchStats, error) {
 	if len(candidates) == 0 {
 		return nil, searchStats{}, nil
 	}
@@ -164,7 +164,7 @@ func (s *ScoreBasedConsolidation) searchForMoves(ctx context.Context, candidates
 		sources[i] = []*Candidate{c}
 	}
 	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec
-	moves, stats := searchMoves(ctx, sources, deadline, compute, rng, s.clock)
+	moves, stats := searchMoves(ctx, sources, deadline, compute, inputs, rng, s.clock)
 	return moves, stats, nil
 }
 

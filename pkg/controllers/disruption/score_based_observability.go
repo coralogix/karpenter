@@ -33,13 +33,13 @@ import (
 func logScoreDecision(ctx context.Context, moves []*move, stats searchStats, candidates, eligible int, budgetBlockedPools, pacingBlockedPools []string, duration time.Duration) {
 	fields := []interface{}{
 		"eligibleCandidates", eligible, "evaluatedMoves", stats.Evaluated, "keptMoves", len(moves),
-		"simulationErrors", stats.Errors, "noOp", stats.NoOp, "noSavings", stats.NoSavings,
+		"simulationErrors", stats.Errors, "noOp", stats.NoOp, "noSavings", stats.NoSavings, "nonPositiveScore", stats.NonPositiveScore,
 		"deadlineHit", stats.TimedOut, "duration", duration,
 		"budgetBlockedNodePools", budgetBlockedPools, "pacingBlockedNodePools", pacingBlockedPools,
 	}
 	failedValidation := 0
 	for _, m := range moves {
-		if m.validationFailedOrNoSavings() {
+		if m.validationRejected() {
 			failedValidation++
 		}
 	}
@@ -53,7 +53,7 @@ func logScoreDecision(ctx context.Context, moves []*move, stats searchStats, can
 				alternatives = append(alternatives, moveLog(other))
 			}
 		}
-		fields = append(fields, "move", moveLog(m), "rank", i+1, "searchScore", m.SearchScore.Savings, "rescoredScore", m.ValidationScore.Savings, "failedValidation", failedValidation, "alternatives", alternatives, "validationAttempts", len(moves))
+		fields = append(fields, "move", moveLog(m), "rank", i+1, "searchScore", m.SearchScore.Total, "rescoredScore", m.ValidationScore.Total, "failedValidation", failedValidation, "alternatives", alternatives, "validationAttempts", len(moves))
 		log.FromContext(ctx).Info("score-based consolidation move selected", fields...)
 		return
 	}
@@ -74,13 +74,15 @@ func noMoveReason(kept int, stats searchStats, candidates, eligible int) string 
 		return "no_candidates"
 	case eligible == 0:
 		return "blocked_by_budget_or_pacing"
+	case stats.NonPositiveScore > 0:
+		return "no_positive_score_move"
 	}
 	return "no_saving_move"
 }
 
 func moveLog(m *move) map[string]interface{} {
 	cmd := m.Command
-	rescored := m.Validation == validationPassed || m.Validation == validationNoSavings
+	rescored := m.Validation != validationFailed
 	score := lo.Ternary(rescored, m.ValidationScore, m.SearchScore)
 	sources := []map[string]interface{}{}
 	for _, c := range cmd.Candidates {
@@ -96,9 +98,9 @@ func moveLog(m *move) map[string]interface{} {
 			newNode = map[string]interface{}{"instanceType": n.InstanceTypeOptions[0].Name, "price": score.NewNodePrice}
 		}
 	}
-	entry := map[string]interface{}{"kind": "single", "sources": sources, "newNode": newNode, "reactivatedStandbyNodes": destinations, "savings": score.Savings, "validation": m.validationText()}
-	if rescored && m.SearchScore.Savings != m.ValidationScore.Savings {
-		entry["searchScore"] = m.SearchScore.Savings
+	entry := map[string]interface{}{"kind": "single", "sources": sources, "newNode": newNode, "reactivatedStandbyNodes": destinations, "savings": score.Savings, "score": score, "validation": m.validationText()}
+	if rescored && m.SearchScore.Total != m.ValidationScore.Total {
+		entry["searchScore"] = m.SearchScore.Total
 	}
 	return entry
 }

@@ -8,20 +8,22 @@ A move can be chosen only if it saves real dollars and its total score is positi
 
 ## Terms
 
-All baselines use one set of **baseline nodes** per pass, taken from the simulation's node snapshot: managed, initialized, not deleting, and not standby. Standby nodes are excluded everywhere because they are about to be reclaimed.
+All baselines use one set of **baseline nodes**, taken from the node snapshot the search starts from (validation takes its own, see ADR-0009): managed, initialized, not deleting, and not standby. Standby nodes are excluded everywhere because they are about to be reclaimed.
 
 - **Cost**: `f × Σ aᵢ` over sources. `aᵢ = priceᵢ / (allocatableCPUᵢ × baseline)`, where `baseline` is `Σ price / Σ allocatable CPU` of the baseline nodes in the source's NodePool and capacity type, and `f = savings / Σ source price`. Comparing a node with the average price per CPU of its own pool and capacity type stops cheap Spot nodes from always losing to on-demand nodes on raw dollars. `f` makes a move that keeps most of the cost score low.
-- **Utilisation**: `Σ w × (allocatableCPUᵢ − requestedCPUᵢ) / allocatableCPUᵢ` over sources, with requests clamped to the allocatable range.
+- **Utilization**: `Σ w × (allocatableCPUᵢ − requestedCPUᵢ) / allocatableCPUᵢ` over sources, with requests clamped to the allocatable range.
 - **Memory balance**: shapes are allocatable CPU and memory minus DaemonSet requests. Per pool, `q` is the baseline nodes' memory per CPU, and `t = (1 + surplus) × requested memory / requested CPU` of their non-DaemonSet pods. `pressure` is 0 when `0.95 ≤ q/t ≤ 1.05`, otherwise `clamp(log2(q/t), −1, 1)`. A shape's delta is `memory / q − CPU`. A pool's delta is the removed source deltas minus the added deltas of the new node and the reactivated standby nodes in that pool. Its contribution is `weight × pressure × clamp(delta / total CPU removed, −1, 1) × number of sources`, summed over the affected pools.
 - **Instance-type concentration**: each source whose instance type makes up more than `threshold` of its pool's baseline nodes adds `weight`.
 
 A term that cannot be computed contributes 0. That covers a missing price (treated as 0), a zero baseline, an unknown pool ratio, and a missing instance-type label.
 
+Issues that stem from zero prices are deliberately ignored. For example, a zero-price source with a zero baseline records a move-wide cost reason that drops the Cost term for every source of a multi-source move, where a per-source treatment would let it contribute 0 on its own. Zero prices are not expected in practice.
+
 ## Tuning
 
 | NodePool annotation (`karpenter.coralogix.net/…`) | Default | Valid |
 |---|---|---|
-| `utilisation-weight` | 1 | finite, > 0 |
+| `utilization-weight` | 1 | finite, > 0 |
 | `memory-surplus` | 0.2 | finite, ≥ 0 |
 | `memory-balance-weight` | 0 (term off) | finite, ≥ 0 |
 | `instance-type-concentration-threshold` | 0.5 | finite, in `[0, 1)` |
@@ -33,5 +35,6 @@ An invalid value uses the default and raises an event on the NodePool, as durati
 
 - **Assess the new node's memory shape against every instance type it could launch as, and use the least favourable.** This was the earlier implementation. Rejected: it needed a scheduler addition and per-type DaemonSet overhead for a term that is off by default. The new node uses the same instance type as its price estimate, so price and memory describe the same node.
 - **Count reactivated standby nodes as free.** Rejected: it makes moving onto an expensive standby node look like a full saving.
+- **Handle zero-price edge cases precisely.** Rejected: zero prices are not expected, so the extra per-source handling would add corner cases for no practical gain.
 - **Reject moves with unknown prices, and track a status for each term.** Rejected: the positive-savings and positive-score rules already stop bad moves, and the extra states multiplied corner cases.
 - **Reset the consolidated state when scoring annotations change.** Rejected: it needs a fingerprint of the annotations for a delay of at most five minutes.
