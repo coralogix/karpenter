@@ -28,11 +28,8 @@ import (
 	"k8s.io/utils/clock"
 
 	"github.com/destel/rill"
-	"github.com/samber/lo"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
-
-	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 var scoreBasedValidEvaluationsTarget = 10
@@ -57,10 +54,12 @@ const (
 	validationFailed
 	// validationNoSavings means validation re-simulated the move but it no longer saves money.
 	validationNoSavings
+	// validationNonPositiveScore means validation re-simulated the move and it still saves money, but its score is not positive.
+	validationNonPositiveScore
 )
 
-func (m *move) validationFailedOrNoSavings() bool {
-	return m.Validation == validationFailed || m.Validation == validationNoSavings
+func (m *move) validationRejected() bool {
+	return m.Validation != validationPassed
 }
 
 // validationText is the log form of the validation outcome.
@@ -70,6 +69,8 @@ func (m *move) validationText() string {
 		return "failed: " + m.FailureReason
 	case validationNoSavings:
 		return "failed: no_savings"
+	case validationNonPositiveScore:
+		return "failed: non_positive_score"
 	}
 	return "passed"
 }
@@ -81,18 +82,13 @@ type searchStats struct {
 	Errors    int
 	NoOp      int
 	NoSavings int
-	TimedOut  bool
+	// NonPositiveScore counts moves that save money but score zero or less.
+	NonPositiveScore int
+	TimedOut         bool
 }
 
-type moveScore struct {
-	Savings       float64
-	SourcePrice   float64
-	NewNodePrice  float64
-	StandbyPrices map[string]float64
-}
-
-// searchMoves simulates every move and keeps the most profitable ones.
-func searchMoves(ctx context.Context, sources [][]*Candidate, deadline time.Time, compute consolidationComputer, random *rand.Rand, clk clock.Clock) ([]*move, searchStats) {
+// searchMoves simulates every move and keeps the highest-scoring ones.
+func searchMoves(ctx context.Context, sources [][]*Candidate, deadline time.Time, compute consolidationComputer, inputs scoreInputs, random *rand.Rand, clk clock.Clock) ([]*move, searchStats) {
 	sources = slices.Clone(sources)
 	random.Shuffle(len(sources), func(i, j int) { sources[i], sources[j] = sources[j], sources[i] })
 	var stats searchStats
@@ -112,7 +108,7 @@ func searchMoves(ctx context.Context, sources [][]*Candidate, deadline time.Time
 		}
 	})
 	valid := rill.OrderedFilterMap(pending, scoreBasedSearchParallelism, func(nodes []*Candidate) (*move, bool, error) {
-		s, err := evaluateMove(ctx, compute, nodes)
+		s, err := evaluateMove(ctx, compute, inputs, nodes)
 		mu.Lock()
 		defer mu.Unlock()
 		stats.Evaluated++
@@ -127,10 +123,13 @@ func searchMoves(ctx context.Context, sources [][]*Candidate, deadline time.Time
 		case s.Score.Savings <= 0:
 			stats.NoSavings++
 			return nil, false, nil
+		case s.Score.Total <= 0:
+			stats.NonPositiveScore++
+			return nil, false, nil
 		}
 		return &move{Command: s.Command, SearchScore: s.Score}, true, nil
 	})
-	moves := topMovesBySavings(valid, scoreBasedValidEvaluationsTarget)
+	moves := topMovesByScore(valid, scoreBasedValidEvaluationsTarget)
 	return moves, stats
 }
 
@@ -142,7 +141,7 @@ type scoredCommand struct {
 
 // evaluateMove is the per-move step shared by the search and the rescore: compute the command and score it.
 // It returns nil when the move is a no-op or needs more than one new node.
-func evaluateMove(ctx context.Context, compute consolidationComputer, nodes []*Candidate) (*scoredCommand, error) {
+func evaluateMove(ctx context.Context, compute consolidationComputer, inputs scoreInputs, nodes []*Candidate) (*scoredCommand, error) {
 	cmd, err := compute(ctx, nodes...)
 	if err != nil {
 		return nil, err
@@ -150,29 +149,15 @@ func evaluateMove(ctx context.Context, compute consolidationComputer, nodes []*C
 	if cmd.Decision() == NoOpDecision || len(cmd.Replacements) > 1 {
 		return nil, nil
 	}
-	return &scoredCommand{Command: cmd, Score: scoreMove(cmd)}, nil
+	return &scoredCommand{Command: cmd, Score: scoreMove(cmd, inputs)}, nil
 }
 
-func scoreMove(cmd Command) moveScore {
-	standbyPrices := map[string]float64{}
-	for _, n := range cmd.Results.ExistingNodes {
-		if len(n.Pods) > 0 && standby.HasStandbyTaint(n.Node) {
-			standbyPrices[n.Name()] = n.Price
-		}
-	}
-	score := moveScore{Savings: cmd.EstimatedSavings() - lo.Sum(lo.Values(standbyPrices)), SourcePrice: cmd.SourceCost(), StandbyPrices: standbyPrices}
-	if len(cmd.Replacements) > 0 {
-		score.NewNodePrice = score.SourcePrice - cmd.EstimatedSavings()
-	}
-	return score
-}
-
-func topMovesBySavings(valid <-chan rill.Try[*move], limit int) []*move {
+func topMovesByScore(valid <-chan rill.Try[*move], limit int) []*move {
 	moves := []*move{}
 	for a := range valid {
 		moves = append(moves, a.Value)
 	}
-	sort.SliceStable(moves, func(i, j int) bool { return moves[i].SearchScore.Savings > moves[j].SearchScore.Savings })
+	sort.SliceStable(moves, func(i, j int) bool { return moves[i].SearchScore.Total > moves[j].SearchScore.Total })
 	if len(moves) > limit {
 		moves = moves[:limit]
 	}

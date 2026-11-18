@@ -20,16 +20,20 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/events"
 )
 
 func TestSearchMovesRejectsUnprofitableAndMultipleReplacements(t *testing.T) {
@@ -44,8 +48,8 @@ func TestSearchMovesRejectsUnprofitableAndMultipleReplacements(t *testing.T) {
 			cmd.Replacements = []*Replacement{{}, {}}
 		}
 		return cmd, nil
-	}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
-	if len(moves) != 1 || moves[0].SearchScore.Savings != 3 || stats.Evaluated != 3 {
+	}, testScoreInputs(sources), rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	if len(moves) != 1 || moves[0].SearchScore.Total != 4 || stats.Evaluated != 3 {
 		t.Fatalf("got %v, stats %+v", moves, stats)
 	}
 }
@@ -57,8 +61,8 @@ func TestSearchMovesPreservesSuccessOnSimulationError(t *testing.T) {
 			return Command{}, fmt.Errorf("simulation failed")
 		}
 		return Command{Candidates: c}, nil
-	}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
-	if len(moves) != 1 || moves[0].SearchScore.Savings != 1 || stats.Errors != 1 || stats.Evaluated != 2 {
+	}, testScoreInputs(sources), rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	if len(moves) != 1 || moves[0].SearchScore.Total != 2 || stats.Errors != 1 || stats.Evaluated != 2 {
 		t.Fatalf("got %v, stats %+v", moves, stats)
 	}
 }
@@ -66,7 +70,7 @@ func TestSearchMovesPreservesSuccessOnSimulationError(t *testing.T) {
 func TestSearchMovesErrorPreventsConsolidatedState(t *testing.T) {
 	_, stats := searchMoves(context.Background(), [][]*Candidate{[]*Candidate{candidateWithPrice(t, 1)}}, time.Now().Add(time.Second), func(context.Context, ...*Candidate) (Command, error) {
 		return Command{}, fmt.Errorf("simulation failed")
-	}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	}, scoreInputs{}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
 	if stats.canMarkConsolidated(1, false) {
 		t.Fatal("failed search must not mark cluster consolidated")
 	}
@@ -83,8 +87,8 @@ func TestSearchMovesFiltersMoveWhenStandbyCostExceedsSavings(t *testing.T) {
 			return cmd, nil
 		}
 		return Command{Candidates: c}, nil
-	}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
-	if len(moves) != 1 || moves[0].SearchScore.Savings != 5 || stats.NoSavings != 1 {
+	}, testScoreInputs(sources), rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	if len(moves) != 1 || moves[0].SearchScore.Total != 6 || stats.NoSavings != 1 {
 		t.Fatalf("got %v, stats %+v", moves, stats)
 	}
 }
@@ -97,4 +101,46 @@ func standbyReactivationResults(standbyName string, price float64) []*pschedulin
 	sn := state.NewNode()
 	sn.Node = node
 	return []*pscheduling.ExistingNode{{StateNode: sn, Pods: []*corev1.Pod{{}}, Price: price}}
+}
+
+func TestSearchMovesRejectsPositiveSavingsWithZeroScore(t *testing.T) {
+	candidate := candidateWithPrice(t, 1)
+	sources := [][]*Candidate{[]*Candidate{candidate}}
+	inputs := testScoreInputs(sources)
+	candidate.Node.Status.Allocatable = nil
+	moves, stats := searchMoves(context.Background(), sources, time.Now().Add(time.Second), func(_ context.Context, c ...*Candidate) (Command, error) {
+		return Command{Candidates: c}, nil
+	}, inputs, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	if len(moves) != 0 || stats.NonPositiveScore != 1 || stats.NoSavings != 0 {
+		t.Fatalf("kept %d moves, stats %+v, want none counted as non-positive score", len(moves), stats)
+	}
+}
+
+func TestInvalidUtilizationWeightWarnsOnce(t *testing.T) {
+	fakeRecorder := record.NewFakeRecorder(10)
+	recorder := events.NewRecorder(fakeRecorder)
+	pool := &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: "pool", UID: "pool", Annotations: map[string]string{v1.UtilizationWeightAnnotationKey: "NaN"}}}
+	candidate := candidateWithPrice(t, 1)
+	candidate.NodePool = pool
+	candidate.NodeClaim = &v1.NodeClaim{}
+	candidate.Node.Labels[v1.NodePoolLabelKey] = pool.Name
+	candidate.Node.Labels[v1.NodeInitializedLabelKey] = "true"
+	candidate.Node.Labels[v1.NodeRegisteredLabelKey] = "true"
+	candidate.Node.Status.Allocatable = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}
+	instanceTypes := instanceTypesByNodePool{pool.Name: {candidate.instanceType.Name: candidate.instanceType}}
+	sources := [][]*Candidate{[]*Candidate{candidate}}
+	for range 2 {
+		inputs := newScoreInputs(state.StateNodes{candidate.StateNode}, instanceTypes, []*Candidate{candidate}, recorder)
+		moves, _ := searchMoves(context.Background(), sources, time.Now().Add(time.Second), func(_ context.Context, c ...*Candidate) (Command, error) {
+			return Command{Candidates: c}, nil
+		}, inputs, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+		if len(moves) != 1 || moves[0].SearchScore.Total != 2 {
+			t.Fatalf("evaluations = %+v, want score 2 using default weight", moves)
+		}
+	}
+
+	warnings := collectFakeRecorderEvents(fakeRecorder)
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "Warning InvalidUtilizationWeight") {
+		t.Fatalf("events = %v, want one invalid-weight warning", warnings)
+	}
 }
