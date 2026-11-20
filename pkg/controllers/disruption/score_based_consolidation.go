@@ -79,18 +79,19 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, _ map[str
 		return []Command{}, err
 	}
 	validCandidates, budgetBlockedPools, pacingBlockedPools := s.filterCandidates(snapshot)
-	var moves []*move
+	var choice moveChoice
 	var stats searchStats
 	eligible := len(validCandidates)
 	var searchDuration time.Duration
 	defer func() {
 		// A failed pass writes no decision log; the controller reports the error.
 		if err == nil {
-			logScoreDecision(ctx, moves, stats, len(snapshot.candidates), eligible, budgetBlockedPools, pacingBlockedPools, searchDuration)
+			logScoreDecision(ctx, choice, stats, len(snapshot.candidates), eligible, budgetBlockedPools, pacingBlockedPools, searchDuration)
 		}
 	}()
 
-	moves, stats, err = s.searchForMoves(ctx, validCandidates, snapshot.scoreInputs, deadline)
+	var feasible []*move
+	feasible, stats, err = s.searchForMoves(ctx, validCandidates, snapshot.scoreInputs, deadline)
 	searchDuration = s.clock.Since(start)
 	if err != nil {
 		return []Command{}, err
@@ -98,7 +99,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, _ map[str
 	if stats.TimedOut {
 		ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
 	}
-	if len(moves) == 0 {
+	if len(feasible) == 0 {
 		if stats.canMarkConsolidated(eligible, len(budgetBlockedPools) > 0 || len(pacingBlockedPools) > 0) {
 			s.markConsolidated()
 		}
@@ -108,14 +109,18 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, _ map[str
 	if err := s.waitForValidation(ctx, start); err != nil {
 		return []Command{}, err
 	}
-	cmd, err := s.rescoreKeptMoves(ctx, moves)
+	batchable := batchableMoves(feasible)
+	evaluator, err := s.validationEvaluator(ctx, feasible, batchable)
 	if err != nil {
 		return []Command{}, err
 	}
-	if len(cmd.Candidates) == 0 {
+	choice.Kept = validateKeptMoves(ctx, evaluator, s.recorder, feasible)
+	choice.BatchMoves = buildBatchMoves(ctx, evaluator, choice.Kept, batchable)
+	choice.Chosen = selectMove(s.recorder, choice.Kept, choice.BatchMoves.Moves)
+	if choice.Chosen.Move == nil {
 		return []Command{}, nil
 	}
-	return []Command{cmd}, nil
+	return []Command{choice.Chosen.Command}, nil
 }
 
 func (s *ScoreBasedConsolidation) filterCandidates(snapshot clusterSnapshot) ([]*Candidate, []string, []string) {
@@ -199,6 +204,42 @@ type withoutCandidateEvents struct {
 
 func (r withoutCandidateEvents) Publish(evts ...events.Event) {
 	r.Recorder.Publish(lo.Reject(evts, func(evt events.Event, _ int) bool { return evt.Reason == events.ConsolidationCandidate })...)
+}
+
+type moveChoice struct {
+	Chosen     validatedMove
+	Kept       []*move
+	BatchMoves batchMovesBuildingResult
+}
+
+// selectMove keeps search order among equal scores, ranking a batch move right after the kept move it was built from.
+func selectMove(recorder events.Recorder, kept []*move, batchMoves []validatedMove) validatedMove {
+	var moves []validatedMove
+	for _, m := range kept {
+		if m.Validation != validationPassed {
+			continue
+		}
+		moves = append(moves, m.validated())
+		moves = append(moves, lo.Filter(batchMoves, func(b validatedMove, _ int) bool { return b.Move == m })...)
+	}
+	best := lo.MaxBy(moves, func(a, b validatedMove) bool { return a.Score.Total > b.Score.Total })
+	if best.Move != nil {
+		best.Command.EmitCandidateEvents(recorder)
+		ScoreBasedMovesSelectedTotal.Inc(map[string]string{moveKindLabel: string(best.Kind)})
+	}
+	return best
+}
+
+// validatedMove is a kept move that passed validation, or a batch move built from it. The zero value is no move.
+type validatedMove struct {
+	Move    *move
+	Kind    moveKind
+	Command Command
+	Score   moveScore
+}
+
+func (m *move) validated() validatedMove {
+	return validatedMove{Move: m, Kind: moveKindSingle, Command: m.Command, Score: m.ValidationScore}
 }
 
 func (s *ScoreBasedConsolidation) Reason() v1.DisruptionReason {

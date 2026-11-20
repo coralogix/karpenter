@@ -42,8 +42,14 @@ const (
 	moveEvaluationNonPositiveScore = "non_positive_score"
 	moveEvaluationError            = "error"
 
-	moveKindLabel  = "kind"
-	moveKindSingle = "single"
+	moveKindLabel = "kind"
+)
+
+type moveKind string
+
+const (
+	moveKindSingle moveKind = "single"
+	moveKindBatch  moveKind = "batch"
 )
 
 var (
@@ -53,7 +59,7 @@ var (
 			Namespace: metrics.Namespace,
 			Subsystem: voluntaryDisruptionSubsystem,
 			Name:      "score_based_move_evaluations_total",
-			Help:      "Number of moves simulated by the score-based consolidation search. Labeled by result.",
+			Help:      "Number of moves simulated by score-based consolidation, by the search and by batch growth. Labeled by result.",
 		},
 		[]string{moveEvaluationResultLabel},
 	)
@@ -73,41 +79,44 @@ func init() {
 	for _, result := range []string{moveEvaluationFeasible, moveEvaluationNoOp, moveEvaluationNoSavings, moveEvaluationNonPositiveScore, moveEvaluationError} {
 		ScoreBasedMoveEvaluationsTotal.Add(0, map[string]string{moveEvaluationResultLabel: result})
 	}
-	ScoreBasedMovesSelectedTotal.Add(0, map[string]string{moveKindLabel: moveKindSingle})
+	for _, kind := range []moveKind{moveKindSingle, moveKindBatch} {
+		ScoreBasedMovesSelectedTotal.Add(0, map[string]string{moveKindLabel: string(kind)})
+	}
 }
 
 func countMoveEvaluation(result string) {
 	ScoreBasedMoveEvaluationsTotal.Inc(map[string]string{moveEvaluationResultLabel: result})
 }
 
-func logScoreDecision(ctx context.Context, moves []*move, stats searchStats, candidates, eligible int, budgetBlockedPools, pacingBlockedPools []string, duration time.Duration) {
+func logScoreDecision(ctx context.Context, choice moveChoice, stats searchStats, candidates, eligible int, budgetBlockedPools, pacingBlockedPools []string, duration time.Duration) {
 	fields := []interface{}{
-		"eligibleCandidates", eligible, "evaluatedMoves", stats.Evaluated, "keptMoves", len(moves),
+		"eligibleCandidates", eligible, "evaluatedMoves", stats.Evaluated, "keptMoves", len(choice.Kept),
 		"simulationErrors", stats.Errors, "noOp", stats.NoOp, "noSavings", stats.NoSavings, "nonPositiveScore", stats.NonPositiveScore,
 		"deadlineHit", stats.TimedOut, "duration", duration,
 		"budgetBlockedNodePools", budgetBlockedPools, "pacingBlockedNodePools", pacingBlockedPools,
 	}
 	failedValidation := 0
-	for _, m := range moves {
+	for _, m := range choice.Kept {
 		if m.validationRejected() {
 			failedValidation++
 		}
 	}
-	for i, m := range moves {
-		if !m.Selected {
-			continue
-		}
+	if choice.Chosen.Move != nil {
 		alternatives := []map[string]interface{}{}
-		for j, other := range moves {
-			if j != i && len(alternatives) < 3 {
+		for _, other := range choice.Kept {
+			// The kept move a chosen batch move was built from is an alternative.
+			if (other != choice.Chosen.Move || choice.Chosen.Kind == moveKindBatch) && len(alternatives) < 3 {
 				alternatives = append(alternatives, moveLog(other))
 			}
 		}
-		fields = append(fields, "move", moveLog(m), "rank", i+1, "searchScore", m.SearchScore.Total, "rescoredScore", m.ValidationScore.Total, "failedValidation", failedValidation, "alternatives", alternatives, "validationAttempts", len(moves))
+		fields = append(fields, "move", chosenMoveLog(choice.Chosen), "rank", slices.Index(choice.Kept, choice.Chosen.Move)+1, "searchScore", choice.Chosen.Move.SearchScore.Total, "rescoredScore", choice.Chosen.Score.Total, "failedValidation", failedValidation, "alternatives", alternatives, "validationAttempts", len(choice.Kept))
+		if choice.Chosen.Kind == moveKindBatch {
+			fields = append(fields, "batchSimulations", choice.BatchMoves.JointSimulations, "batchesGrown", len(choice.BatchMoves.Moves))
+		}
 		log.FromContext(ctx).Info("score-based consolidation move selected", fields...)
 		return
 	}
-	fields = append(fields, "reason", noMoveReason(len(moves), stats, candidates, eligible), "validationAttempts", len(moves))
+	fields = append(fields, "reason", noMoveReason(len(choice.Kept), stats, candidates, eligible), "validationAttempts", len(choice.Kept))
 	log.FromContext(ctx).Info("score-based consolidation found no move", fields...)
 }
 
@@ -130,10 +139,23 @@ func noMoveReason(kept int, stats searchStats, candidates, eligible int) string 
 	return "no_saving_move"
 }
 
+func chosenMoveLog(chosen validatedMove) map[string]interface{} {
+	if chosen.Kind == moveKindSingle {
+		return moveLog(chosen.Move)
+	}
+	return commandLog(chosen.Kind, chosen.Command, chosen.Score, "passed")
+}
+
 func moveLog(m *move) map[string]interface{} {
-	cmd := m.Command
 	rescored := m.Validation != validationFailed
-	score := lo.Ternary(rescored, m.ValidationScore, m.SearchScore)
+	entry := commandLog(moveKindSingle, m.Command, lo.Ternary(rescored, m.ValidationScore, m.SearchScore), m.validationText())
+	if rescored && m.SearchScore.Total != m.ValidationScore.Total {
+		entry["searchScore"] = m.SearchScore.Total
+	}
+	return entry
+}
+
+func commandLog(kind moveKind, cmd Command, score moveScore, validation string) map[string]interface{} {
 	sources := []map[string]interface{}{}
 	for _, c := range cmd.Candidates {
 		sources = append(sources, map[string]interface{}{"node": c.Name(), "nodePool": c.NodePool.Name, "instanceType": c.Labels()[corev1.LabelInstanceTypeStable], "capacityType": c.Labels()[v1.CapacityTypeLabelKey], "price": c.Price})
@@ -148,9 +170,5 @@ func moveLog(m *move) map[string]interface{} {
 			newNode = map[string]interface{}{"instanceType": n.InstanceTypeOptions[0].Name, "price": score.NewNodePrice}
 		}
 	}
-	entry := map[string]interface{}{"kind": moveKindSingle, "sources": sources, "newNode": newNode, "reactivatedStandbyNodes": destinations, "score": score, "validation": m.validationText()}
-	if rescored && m.SearchScore.Total != m.ValidationScore.Total {
-		entry["searchScore"] = m.SearchScore.Total
-	}
-	return entry
+	return map[string]interface{}{"kind": kind, "sources": sources, "newNode": newNode, "reactivatedStandbyNodes": destinations, "score": score, "validation": validation}
 }
