@@ -1,6 +1,6 @@
 # Score-based consolidation
 
-This fork adds an alternate consolidation disruption method for NodePools that opt in via annotation. It simulates single-node moves, grows batch moves that empty several nodes at once, and ranks moves by a score combining normalized cost savings and unused CPU. Empty nodes are not deleted right away; they go on **standby** and are reclaimed later.
+This fork adds an alternate consolidation disruption method for NodePools that opt in via annotation. It simulates single-node moves, merges pairs of nodes onto one new node when no single-node move helps, grows batch moves that empty several nodes at once, and ranks moves by a score combining normalized cost savings and unused CPU. Empty nodes are not deleted right away; they go on **standby** and are reclaimed later.
 
 ## NodePool configuration
 
@@ -48,6 +48,8 @@ On `WhenEmptyOrUnderutilized` pools, the method picks the move with the highest 
 
 Moves needing more than one new node are rejected. Each searched pass logs its decision, including why no move was chosen and how the chosen move's score was computed.
 
+When no single-node move saves money and scores above zero, and the search's 15-second deadline has not passed, the method tries **pair moves**: two source nodes whose pods fit together on at most one new node, such as two half-full nodes that cannot move anywhere cheaper alone. A pair is tried only if it fits each source pool's `Underutilized` budget and [disruption pacing](disruption-pacing.md). When more than 256 pairs qualify, 256 are sampled, favouring nodes with low CPU use, so each pass tries a different sample. Half of the 256 go to pairs from one NodePool, because pods already running on a pool are likelier to fit on one replacement together than pods split across pools for a reason; when either kind has fewer pairs than its half, the other kind gets the rest. A pair moves like any other move: any new node launches first, then both sources drain and go on standby.
+
 After the 15-second validation delay, the method re-simulates its ten best moves on a fresh view of the cluster. It then grows **batch moves** from the three best of those that need no new node: other single-node moves that need no new node are added one at a time, and an addition is kept only if the whole batch still fits on existing or standby nodes, saves money, and scores higher than before. A batch never exceeds a source pool's `Underutilized` budget or the [disruption pacing](disruption-pacing.md) per-batch cap, and each starting move gets at most 32 joint simulations. The method runs the highest-scoring of the re-simulated moves and the grown batches.
 
 ### Score
@@ -61,7 +63,7 @@ Each move's **savings** are the source nodes' hourly prices minus the estimated 
 
 | Event | On | When |
 |-------|----|------|
-| `ConsolidationCandidate` | Nodes and NodeClaims | The node is a source of the chosen move, after validation; for a batch move, every source. Moves simulated during the search or batch growth raise no candidate events. |
+| `ConsolidationCandidate` | Nodes and NodeClaims | The node is a source of the chosen move, after validation; for a batch or pair move, every source. Moves simulated during the search or batch growth raise no candidate events. |
 | `ConsolidationRejected` | Nodes and NodeClaims | The node is a source of a kept move that failed validation. The message gives the reason, such as `scheduling`, `budget`, `pacing` or `no_savings`. |
 | `Unconsolidatable` | Nodes and NodeClaims | Unchanged from upstream: simulation found the node cannot be consolidated. |
 | `DisruptionBlocked` | NodePool | The pool's `Underutilized` budget is used up by disruptions already in progress, such as running evacuations. A budget that allows no disruptions at all raises upstream's budget event instead. |
@@ -81,7 +83,7 @@ Upstream disruption metrics are filled with `consolidation_type="score-based"`:
 The fork adds:
 
 - `karpenter_voluntary_disruption_score_based_move_evaluations_total{result}`: moves simulated by the search and by batch growth. `result` is `feasible` (saves money and scores above 0), `no_op` (nothing to do, or needs more than one new node), `no_savings`, `non_positive_score`, or `error`. A batch growth addition that validation rejects is not counted.
-- `karpenter_voluntary_disruption_score_based_moves_selected_total{kind}`: chosen moves. `kind` is `single` or `batch`.
+- `karpenter_voluntary_disruption_score_based_moves_selected_total{kind}`: chosen moves. `kind` is `single`, `batch`, or `pair`.
 
 ## Rollback to upstream
 

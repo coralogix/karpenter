@@ -145,7 +145,7 @@ func TestSearchMoves_ranksScore(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	winner, stats := searchMoves(ctx, sources, time.Now().Add(time.Second), moveEvaluator{compute: compute, inputs: testScoreInputs(sources)}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	winner, stats := newTestSearch(moveEvaluator{compute: compute, inputs: testScoreInputs(sources)}).simulate(ctx, sources)
 	evaluated := stats.Evaluated
 	if len(winner) != 2 {
 		t.Fatalf("evaluations = %d, want 2", len(winner))
@@ -175,7 +175,7 @@ func TestSearchMoves_stopsOnDeadline(t *testing.T) {
 		}
 	}
 
-	winner, stats := searchMoves(ctx, sources, time.Now().Add(-time.Millisecond), moveEvaluator{compute: compute}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	winner, stats := moveSearch{evaluator: moveEvaluator{compute: compute}, deadline: time.Now().Add(-time.Millisecond), random: rand.New(rand.NewSource(1)), clk: clock.RealClock{}}.simulate(ctx, sources) //nolint:gosec
 	evaluated := stats.Evaluated
 	if len(winner) != 0 {
 		t.Fatalf("evaluations = %d, want 0", len(winner))
@@ -201,7 +201,7 @@ func TestSearchMoves_keepsTenBest(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	feasible, stats := searchMoves(ctx, sources, time.Now().Add(time.Second), moveEvaluator{compute: compute, inputs: testScoreInputs(sources)}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	feasible, stats := newTestSearch(moveEvaluator{compute: compute, inputs: testScoreInputs(sources)}).simulate(ctx, sources)
 	moves := keptMoves(feasible)
 	evaluated := stats.Evaluated
 	if len(moves) != scoreBasedKeptMovesLimit {
@@ -240,7 +240,7 @@ func TestSearchMoves_returnsPartialOnTimeout(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	moves, stats := searchMoves(ctx, sources, deadline, moveEvaluator{compute: compute, inputs: testScoreInputs(sources)}, rand.New(rand.NewSource(1)), fakeClock) //nolint:gosec
+	moves, stats := moveSearch{evaluator: moveEvaluator{compute: compute, inputs: testScoreInputs(sources)}, deadline: deadline, random: rand.New(rand.NewSource(1)), clk: fakeClock}.simulate(ctx, sources) //nolint:gosec
 	if !stats.TimedOut {
 		t.Fatal("expected stats.TimedOut")
 	}

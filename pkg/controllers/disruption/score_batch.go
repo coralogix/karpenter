@@ -82,7 +82,7 @@ func growBatchMove(ctx context.Context, evaluator moveEvaluator, seed *move, bat
 		if IsValidationError(err) {
 			continue
 		}
-		result := moveEvaluationResult(grown, err)
+		result := classifyEvaluation(grown, err)
 		countMoveEvaluation(result)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
