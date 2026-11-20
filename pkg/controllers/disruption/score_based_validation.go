@@ -67,7 +67,7 @@ type rescoreChecks struct {
 
 func (r rescoreChecks) wrap(compute consolidationComputer) consolidationComputer {
 	return func(ctx context.Context, sources ...*Candidate) (Command, error) {
-		fresh, err := r.freshSources(sources)
+		fresh, err := r.beforeCompute(sources)
 		if err != nil {
 			return Command{}, err
 		}
@@ -79,11 +79,22 @@ func (r rescoreChecks) wrap(compute consolidationComputer) consolidationComputer
 		if err := r.checkNotNominated(cmd.Candidates); err != nil {
 			return Command{}, err
 		}
-		if !r.pacing.CommandAllowed(cmd) {
-			return Command{}, NewValidationError(errWholeCommandPacing)
-		}
 		return cmd, nil
 	}
+}
+
+// beforeCompute returns the fresh candidates for a move's sources, or the validation error for the first check the
+// move fails: churn, budget or nomination, then whole-command pacing. None of them needs the simulation, so a move
+// they reject costs no compute.
+func (r rescoreChecks) beforeCompute(sources []*Candidate) ([]*Candidate, error) {
+	fresh, err := r.freshSources(sources)
+	if err != nil {
+		return nil, err
+	}
+	if !r.pacing.CommandAllowed(Command{Candidates: fresh}) {
+		return nil, NewValidationError(errWholeCommandPacing)
+	}
+	return fresh, nil
 }
 
 func (r rescoreChecks) freshSources(sources []*Candidate) ([]*Candidate, error) {
