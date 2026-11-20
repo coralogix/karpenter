@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -34,22 +35,22 @@ var errWholeCommandPacing = errors.New("whole-command pacing")
 
 const validationErrorReason = "error"
 
-// rescoreKeptMoves repeats the search on a fresh snapshot of the kept moves' sources and returns the move with the
-// highest positive rescored score, exactly as re-simulated.
-func (s *ScoreBasedConsolidation) rescoreKeptMoves(ctx context.Context, moves []*move) (Command, error) {
+var scoreBasedKeptMovesLimit = 10
+
+func (s *ScoreBasedConsolidation) validationEvaluator(ctx context.Context, feasible, batchable []*move) (moveEvaluator, error) {
 	sources := sets.New[string]()
-	for _, m := range moves {
+	for _, m := range slices.Concat(keptMoves(feasible), batchable) {
 		for _, c := range m.Command.Candidates {
 			sources.Insert(c.Name())
 		}
 	}
 	snapshot, err := s.prepare(ctx, sources)
 	if err != nil {
-		return Command{}, err
+		return moveEvaluator{}, err
 	}
 	compute, err := s.newComputer(ctx, snapshot.candidates)
 	if err != nil {
-		return Command{}, err
+		return moveEvaluator{}, err
 	}
 	checks := rescoreChecks{
 		candidates:                 lo.KeyBy(snapshot.candidates, func(c *Candidate) string { return c.Name() }),
@@ -57,7 +58,17 @@ func (s *ScoreBasedConsolidation) rescoreKeptMoves(ctx context.Context, moves []
 		cluster:                    s.cluster,
 		pacing:                     s.disruptionPacing,
 	}
-	return selectBestRescoredCommand(ctx, moveEvaluator{compute: checks.wrap(compute), inputs: snapshot.scoreInputs}, s.recorder, moves), nil
+	return moveEvaluator{compute: checks.wrap(compute), inputs: snapshot.scoreInputs}, nil
+}
+
+// notSimulatedError marks a move the checks rejected before compute, so batch growth does not count it as a
+// simulation.
+type notSimulatedError struct {
+	error
+}
+
+func (e notSimulatedError) Unwrap() error {
+	return e.error
 }
 
 type rescoreChecks struct {
@@ -71,7 +82,7 @@ func (r rescoreChecks) wrap(compute consolidationComputer) consolidationComputer
 	return func(ctx context.Context, sources ...*Candidate) (Command, error) {
 		fresh, err := r.beforeCompute(sources)
 		if err != nil {
-			return Command{}, err
+			return Command{}, notSimulatedError{error: err}
 		}
 		cmd, err := compute(ctx, fresh...)
 		if err != nil {
@@ -125,32 +136,21 @@ func (r rescoreChecks) checkNotNominated(candidates []*Candidate) error {
 	return nil
 }
 
-func selectBestRescoredCommand(ctx context.Context, evaluator moveEvaluator, recorder events.Recorder, moves []*move) Command {
-	for _, m := range moves {
+func validateKeptMoves(ctx context.Context, evaluator moveEvaluator, recorder events.Recorder, feasible []*move) []*move {
+	kept := keptMoves(feasible)
+	for _, m := range kept {
 		rescore(ctx, evaluator, m)
-	}
-	passed := lo.Filter(moves, func(e *move, _ int) bool { return e.Validation == validationPassed })
-	best := lo.MaxBy(passed, func(a, b *move) bool { return a.ValidationScore.Total > b.ValidationScore.Total })
-	rankedAboveBest := true
-	for _, m := range moves {
-		if m == best {
-			rankedAboveBest = false
-		}
-		if !m.failedValidation() {
-			continue
-		}
-		FailedValidationsTotal.Inc(map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
-		if rankedAboveBest {
+		if m.failedValidation() {
+			FailedValidationsTotal.Inc(map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
 			m.Command.EmitRejectedEvents(recorder, m.validationFailureReason())
 		}
 	}
-	if best == nil {
-		return Command{}
-	}
-	best.Selected = true
-	best.Command.EmitCandidateEvents(recorder)
-	ScoreBasedMovesSelectedTotal.Inc(map[string]string{moveKindLabel: moveKindSingle})
-	return best.Command
+	return kept
+}
+
+// keptMoves are the feasible moves validated after the delay. The limit only bounds validation work.
+func keptMoves(feasible []*move) []*move {
+	return feasible[:min(len(feasible), scoreBasedKeptMovesLimit)]
 }
 
 func rescore(ctx context.Context, evaluator moveEvaluator, m *move) {

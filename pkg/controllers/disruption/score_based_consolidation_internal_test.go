@@ -201,10 +201,11 @@ func TestSearchMoves_keepsTenBest(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	moves, stats := searchMoves(ctx, sources, time.Now().Add(time.Second), moveEvaluator{compute: compute, inputs: testScoreInputs(sources)}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	feasible, stats := searchMoves(ctx, sources, time.Now().Add(time.Second), moveEvaluator{compute: compute, inputs: testScoreInputs(sources)}, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	moves := keptMoves(feasible)
 	evaluated := stats.Evaluated
-	if len(moves) != scoreBasedValidEvaluationsTarget {
-		t.Fatalf("evaluations = %d, want %d", len(moves), scoreBasedValidEvaluationsTarget)
+	if len(moves) != scoreBasedKeptMovesLimit {
+		t.Fatalf("evaluations = %d, want %d", len(moves), scoreBasedKeptMovesLimit)
 	}
 	for i, m := range moves {
 		want := strconv.Itoa(11 - i)
@@ -212,8 +213,8 @@ func TestSearchMoves_keepsTenBest(t *testing.T) {
 			t.Fatalf("evaluation[%d] index = %q, want %q", i, m.Command.Candidates[0].NodePool.Name, want)
 		}
 	}
-	if evaluated < scoreBasedValidEvaluationsTarget {
-		t.Fatalf("evaluated = %d, want at least %d", evaluated, scoreBasedValidEvaluationsTarget)
+	if evaluated < scoreBasedKeptMovesLimit {
+		t.Fatalf("evaluated = %d, want at least %d", evaluated, scoreBasedKeptMovesLimit)
 	}
 }
 
@@ -251,7 +252,7 @@ func TestSearchMoves_returnsPartialOnTimeout(t *testing.T) {
 	}
 }
 
-func TestSelectBestRescoredCommand_runsHigherRescoredMoveAsResimulated(t *testing.T) {
+func TestChooseMove_runsHigherRescoredMoveAsResimulated(t *testing.T) {
 	highSearch, lowSearch := namedCandidate(t, "high-search", 10), namedCandidate(t, "low-search", 5)
 	moves := []*move{
 		{Command: Command{Candidates: []*Candidate{highSearch}, Results: pscheduling.Results{ExistingNodes: standbyReactivationResults("standby-expensive", 1)}}, SearchScore: moveScore{Total: 9}},
@@ -272,7 +273,7 @@ func TestSelectBestRescoredCommand_runsHigherRescoredMoveAsResimulated(t *testin
 	}
 }
 
-func TestSelectBestRescoredCommand_rejectsRescoredMoveWithoutSavings(t *testing.T) {
+func TestChooseMove_rejectsRescoredMoveWithoutSavings(t *testing.T) {
 	source := namedCandidate(t, "source", 0.10)
 	results := pscheduling.Results{ExistingNodes: standbyReactivationResults("standby-a", 0.10)}
 	moves := []*move{{Command: Command{Candidates: []*Candidate{source}, Results: results}, SearchScore: moveScore{Total: 0.10}}}
@@ -287,7 +288,7 @@ func TestSelectBestRescoredCommand_rejectsRescoredMoveWithoutSavings(t *testing.
 	}
 }
 
-func TestSelectBestRescoredCommand_rejectsPositiveSavingsWithNonPositiveRescoredScore(t *testing.T) {
+func TestChooseMove_rejectsPositiveSavingsWithNonPositiveRescoredScore(t *testing.T) {
 	source := namedCandidate(t, "source", 1)
 	moves := []*move{{Command: Command{Candidates: []*Candidate{source}}, SearchScore: moveScore{Total: 2}}}
 	inputs := testScoreInputs(sourcesOf(moves))
@@ -303,7 +304,7 @@ func TestSelectBestRescoredCommand_rejectsPositiveSavingsWithNonPositiveRescored
 	}
 }
 
-func TestSelectBestRescoredCommand_noOpFailsWithSchedulingAndNextMoveRuns(t *testing.T) {
+func TestChooseMove_noOpFailsWithSchedulingAndNextMoveRuns(t *testing.T) {
 	high, low := namedCandidate(t, "high-score", 0.50), namedCandidate(t, "low-score", 0.10)
 	moves := []*move{
 		{Command: Command{Candidates: []*Candidate{high}}, SearchScore: moveScore{Total: 0.50}},
@@ -320,7 +321,7 @@ func TestSelectBestRescoredCommand_noOpFailsWithSchedulingAndNextMoveRuns(t *tes
 	}
 }
 
-func TestSelectBestRescoredCommand_candidateEventsOnlyOnChosenMoveAndRejectedEventsOnFailedMovesRankedAboveIt(t *testing.T) {
+func TestChooseMove_candidateEventsOnlyOnChosenMoveAndRejectedEventsOnEveryFailedMove(t *testing.T) {
 	recorder := test.NewEventRecorder()
 	moves := []*move{
 		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "fails-first", 0.50)}}, SearchScore: moveScore{Total: 0.50}},
@@ -328,37 +329,17 @@ func TestSelectBestRescoredCommand_candidateEventsOnlyOnChosenMoveAndRejectedEve
 		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "fails-last", 0.10)}}, SearchScore: moveScore{Total: 0.10}},
 	}
 
-	selectBestRescoredCommand(context.Background(), moveEvaluator{compute: resimulatedTo(map[string]pscheduling.Results{"chosen": {}}), inputs: testScoreInputs(sourcesOf(moves))}, recorder, moves)
+	chooseMove(moveEvaluator{compute: resimulatedTo(map[string]pscheduling.Results{"chosen": {}}), inputs: testScoreInputs(sourcesOf(moves))}, recorder, moves, nil)
 
 	if got := involvedObjectNames(recorder, events.ConsolidationCandidate); !slices.Equal(got, []string{"chosen"}) {
 		t.Errorf("ConsolidationCandidate events on %v, want only the chosen move's source", got)
 	}
-	if got := involvedObjectNames(recorder, events.ConsolidationRejected); !slices.Equal(got, []string{"fails-first"}) {
-		t.Errorf("ConsolidationRejected events on %v, want only the failed move ranked above the chosen one", got)
+	if got := involvedObjectNames(recorder, events.ConsolidationRejected); !slices.Equal(got, []string{"fails-first", "fails-last"}) {
+		t.Errorf("ConsolidationRejected events on %v, want every failed move", got)
 	}
 }
 
-func TestSelectBestRescoredCommand_rejectedEventsOnEveryFailedMoveWhenNoneIsChosen(t *testing.T) {
-	recorder := test.NewEventRecorder()
-	moves := []*move{
-		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "high-score", 0.50)}}, SearchScore: moveScore{Total: 0.50}},
-		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "low-score", 0.10)}}, SearchScore: moveScore{Total: 0.10}},
-	}
-
-	cmd := selectBestRescoredCommand(context.Background(), moveEvaluator{compute: resimulatedTo(nil)}, recorder, moves)
-
-	if len(cmd.Candidates) != 0 {
-		t.Fatalf("command candidates = %d, want 0", len(cmd.Candidates))
-	}
-	if got := involvedObjectNames(recorder, events.ConsolidationRejected); !slices.Equal(got, []string{"high-score", "low-score"}) {
-		t.Errorf("ConsolidationRejected events on %v, want both failed moves", got)
-	}
-	if got := involvedObjectNames(recorder, events.ConsolidationCandidate); len(got) != 0 {
-		t.Errorf("ConsolidationCandidate events on %v, want none", got)
-	}
-}
-
-func TestSelectBestRescoredCommand_countsSelectedKindAndEveryFailedValidation(t *testing.T) {
+func TestChooseMove_countsSelectedKindAndEveryFailedValidation(t *testing.T) {
 	moves := []*move{
 		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "no-longer-fits", 0.50)}}, SearchScore: moveScore{Total: 0.50}},
 		{Command: Command{Candidates: []*Candidate{namedCandidate(t, "chosen", 0.30)}}, SearchScore: moveScore{Total: 0.30}},
@@ -381,7 +362,7 @@ func TestSelectBestRescoredCommand_countsSelectedKindAndEveryFailedValidation(t 
 	expectRescore(t, compute, testScoreInputs(sourcesOf(moves)), moves)
 
 	selected := counterValuesByLabel(t, "karpenter_voluntary_disruption_score_based_moves_selected_total", "kind")
-	if delta := selected[moveKindSingle] - selectedBefore[moveKindSingle]; delta != 1 {
+	if delta := selected[string(moveKindSingle)] - selectedBefore[string(moveKindSingle)]; delta != 1 {
 		t.Errorf("selected single moves = %v, want 1", delta)
 	}
 	failed := counterValuesByLabel(t, "karpenter_voluntary_disruption_failed_validations_total", ConsolidationTypeLabel)
@@ -390,7 +371,7 @@ func TestSelectBestRescoredCommand_countsSelectedKindAndEveryFailedValidation(t 
 	}
 }
 
-func TestSelectBestRescoredCommand_rejectsMoveByWholeCommandPacing(t *testing.T) {
+func TestChooseMove_rejectsMoveByWholeCommandPacing(t *testing.T) {
 	pool := paceTestNodePool("1", "1")
 	clk := clocktesting.NewFakeClock(time.Now())
 	pacing := NewDisruptionPacing(clk)
@@ -477,7 +458,13 @@ func resimulatedTo(byFirstSource map[string]pscheduling.Results) consolidationCo
 
 func expectRescore(t *testing.T, compute consolidationComputer, inputs scoreInputs, moves []*move) Command {
 	t.Helper()
-	return selectBestRescoredCommand(context.Background(), moveEvaluator{compute: compute, inputs: inputs}, events.NewRecorder(record.NewFakeRecorder(10)), moves)
+	return chooseMove(moveEvaluator{compute: compute, inputs: inputs}, events.NewRecorder(record.NewFakeRecorder(10)), moves, nil).Command
+}
+
+// chooseMove runs validation, batch move building and selection as ComputeCommands does.
+func chooseMove(evaluator moveEvaluator, recorder events.Recorder, feasible, batchable []*move) validatedMove {
+	kept := validateKeptMoves(context.Background(), evaluator, recorder, feasible)
+	return selectMove(recorder, kept, buildBatchMoves(context.Background(), evaluator, kept, batchable).Moves)
 }
 
 func namedCandidate(t *testing.T, name string, price float64) *Candidate {

@@ -189,7 +189,7 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	// As the number of commands increase, we expect more delays and scale the retry duration accordingly.
 	retryDuration := q.GetMaxRetryDuration()
 	if cmd.isScoreBasedEvacuation() {
-		retryDuration = evacuationTimeout(cmd.Candidates[0].NodePool, q.recorder)
+		retryDuration = commandEvacuationTimeout(cmd, q.recorder)
 	}
 	// Wrap an error in an unrecoverable error if it timed out
 	defer func() {

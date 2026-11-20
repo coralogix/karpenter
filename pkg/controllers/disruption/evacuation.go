@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/awslabs/operatorpkg/serrors"
+	"go.uber.org/multierr"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,9 +41,38 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-//nolint:gocyclo
+type evacuationProgress int
+
+const (
+	evacuationStandby evacuationProgress = iota + 1
+	evacuationFinished
+)
+
+// evacuate works on every source that is not finished, so all sources of a move drain at the same time (ADR-0007). An
+// error on one source does not stop the others.
 func (q *Queue) evacuate(ctx context.Context, cmd *Command) error {
+	if cmd.evacuationProgressByProviderID == nil {
+		cmd.evacuationProgressByProviderID = map[string]evacuationProgress{}
+	}
+	var errs error
 	for _, candidate := range cmd.Candidates {
+		// A finished source is never marked standby again, which would reset its standby timestamp, nor evacuated
+		// again after reactivation.
+		if cmd.evacuationProgressByProviderID[candidate.ProviderID()] == evacuationFinished {
+			continue
+		}
+		if err := q.evacuateSource(ctx, cmd, candidate); err != nil {
+			errs = multierr.Append(errs, err)
+			continue
+		}
+		cmd.evacuationProgressByProviderID[candidate.ProviderID()] = evacuationFinished
+	}
+	return errs
+}
+
+//nolint:gocyclo
+func (q *Queue) evacuateSource(ctx context.Context, cmd *Command, candidate *Candidate) error {
+	if cmd.evacuationProgressByProviderID[candidate.ProviderID()] != evacuationStandby {
 		pods, err := nodeutils.GetPods(ctx, q.kubeClient, candidate.Node)
 		if err != nil {
 			return fmt.Errorf("listing evacuation pods, %w", err)
@@ -66,21 +96,19 @@ func (q *Queue) evacuate(ctx context.Context, cmd *Command) error {
 					return err
 				}
 			}
-			return fmt.Errorf("waiting for %d evacuation pods", len(waiting))
+			return serrors.Wrap(fmt.Errorf("waiting for %d evacuation pods", len(waiting)), "Node", klog.KObj(candidate.Node))
 		}
 		// Persist standby before removing the temporary disruption taint, so the
 		// source never opens to ordinary scheduling between the two states.
 		if err := standby.Mark(ctx, q.kubeClient, candidate.Node, q.clock.Now()); err != nil {
 			return fmt.Errorf("marking evacuated node standby, %w", err)
 		}
-		if err := state.RequireNoScheduleTaint(ctx, q.kubeClient, false, candidate.StateNode); err != nil {
-			return err
-		}
-		if err := state.ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, candidate.StateNode); err != nil {
-			return err
-		}
+		cmd.evacuationProgressByProviderID[candidate.ProviderID()] = evacuationStandby
 	}
-	return nil
+	if err := state.RequireNoScheduleTaint(ctx, q.kubeClient, false, candidate.StateNode); err != nil {
+		return err
+	}
+	return state.ClearNodeClaimsCondition(ctx, q.kubeClient, q.clock, v1.ConditionTypeDisruptionReason, candidate.StateNode)
 }
 
 func (q *Queue) evictEvacuationPod(ctx context.Context, node *corev1.Node, pod *corev1.Pod, reason string) error {
@@ -111,7 +139,11 @@ func (c Command) isScoreBasedEvacuation() bool {
 	return c.Method != nil && c.ConsolidationType() == ScoreBasedConsolidationType
 }
 
-// evacuationTimeout returns how long a score-based evacuation command may run before it times out.
+func commandEvacuationTimeout(cmd *Command, recorder events.Recorder) time.Duration {
+	pools := lo.UniqBy(lo.Map(cmd.Candidates, func(c *Candidate, _ int) *v1.NodePool { return c.NodePool }), func(np *v1.NodePool) string { return np.Name })
+	return lo.Min(lo.Map(pools, func(np *v1.NodePool, _ int) time.Duration { return evacuationTimeout(np, recorder) }))
+}
+
 func evacuationTimeout(np *v1.NodePool, recorder events.Recorder) time.Duration {
 	return readDurationAnnotation(np, recorder, v1.EvacuationTimeoutAnnotationKey, 5*time.Minute, events.InvalidEvacuationTimeout)
 }
