@@ -24,7 +24,11 @@ import (
 	"sync"
 
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 )
 
 const scoreBasedBatchMoveSeeds = 3
@@ -45,6 +49,8 @@ func buildBatchMoves(ctx context.Context, evaluator moveEvaluator, kept, batchab
 	}
 	sort.SliceStable(seeds, func(i, j int) bool { return seeds[i].ValidationScore.Total > seeds[j].ValidationScore.Total })
 	seeds = seeds[:min(len(seeds), scoreBasedBatchMoveSeeds)]
+	ctx, endSpan := cxtracing.Start(ctx, scoreBasedSpanName+".batch", attribute.Int("seeds", len(seeds)))
+	defer endSpan()
 	grown := make([]validatedMove, len(seeds))
 	simulations := make([]int, len(seeds))
 	var wg sync.WaitGroup
@@ -56,9 +62,11 @@ func buildBatchMoves(ctx context.Context, evaluator moveEvaluator, kept, batchab
 		}()
 	}
 	wg.Wait()
+	jointSimulations := lo.Sum(simulations)
+	trace.SpanFromContext(ctx).SetAttributes(attribute.Int("joint_simulations", jointSimulations))
 	return batchMovesBuildingResult{
 		Moves:            lo.Filter(grown, func(m validatedMove, _ int) bool { return m.Kind == moveKindBatch }),
-		JointSimulations: lo.Sum(simulations),
+		JointSimulations: jointSimulations,
 	}
 }
 

@@ -89,6 +89,17 @@ The fork adds:
 - `karpenter_nodes_standby_reactivated_total{nodepool, source}`: standby nodes reactivated. `source` is `provisioning` or `disruption`, whichever decision placed pods on the node.
 - `karpenter_nodepools_standby_nodes{nodepool}`: standby nodes per NodePool, set on every disruption pass. A NodePool's series disappears when the pool is deleted, stops using score-based consolidation, or can no longer hold standby nodes (`consolidateAfter: Never`).
 
+## Spans
+
+Each pass has one `karpenter.disruption.score_based_consolidation` span. It carries the chosen move's `rank` (its position by search score; a batch move ranks as the move it grew from) and `kind`. Its children, prefixed with the pass span's name:
+
+- `.search`: building the simulator and the search. It has no children when no candidate is eligible. Otherwise its children `.search.single` and `.search.pair` (when the single phase found nothing before the deadline) carry `candidates`, `evaluated_moves` and `deadline_hit`.
+- `.validation_wait`: the rest of the validation delay after the search.
+- `.validate`: the fresh snapshot, candidate preparation and rescoring of the kept moves.
+- `.batch`: batch growth, with `seeds` and `joint_simulations`.
+
+`karpenter.disruption.simulate_scheduling` spans nest under the phase that ran them.
+
 ## Rollback to upstream
 
 Rolling back to upstream Karpenter is safe and needs no manifest or CRD changes. Upstream ignores the annotations, and the NodePools resume standard emptiness and consolidation. Nodes may keep the standby taint; remove it manually so scheduling is not blocked:

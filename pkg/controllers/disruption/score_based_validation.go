@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/events"
 )
 
@@ -36,6 +37,17 @@ var errWholeCommandPacing = errors.New("whole-command pacing")
 const validationErrorReason = "error"
 
 var scoreBasedKeptMovesLimit = 10
+
+// validate rescores the kept moves on a fresh snapshot and returns the evaluator batch growth simulates with.
+func (s *ScoreBasedConsolidation) validate(ctx context.Context, feasible, batchable []*move) (moveEvaluator, []*move, error) {
+	ctx, endSpan := cxtracing.Start(ctx, scoreBasedSpanName+".validate")
+	defer endSpan()
+	evaluator, err := s.validationEvaluator(ctx, feasible, batchable)
+	if err != nil {
+		return moveEvaluator{}, nil, err
+	}
+	return evaluator, validateKeptMoves(ctx, evaluator, s.recorder, feasible), nil
+}
 
 func (s *ScoreBasedConsolidation) validationEvaluator(ctx context.Context, feasible, batchable []*move) (moveEvaluator, error) {
 	sources := sets.New[string]()

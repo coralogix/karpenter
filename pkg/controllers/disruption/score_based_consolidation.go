@@ -20,13 +20,17 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"slices"
 	"time"
 
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 	"sigs.k8s.io/karpenter/pkg/events"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 )
@@ -34,6 +38,8 @@ import (
 var ScoreBasedConsolidationTimeoutDuration = 15 * time.Second
 
 const ScoreBasedConsolidationType = "score-based"
+
+const scoreBasedSpanName = "karpenter.disruption.score_based_consolidation"
 
 func NodePoolUsesScoreBasedConsolidation(np *v1.NodePool) bool {
 	if np == nil {
@@ -68,6 +74,8 @@ func (s *ScoreBasedConsolidation) ShouldDisrupt(ctx context.Context, cn *Candida
 //
 // nolint:gocyclo
 func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, _ map[string]int, _ ...*Candidate) (_ []Command, err error) {
+	ctx, endSpan := cxtracing.Start(ctx, scoreBasedSpanName)
+	defer endSpan()
 	if s.IsConsolidated() {
 		return []Command{}, nil
 	}
@@ -110,16 +118,17 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, _ map[str
 		return []Command{}, err
 	}
 	batchable := filterBatchable(feasible)
-	evaluator, err := s.validationEvaluator(ctx, feasible, batchable)
+	var evaluator moveEvaluator
+	evaluator, choice.Kept, err = s.validate(ctx, feasible, batchable)
 	if err != nil {
 		return []Command{}, err
 	}
-	choice.Kept = validateKeptMoves(ctx, evaluator, s.recorder, feasible)
 	choice.BatchMoves = buildBatchMoves(ctx, evaluator, choice.Kept, batchable)
 	choice.Chosen = selectMove(s.recorder, choice.Kept, choice.BatchMoves.Moves)
 	if choice.Chosen.Move == nil {
 		return []Command{}, nil
 	}
+	trace.SpanFromContext(ctx).SetAttributes(attribute.Int("rank", choice.rank()), attribute.String("kind", string(choice.Chosen.Kind)))
 	return []Command{choice.Chosen.Command}, nil
 }
 
@@ -157,6 +166,8 @@ func (s *ScoreBasedConsolidation) filterCandidates(snapshot clusterSnapshot) ([]
 }
 
 func (s *ScoreBasedConsolidation) waitForValidation(ctx context.Context, start time.Time) error {
+	_, endSpan := cxtracing.Start(ctx, scoreBasedSpanName+".validation_wait")
+	defer endSpan()
 	remainingValidationDelay := commandValidationDelay - s.clock.Since(start)
 	if remainingValidationDelay > 0 {
 		select {
@@ -169,6 +180,8 @@ func (s *ScoreBasedConsolidation) waitForValidation(ctx context.Context, start t
 }
 
 func (s *ScoreBasedConsolidation) searchForMoves(ctx context.Context, candidates []*Candidate, snapshot clusterSnapshot, deadline time.Time) ([]*move, searchStats, error) {
+	ctx, endSpan := cxtracing.Start(ctx, scoreBasedSpanName+".search")
+	defer endSpan()
 	if len(candidates) == 0 {
 		return nil, searchStats{}, nil
 	}
@@ -231,6 +244,11 @@ func selectMove(recorder events.Recorder, kept []*move, batchMoves []validatedMo
 		ScoreBasedMovesSelectedTotal.Inc(map[string]string{moveKindLabel: string(best.Kind)})
 	}
 	return best
+}
+
+// rank is the chosen move's position by search score. A batch move ranks as the kept move it was built from.
+func (c moveChoice) rank() int {
+	return slices.Index(c.Kept, c.Chosen.Move) + 1
 }
 
 // validatedMove is a kept move that passed validation, or a batch move built from it. The zero value is no move.
