@@ -84,6 +84,10 @@ The fork adds:
 
 - `karpenter_voluntary_disruption_score_based_move_evaluations_total{result}`: moves simulated by the search and by batch growth. `result` is `feasible` (saves money and scores above 0), `no_op` (nothing to do, or needs more than one new node), `no_savings`, `non_positive_score`, or `error`. A batch growth addition that validation rejects is not counted.
 - `karpenter_voluntary_disruption_score_based_moves_selected_total{kind}`: chosen moves. `kind` is `single`, `batch`, or `pair`.
+- `karpenter_nodeclaims_evacuated_total{nodepool, capacity_type}`: sources put on standby by an evacuation, once each. Evacuations delete nothing, so they never appear in `karpenter_nodeclaims_disrupted_total`.
+- `karpenter_voluntary_disruption_evacuation_duration_seconds{outcome}`: time from the start of an evacuation until it ends. `outcome` is `succeeded` when every source is on standby, or `failed` on timeout or another failure, even if some sources already reached standby.
+- `karpenter_nodes_standby_reactivated_total{nodepool, source}`: standby nodes reactivated. `source` is `provisioning` or `disruption`, whichever decision placed pods on the node.
+- `karpenter_nodepools_standby_nodes{nodepool}`: standby nodes per NodePool, set on every disruption pass. A NodePool's series disappears when the pool is deleted, stops using score-based consolidation, or can no longer hold standby nodes (`consolidateAfter: Never`).
 
 ## Rollback to upstream
 

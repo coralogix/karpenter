@@ -22,12 +22,16 @@ import (
 	"fmt"
 	"time"
 
+	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/awslabs/operatorpkg/serrors"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/multierr"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
@@ -36,10 +40,39 @@ import (
 	terminatorevents "sigs.k8s.io/karpenter/pkg/controllers/node/termination/terminator/events"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	podutils "sigs.k8s.io/karpenter/pkg/utils/pod"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
+
+var (
+	// NodeClaimsEvacuatedTotal counts sources handed to standby. Evacuations delete nothing, so they never appear in
+	// nodeclaims_disrupted_total.
+	NodeClaimsEvacuatedTotal = opmetrics.NewPrometheusCounter(
+		crmetrics.Registry,
+		prometheus.CounterOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: metrics.NodeClaimSubsystem,
+			Name:      "evacuated_total",
+			Help:      "Number of nodeclaims evacuated and handed to standby. Labeled by NodePool and capacity type.",
+		},
+		[]string{metrics.NodePoolLabel, metrics.CapacityTypeLabel},
+	)
+	EvacuationDurationSeconds = opmetrics.NewPrometheusHistogram(
+		crmetrics.Registry,
+		prometheus.HistogramOpts{
+			Namespace: metrics.Namespace,
+			Subsystem: voluntaryDisruptionSubsystem,
+			Name:      "evacuation_duration_seconds",
+			Help:      "Duration of evacuation commands from start until every source is standby, or until the command fails. Labeled by outcome.",
+			Buckets:   metrics.DurationBuckets(),
+		},
+		[]string{evacuationOutcomeLabel},
+	)
+)
+
+const evacuationOutcomeLabel = "outcome"
 
 type evacuationProgress int
 
@@ -104,6 +137,10 @@ func (q *Queue) evacuateSource(ctx context.Context, cmd *Command, candidate *Can
 			return fmt.Errorf("marking evacuated node standby, %w", err)
 		}
 		cmd.evacuationProgressByProviderID[candidate.ProviderID()] = evacuationStandby
+		NodeClaimsEvacuatedTotal.Inc(map[string]string{
+			metrics.NodePoolLabel:     candidate.NodeClaim.Labels[v1.NodePoolLabelKey],
+			metrics.CapacityTypeLabel: candidate.NodeClaim.Labels[v1.CapacityTypeLabelKey],
+		})
 	}
 	if err := state.RequireNoScheduleTaint(ctx, q.kubeClient, false, candidate.StateNode); err != nil {
 		return err
@@ -133,6 +170,17 @@ func (q *Queue) evictEvacuationPod(ctx context.Context, node *corev1.Node, pod *
 		return nil
 	}
 	return err
+}
+
+// observeEvacuationDuration records a finished evacuation command. A command that failed counts as failed even when
+// some of its sources already reached standby.
+func observeEvacuationDuration(cmd *Command, clk clock.Clock) {
+	if !cmd.isScoreBasedEvacuation() {
+		return
+	}
+	EvacuationDurationSeconds.Observe(clk.Since(cmd.CreationTimestamp).Seconds(), map[string]string{
+		evacuationOutcomeLabel: lo.Ternary(cmd.Succeeded, "succeeded", "failed"),
+	})
 }
 
 func (c Command) isScoreBasedEvacuation() bool {

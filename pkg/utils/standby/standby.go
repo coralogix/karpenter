@@ -49,25 +49,28 @@ func Timestamp(node *corev1.Node) (time.Time, bool) {
 
 // Mark writes the standby timestamp and taint together.
 func Mark(ctx context.Context, kubeClient client.Client, node *corev1.Node, now time.Time) error {
-	return patchNode(ctx, kubeClient, node, func(patch *corev1.Node) {
+	_, err := patchNode(ctx, kubeClient, node, func(patch *corev1.Node) {
 		if patch.Annotations == nil {
 			patch.Annotations = map[string]string{}
 		}
 		patch.Annotations[v1.StandbyNodeAnnotationKey] = now.UTC().Format(time.RFC3339Nano)
 		patch.Spec.Taints = append(WithoutStandbyTaint(patch.Spec.Taints), v1.StandbyNoScheduleTaint)
 	})
+	return err
 }
 
-// Clear removes both standby marks in one Node update.
-func Clear(ctx context.Context, kubeClient client.Client, node *corev1.Node) error {
+// Clear removes both standby marks in one Node update. It reports whether the stored Node changed, so a caller acting on
+// a stale copy can tell that standby was already cleared.
+func Clear(ctx context.Context, kubeClient client.Client, node *corev1.Node) (bool, error) {
 	return patchNode(ctx, kubeClient, node, func(patch *corev1.Node) {
 		delete(patch.Annotations, v1.StandbyNodeAnnotationKey)
 		patch.Spec.Taints = WithoutStandbyTaint(patch.Spec.Taints)
 	})
 }
 
-func patchNode(ctx context.Context, kubeClient client.Client, node *corev1.Node, update func(*corev1.Node)) error {
-	return retryIgnoringNotFound(func() error {
+func patchNode(ctx context.Context, kubeClient client.Client, node *corev1.Node, update func(*corev1.Node)) (bool, error) {
+	patched := false
+	err := retryIgnoringNotFound(func() error {
 		stored := &corev1.Node{}
 		if err := kubeClient.Get(ctx, client.ObjectKeyFromObject(node), stored); err != nil {
 			return err
@@ -80,8 +83,13 @@ func patchNode(ctx context.Context, kubeClient client.Client, node *corev1.Node,
 		if equality.Semantic.DeepEqual(patch, stored) {
 			return nil
 		}
-		return kubeClient.Patch(ctx, patch, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
+		if err := kubeClient.Patch(ctx, patch, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
+			return err
+		}
+		patched = true
+		return nil
 	})
+	return patched, err
 }
 
 func HasStandbyTaint(node *corev1.Node) bool {

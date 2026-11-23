@@ -104,6 +104,7 @@ func (c *Controller) startCommands(ctx context.Context, method Method, commands 
 			if staticDrift, ok := method.(*StaticDrift); ok && !command.staticNodeCountReservationHandedOff {
 				c.releaseStaticNodeCountReservation(staticDrift, command)
 			}
+			observeEvacuationDuration(&command, c.clock)
 			results[i].err = fmt.Errorf("disrupting candidates, %w", err)
 			return
 		}

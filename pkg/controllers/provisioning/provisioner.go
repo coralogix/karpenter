@@ -62,7 +62,6 @@ import (
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
-	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
 // LaunchOptions are the set of options that can be used to trigger certain
@@ -192,18 +191,6 @@ func (p *Provisioner) CreateNodeClaims(ctx context.Context, nodeClaims []*schedu
 		}
 	})
 	return nodeClaimNames, multierr.Combine(errs...)
-}
-
-// ReactivateStandby clears standby on every existing node the results place pods on, so those pods can bind.
-// Only results that are acted on may be passed; simulations never change standby.
-func (p *Provisioner) ReactivateStandby(ctx context.Context, results scheduler.Results) error {
-	var errs []error
-	for _, n := range results.ExistingNodes {
-		if len(n.Pods) > 0 && standby.HasStandbyTaint(n.Node) {
-			errs = append(errs, standby.Clear(ctx, p.kubeClient, n.Node))
-		}
-	}
-	return multierr.Combine(errs...)
 }
 
 func (p *Provisioner) GetPendingPods(ctx context.Context) ([]*corev1.Pod, error) {
@@ -534,7 +521,7 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 		// these nodeClaims don't have a name until they are created
 		filterVirtualPodMapping(results.ExistingNodeToPodMapping()))
 	results.Record(ctx, p.recorder, p.cluster)
-	if err := p.ReactivateStandby(ctx, results); err != nil {
+	if err := p.ReactivateStandby(ctx, results, StandbyReactivationSourceProvisioning); err != nil {
 		log.FromContext(ctx).Error(err, "reactivating standby nodes")
 	}
 	return results, nil
