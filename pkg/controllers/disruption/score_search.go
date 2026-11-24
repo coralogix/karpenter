@@ -200,7 +200,9 @@ func (e moveEvaluator) evaluate(ctx context.Context, nodes []*Candidate) (*score
 	if cmd.Decision() == NoOpDecision || len(cmd.Replacements) > 1 {
 		return nil, nil
 	}
-	return &scoredCommand{Command: cmd, Score: scoreMove(cmd, e.inputs)}, nil
+	score := scoreMove(cmd, e.inputs)
+	cmd.scoreSavings = &score.Savings
+	return &scoredCommand{Command: cmd, Score: score}, nil
 }
 
 func classifyEvaluation(s *scoredCommand, err error) string {

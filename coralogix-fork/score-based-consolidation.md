@@ -73,6 +73,8 @@ Each move's **savings** are the source nodes' hourly prices minus the estimated 
 
 `DisruptionBlocked` events are deduplicated for one minute.
 
+The savings in `ConsolidationCandidate` and `ConsolidationRejected` messages and in the `disrupting node(s)` log are the move's savings as defined above, including reactivated standby nodes. The `disrupting node(s)` log of standby marking shows no savings, since marking removes no node.
+
 ## Metrics
 
 Upstream disruption metrics are filled with `consolidation_type="score-based"`:

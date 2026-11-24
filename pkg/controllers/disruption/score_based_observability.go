@@ -18,6 +18,7 @@ package disruption
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"slices"
 	"time"
@@ -172,4 +173,20 @@ func commandLog(kind moveKind, cmd Command, score moveScore, validation string) 
 		}
 	}
 	return map[string]interface{}{"kind": kind, "sources": sources, "newNode": newNode, "reactivatedStandbyNodes": destinations, "score": score, "validation": validation}
+}
+
+func (c Command) savingsSuffix() string {
+	if c.Decision() == StandbyDecision {
+		return ""
+	}
+	return fmt.Sprintf(" (savings: $%.2f)", c.reportedSavings())
+}
+
+// reportedSavings is the savings a command reports in its string and events: a score-based move's score savings, which
+// include reactivated standby nodes, otherwise upstream's EstimatedSavings.
+func (c Command) reportedSavings() float64 {
+	if c.scoreSavings != nil {
+		return *c.scoreSavings
+	}
+	return c.EstimatedSavings()
 }
