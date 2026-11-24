@@ -92,12 +92,13 @@ func countMoveEvaluation(result string) {
 	ScoreBasedMoveEvaluationsTotal.Inc(map[string]string{moveEvaluationResultLabel: result})
 }
 
-func logScoreDecision(ctx context.Context, choice moveChoice, stats searchStats, candidates, eligible int, budgetBlockedPools, pacingBlockedPools []string, duration time.Duration) {
+func logScoreDecision(ctx context.Context, choice moveChoice, stats searchStats, filtered filteredCandidates, duration time.Duration) {
 	fields := []interface{}{
-		"eligibleCandidates", eligible, "evaluatedMoves", stats.Evaluated, "keptMoves", len(choice.Kept),
+		"eligibleCandidates", len(filtered.Eligible), "pacingHeldCandidates", filtered.PacingHeld, "budgetBlockedCandidates", filtered.BudgetBlocked,
+		"evaluatedMoves", stats.Evaluated, "keptMoves", len(choice.Kept),
 		"simulationErrors", stats.Errors, "noOp", stats.NoOp, "noSavings", stats.NoSavings, "nonPositiveScore", stats.NonPositiveScore,
 		"pairsEvaluated", stats.PairsEvaluated, "deadlineHit", stats.TimedOut, "duration", duration,
-		"budgetBlockedNodePools", budgetBlockedPools, "pacingBlockedNodePools", pacingBlockedPools,
+		"budgetBlockedNodePools", filtered.BudgetBlockedPools, "pacingBlockedNodePools", filtered.PacingBlockedPools,
 	}
 	validationFailures := map[string]int{}
 	for _, m := range choice.Kept {
@@ -126,12 +127,15 @@ func logScoreDecision(ctx context.Context, choice moveChoice, stats searchStats,
 	for _, m := range choice.Kept[:min(len(choice.Kept), loggedMovesLimit)] {
 		rejected = append(rejected, moveLog(m))
 	}
-	fields = append(fields, "reason", noMoveReason(len(choice.Kept), stats, candidates, eligible), "rejectedMoves", rejected)
+	fields = append(fields, "reason", noMoveReason(len(choice.Kept), stats, filtered), "rejectedMoves", rejected)
 	log.FromContext(ctx).Info("score-based consolidation found no move", fields...)
 }
 
 // noMoveReason assumes kept moves were all validated, since a pass that errors before validating them logs nothing.
-func noMoveReason(kept int, stats searchStats, candidates, eligible int) string {
+// Budgets and pacing explain a pass only when its search finished cleanly and found nothing among the candidates they
+// left; errors, validation rejections and timeouts are more direct causes. Budgets go first because they are applied
+// first and are the hard limit.
+func noMoveReason(kept int, stats searchStats, filtered filteredCandidates) string {
 	switch {
 	case stats.Errors > 0:
 		return "simulation_error"
@@ -139,10 +143,12 @@ func noMoveReason(kept int, stats searchStats, candidates, eligible int) string 
 		return "all_rejected_by_validation"
 	case stats.TimedOut:
 		return "timed_out"
-	case candidates == 0:
+	case filtered.BudgetBlocked > 0:
+		return "blocked_by_budget"
+	case filtered.PacingHeld > 0:
+		return "held_by_pacing"
+	case len(filtered.Eligible) == 0:
 		return "no_candidates"
-	case eligible == 0:
-		return "blocked_by_budget_or_pacing"
 	case stats.NonPositiveScore > 0:
 		return "no_positive_score_move"
 	}
