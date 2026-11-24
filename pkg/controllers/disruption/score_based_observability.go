@@ -44,6 +44,8 @@ const (
 	moveEvaluationError            = "error"
 
 	moveKindLabel = "kind"
+
+	loggedMovesLimit = 3
 )
 
 type moveKind string
@@ -97,28 +99,34 @@ func logScoreDecision(ctx context.Context, choice moveChoice, stats searchStats,
 		"pairsEvaluated", stats.PairsEvaluated, "deadlineHit", stats.TimedOut, "duration", duration,
 		"budgetBlockedNodePools", budgetBlockedPools, "pacingBlockedNodePools", pacingBlockedPools,
 	}
-	failedValidation := 0
+	validationFailures := map[string]int{}
 	for _, m := range choice.Kept {
 		if m.validationRejected() {
-			failedValidation++
+			validationFailures[m.validationFailureReason()]++
 		}
 	}
+	fields = append(fields, "validationAttempts", len(choice.Kept), "validationFailures", validationFailures)
 	if choice.Chosen.Move != nil {
 		alternatives := []map[string]interface{}{}
 		for _, other := range choice.Kept {
 			// The kept move a chosen batch move was built from is an alternative.
-			if (other != choice.Chosen.Move || choice.Chosen.Kind == moveKindBatch) && len(alternatives) < 3 {
+			if (other != choice.Chosen.Move || choice.Chosen.Kind == moveKindBatch) && len(alternatives) < loggedMovesLimit {
 				alternatives = append(alternatives, moveLog(other))
 			}
 		}
-		fields = append(fields, "move", chosenMoveLog(choice.Chosen), "rank", choice.rank(), "searchScore", choice.Chosen.Move.SearchScore.Total, "rescoredScore", choice.Chosen.Score.Total, "failedValidation", failedValidation, "alternatives", alternatives, "validationAttempts", len(choice.Kept))
+		fields = append(fields, "move", chosenMoveLog(choice.Chosen), "rank", choice.rank(), "searchScore", choice.Chosen.Move.SearchScore.Total, "rescoredScore", choice.Chosen.Score.Total, "alternatives", alternatives)
 		if choice.Chosen.Kind == moveKindBatch {
 			fields = append(fields, "batchSimulations", choice.BatchMoves.JointSimulations, "batchesGrown", len(choice.BatchMoves.Moves))
 		}
 		log.FromContext(ctx).Info("score-based consolidation move selected", fields...)
 		return
 	}
-	fields = append(fields, "reason", noMoveReason(len(choice.Kept), stats, candidates, eligible), "validationAttempts", len(choice.Kept))
+	// With no move chosen, every kept move was rejected by validation.
+	rejected := []map[string]interface{}{}
+	for _, m := range choice.Kept[:min(len(choice.Kept), loggedMovesLimit)] {
+		rejected = append(rejected, moveLog(m))
+	}
+	fields = append(fields, "reason", noMoveReason(len(choice.Kept), stats, candidates, eligible), "rejectedMoves", rejected)
 	log.FromContext(ctx).Info("score-based consolidation found no move", fields...)
 }
 

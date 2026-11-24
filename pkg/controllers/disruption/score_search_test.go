@@ -281,8 +281,8 @@ func TestChooseMove_pairRescoredOntoTwoNewNodesFailsWithScheduling(t *testing.T)
 
 	chosen := chooseMove(moveEvaluator{compute: pairsOnto(2), inputs: testScoreInputs(sourcesOf([]*move{pair}))}, events.NewRecorder(record.NewFakeRecorder(10)), []*move{pair}, nil)
 
-	if chosen.Move != nil || pair.validationText() != "failed: scheduling" {
-		t.Fatalf("chose %+v, validation %q, want no move and failed: scheduling", chosen, pair.validationText())
+	if chosen.Move != nil || pair.validationFailureReason() != "scheduling" {
+		t.Fatalf("chose %+v, validation failure %q, want no move and scheduling", chosen, pair.validationFailureReason())
 	}
 }
 

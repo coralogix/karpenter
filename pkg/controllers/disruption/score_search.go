@@ -18,6 +18,7 @@ package disruption
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"runtime"
 	"slices"
@@ -47,6 +48,7 @@ type move struct {
 	ValidationScore moveScore
 	Validation      validationStatus
 	FailureReason   string
+	FailureMessage  string
 }
 
 type validationStatus int
@@ -66,10 +68,13 @@ func (m *move) validationRejected() bool {
 }
 
 func (m *move) validationText() string {
-	if m.validationRejected() {
-		return "failed: " + m.validationFailureReason()
+	switch {
+	case !m.validationRejected():
+		return "passed"
+	case m.FailureMessage != "":
+		return fmt.Sprintf("failed: %s (%s)", m.validationFailureReason(), m.FailureMessage)
 	}
-	return "passed"
+	return "failed: " + m.validationFailureReason()
 }
 
 // failedValidation is a rejection by validation itself, not an error while simulating during it.
