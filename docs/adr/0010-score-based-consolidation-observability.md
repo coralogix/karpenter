@@ -21,6 +21,7 @@ Metrics reuse upstream disruption metrics with `consolidation_type="score-based"
 - `karpenter_nodeclaims_evacuated_total{nodepool, capacity_type}`, because evacuations delete nothing and so never appear in `nodeclaims_disrupted_total`;
 - `karpenter_voluntary_disruption_evacuation_duration_seconds{outcome}`;
 - `karpenter_nodes_standby_reactivated_total{nodepool, source}`, where the caller that clears standby supplies `source`, so nothing is stored on the node (ADR-0001);
+- `karpenter_nodes_standby_duration_seconds{nodepool, outcome}`, observed once when a node leaves standby: when it is reactivated, when standby is repaired, or when a reclamation command succeeds, measured up to when that command started. A failed reclamation records nothing, so a node it leaves on standby is not recorded twice. Nodes deleted by other methods are not recorded;
 - `karpenter_nodepools_standby_nodes{nodepool}`.
 
 Tracing has one span per disruption controller pass, with a child span for each method and its outcome. The score-based method's span contains the search phases, the validation wait, validation, and batch growth.

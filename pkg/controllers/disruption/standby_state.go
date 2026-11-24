@@ -28,6 +28,7 @@ import (
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
@@ -89,7 +90,10 @@ func repairStandbyNode(ctx context.Context, kubeClient client.Client, recorder e
 		return nil
 	}
 	clearStandby := func() error {
-		_, err := standby.Clear(ctx, kubeClient, node.Node)
+		cleared, err := standby.Clear(ctx, kubeClient, node.Node)
+		if cleared {
+			provisioning.ObserveStandbyDuration(node.Node, provisioning.StandbyOutcomeRepaired, clk.Now())
+		}
 		return err
 	}
 	if !standby.HasStandbyTaint(node.Node) {

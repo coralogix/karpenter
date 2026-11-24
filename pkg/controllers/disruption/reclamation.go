@@ -23,6 +23,7 @@ import (
 	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
@@ -91,4 +92,16 @@ func candidateReadyForReclamation(cluster *state.Cluster, recorder events.Record
 // reclamationDelay returns how long a node must stay in standby before reclamation may delete it.
 func reclamationDelay(np *v1.NodePool, recorder events.Recorder) time.Duration {
 	return readDurationAnnotation(np, recorder, v1.ReclamationDelayAnnotationKey, defaultReclamationDelay, events.InvalidReclamationDelay)
+}
+
+// observeReclaimedStandby records, once a reclamation command has succeeded, the standby duration of every node it
+// deleted, up to when the command started. A failed command leaves its nodes on standby, so they are recorded when they
+// later leave it.
+func observeReclaimedStandby(cmd *Command) {
+	if _, ok := cmd.Method.(*Reclamation); !ok || !cmd.Succeeded {
+		return
+	}
+	for _, c := range cmd.Candidates {
+		provisioning.ObserveStandbyDuration(c.Node, provisioning.StandbyOutcomeReclaimed, cmd.CreationTimestamp)
+	}
 }

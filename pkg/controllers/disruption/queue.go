@@ -178,6 +178,7 @@ func (q *Queue) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reconci
 		cmd.Succeeded = true
 	}
 	observeEvacuationDuration(cmd, q.clock)
+	observeReclaimedStandby(cmd)
 	q.CompleteCommand(cmd)
 	return reconcile.Result{}, nil
 }
