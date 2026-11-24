@@ -42,7 +42,7 @@ Empty nodes are tainted `karpenter.coralogix.net/standby:NoSchedule` and annotat
 
 ### Reactivation
 
-A standby node counts as existing capacity for provisioning and disruption. If a scheduling result places pods on it, Karpenter clears the standby marks so the pods can bind, instead of launching a new node.
+A standby node counts as existing capacity for provisioning and disruption. If a scheduling result places pods on it, Karpenter clears the standby marks so the pods can bind, instead of launching a new node. Scheduling tries active nodes before standby nodes, and standby nodes cheapest first, so a pod reactivates a standby node only when no active node fits it, and then the cheapest standby node that fits. Upstream orders existing nodes by name; this fork keeps that order among active nodes and among standby nodes of the same price.
 
 ### Evacuation
 

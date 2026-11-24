@@ -909,7 +909,7 @@ func (s *Scheduler) sortExistingNodes() {
 	// This is done specifically for consolidation where we want to make sure we schedule to initialized nodes
 	// before we attempt to schedule uninitialized ones
 	sort.SliceStable(s.existingNodes, func(i, j int) bool {
-		return existingNodeLess(s.existingNodes[i].StateNode, s.existingNodes[j].StateNode)
+		return existingNodeLess(s.existingNodes[i].StateNode, s.existingNodes[i].Price, s.existingNodes[j].StateNode, s.existingNodes[j].Price)
 	})
 }
 
@@ -989,12 +989,22 @@ func volumeZoneReq(volumeReqs []scheduling.Requirements) *scheduling.Requirement
 
 }
 
-func existingNodeLess(lhs, rhs *state.StateNode) bool {
+// existingNodeLess puts initialized nodes first. After that, active nodes go before standby nodes, so pods reactivate a
+// standby node only when no active node fits them, and standby nodes go cheapest first, so pods reactivate the cheapest
+// standby node that fits.
+func existingNodeLess(lhs *state.StateNode, lhsPrice float64, rhs *state.StateNode, rhsPrice float64) bool {
 	if lhs.Initialized() && !rhs.Initialized() {
 		return true
 	}
 	if !lhs.Initialized() && rhs.Initialized() {
 		return false
+	}
+	lhsStandby, rhsStandby := standby.HasStandbyTaint(lhs.Node), standby.HasStandbyTaint(rhs.Node)
+	if lhsStandby != rhsStandby {
+		return rhsStandby
+	}
+	if lhsStandby && lhsPrice != rhsPrice {
+		return lhsPrice < rhsPrice
 	}
 	return lhs.Name() < rhs.Name()
 
