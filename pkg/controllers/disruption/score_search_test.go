@@ -137,8 +137,8 @@ func TestInvalidUtilizationWeightWarnsOnce(t *testing.T) {
 		moves, _ := newTestSearch(moveEvaluator{compute: func(_ context.Context, c ...*Candidate) (Command, error) {
 			return Command{Candidates: c}, nil
 		}, inputs: inputs}).simulate(context.Background(), sources)
-		if len(moves) != 1 || moves[0].SearchScore.Total != 2 {
-			t.Fatalf("evaluations = %+v, want score 2 using default weight", moves)
+		if len(moves) != 1 || moves[0].SearchScore.Total != 1+defaultUtilizationWeight {
+			t.Fatalf("evaluations = %+v, want score %g using default weight", moves, 1+defaultUtilizationWeight)
 		}
 	}
 

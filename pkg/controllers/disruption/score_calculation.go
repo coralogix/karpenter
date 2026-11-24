@@ -33,7 +33,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/utils/standby"
 )
 
-const defaultUtilizationWeight = 1.0
+const defaultUtilizationWeight = 0.25
 
 // savingsTolerance is the hourly dollar amount below which savings are float rounding noise, not money. Prices carry at
 // most a few decimal places, while rounding error on sums of hourly prices stays many orders of magnitude below this.

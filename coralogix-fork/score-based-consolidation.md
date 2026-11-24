@@ -20,7 +20,7 @@ spec:
 | Annotation | Meaning |
 |------------|---------|
 | `karpenter.coralogix.net/score-based-consolidation` | Opts the NodePool in (presence is enough; value is ignored). |
-| `karpenter.coralogix.net/utilization-weight` | How much unused CPU counts in the score. Default **1**; anything other than a positive number falls back to the default and raises an event on the NodePool. |
+| `karpenter.coralogix.net/utilization-weight` | How much unused CPU counts in the score. Default **0.25**; anything other than a positive number falls back to the default and raises an event on the NodePool. |
 | `karpenter.coralogix.net/reclamation-delay` | How long a node stays on standby before it may be deleted. Default **15s**. |
 | `karpenter.coralogix.net/evacuation-timeout` | How long an evacuation may run before it is abandoned. Default **5m**. A move whose sources span NodePools uses the shortest. |
 

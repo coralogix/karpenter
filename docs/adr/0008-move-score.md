@@ -23,7 +23,7 @@ Issues that stem from zero prices are deliberately ignored. For example, a zero-
 
 | NodePool annotation (`karpenter.coralogix.net/…`) | Default | Valid |
 |---|---|---|
-| `utilization-weight` | 1 | finite, > 0 |
+| `utilization-weight` | 0.25 | finite, > 0 |
 | `memory-surplus` | 0.2 | finite, ≥ 0 |
 | `memory-balance-weight` | 0 (term off) | finite, ≥ 0 |
 | `instance-type-concentration-threshold` | 0.5 | finite, in `[0, 1)` |
