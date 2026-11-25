@@ -19,18 +19,22 @@ package disruption
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
-	"sync"
+
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/clock"
+	clocktesting "k8s.io/utils/clock/testing"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
@@ -126,61 +130,14 @@ func TestScoreBasedConsolidationValidatorFilter(t *testing.T) {
 	}
 }
 
-func TestMoveSetSearchStats(t *testing.T) {
-	stats := &moveSetSearchStats{}
-
-	stats.record(100*time.Millisecond, nil)
-	stats.record(300*time.Millisecond, fmt.Errorf("compute failed"))
-	stats.record(200*time.Millisecond, nil)
-
-	if got := stats.avg(); got != 200*time.Millisecond {
-		t.Fatalf("avg = %v, want %v", got, 200*time.Millisecond)
-	}
-	if got := stats.maxDuration(); got != 300*time.Millisecond {
-		t.Fatalf("max = %v, want %v", got, 300*time.Millisecond)
-	}
-	if got := stats.errorCount(); got != 1 {
-		t.Fatalf("errors = %d, want 1", got)
-	}
-
-	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func(d time.Duration) {
-			defer wg.Done()
-			stats.record(d, nil)
-		}(time.Duration(i+1) * time.Millisecond)
-	}
-	wg.Wait()
-
-	if got := stats.maxDuration(); got != 300*time.Millisecond {
-		t.Fatalf("max after concurrent records = %v, want %v", got, 300*time.Millisecond)
-	}
-	if got := stats.errorCount(); got != 1 {
-		t.Fatalf("errors after concurrent records = %d, want 1", got)
-	}
-}
-
-func TestMoveSetPriorityScore(t *testing.T) {
-	lowPriceCandidate := candidateWithPrice(t, 0.10)
-	highPriceCandidate := candidateWithPrice(t, 0.50)
-
-	if got := moveSetPriorityScore(moveSet{Nodes: []*Candidate{lowPriceCandidate}}); got != 0.10 {
-		t.Fatalf("single-node move set score = %v, want 0.10", got)
-	}
-	if got := moveSetPriorityScore(moveSet{Nodes: []*Candidate{lowPriceCandidate, highPriceCandidate}}); got != 0.50 {
-		t.Fatalf("multi-node move set score = %v, want 0.50", got)
-	}
-}
-
-func TestEvaluateMoveSetsPar_respectsOrder(t *testing.T) {
+func TestSearchMoves_ranksSavings(t *testing.T) {
 	ctx := context.Background()
-	moveSets := make([]moveSet, 2)
+	sources := make([][]*Candidate, 2)
 	delays := []time.Duration{50 * time.Millisecond, 5 * time.Millisecond}
-	for i := range moveSets {
-		candidate := candidateWithPrice(t, 0.10)
+	for i := range sources {
+		candidate := candidateWithPrice(t, float64(i+1))
 		candidate.NodePool = &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: strconv.Itoa(i)}}
-		moveSets[i] = moveSet{Nodes: []*Candidate{candidate}}
+		sources[i] = []*Candidate{candidate}
 	}
 
 	compute := func(ctx context.Context, candidates ...*Candidate) (Command, error) {
@@ -196,28 +153,26 @@ func TestEvaluateMoveSetsPar_respectsOrder(t *testing.T) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	winner, evaluated, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(time.Second), compute)
-	if err != nil {
-		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
-	}
+	winner, stats := searchMoves(ctx, sources, time.Now().Add(time.Second), compute, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	evaluated := stats.Evaluated
 	if len(winner) != 2 {
 		t.Fatalf("evaluations = %d, want 2", len(winner))
 	}
-	if winner[0].Command.Candidates[0].NodePool.Name != "0" {
-		t.Fatalf("first evaluation index = %q, want %q", winner[0].Command.Candidates[0].NodePool.Name, "0")
+	if winner[0].Command.Candidates[0].NodePool.Name != "1" {
+		t.Fatalf("first evaluation index = %q, want %q", winner[0].Command.Candidates[0].NodePool.Name, "1")
 	}
-	if winner[1].Command.Candidates[0].NodePool.Name != "1" {
-		t.Fatalf("second evaluation index = %q, want %q", winner[1].Command.Candidates[0].NodePool.Name, "1")
+	if winner[1].Command.Candidates[0].NodePool.Name != "0" {
+		t.Fatalf("second evaluation index = %q, want %q", winner[1].Command.Candidates[0].NodePool.Name, "0")
 	}
 	if evaluated != 2 {
 		t.Fatalf("evaluated = %d, want 2", evaluated)
 	}
 }
 
-func TestEvaluateMoveSetsPar_stopsOnDeadline(t *testing.T) {
+func TestSearchMoves_stopsOnDeadline(t *testing.T) {
 	ctx := context.Background()
 	candidate := candidateWithPrice(t, 0.10)
-	moveSets := []moveSet{{Nodes: []*Candidate{candidate}}, {Nodes: []*Candidate{candidate}}}
+	sources := [][]*Candidate{[]*Candidate{candidate}, []*Candidate{candidate}}
 
 	compute := func(ctx context.Context, candidates ...*Candidate) (Command, error) {
 		select {
@@ -228,42 +183,41 @@ func TestEvaluateMoveSetsPar_stopsOnDeadline(t *testing.T) {
 		}
 	}
 
-	winner, evaluated, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(-time.Millisecond), compute)
-	if err != nil {
-		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
-	}
+	winner, stats := searchMoves(ctx, sources, time.Now().Add(-time.Millisecond), compute, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	evaluated := stats.Evaluated
 	if len(winner) != 0 {
 		t.Fatalf("evaluations = %d, want 0", len(winner))
 	}
 	if evaluated != 0 {
 		t.Fatalf("evaluated = %d, want 0", evaluated)
 	}
+	if !stats.TimedOut {
+		t.Fatal("expected stats.TimedOut")
+	}
 }
 
-func TestEvaluateMoveSetsPar_stopsAfterNValidEvaluations(t *testing.T) {
+func TestSearchMoves_keepsTenBest(t *testing.T) {
 	ctx := context.Background()
-	moveSets := make([]moveSet, 12)
-	for i := range moveSets {
-		candidate := candidateWithPrice(t, 0.10)
+	sources := make([][]*Candidate, 12)
+	for i := range sources {
+		candidate := candidateWithPrice(t, float64(i+1))
 		candidate.NodePool = &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: strconv.Itoa(i)}}
-		moveSets[i] = moveSet{Nodes: []*Candidate{candidate}}
+		sources[i] = []*Candidate{candidate}
 	}
 
 	compute := func(_ context.Context, candidates ...*Candidate) (Command, error) {
 		return Command{Candidates: candidates}, nil
 	}
 
-	evals, evaluated, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(time.Second), compute)
-	if err != nil {
-		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
+	moves, stats := searchMoves(ctx, sources, time.Now().Add(time.Second), compute, rand.New(rand.NewSource(1)), clock.RealClock{}) //nolint:gosec
+	evaluated := stats.Evaluated
+	if len(moves) != scoreBasedValidEvaluationsTarget {
+		t.Fatalf("evaluations = %d, want %d", len(moves), scoreBasedValidEvaluationsTarget)
 	}
-	if len(evals) != scoreBasedValidEvaluationsTarget {
-		t.Fatalf("evaluations = %d, want %d", len(evals), scoreBasedValidEvaluationsTarget)
-	}
-	for i, eval := range evals {
-		want := strconv.Itoa(i)
-		if eval.Command.Candidates[0].NodePool.Name != want {
-			t.Fatalf("evaluation[%d] index = %q, want %q", i, eval.Command.Candidates[0].NodePool.Name, want)
+	for i, m := range moves {
+		want := strconv.Itoa(11 - i)
+		if m.Command.Candidates[0].NodePool.Name != want {
+			t.Fatalf("evaluation[%d] index = %q, want %q", i, m.Command.Candidates[0].NodePool.Name, want)
 		}
 	}
 	if evaluated < scoreBasedValidEvaluationsTarget {
@@ -271,48 +225,129 @@ func TestEvaluateMoveSetsPar_stopsAfterNValidEvaluations(t *testing.T) {
 	}
 }
 
-func TestEvaluateMoveSetsPar_returnsPartialOnTimeout(t *testing.T) {
+func TestSearchMoves_returnsPartialOnTimeout(t *testing.T) {
+	orig := scoreBasedSearchParallelism
+	scoreBasedSearchParallelism = 1
+	t.Cleanup(func() { scoreBasedSearchParallelism = orig })
+
+	fakeClock := clocktesting.NewFakeClock(time.Now())
+	deadline := fakeClock.Now().Add(100 * time.Millisecond)
 	ctx := context.Background()
-	moveSets := make([]moveSet, 3)
-	for i := range moveSets {
-		candidate := candidateWithPrice(t, 0.10)
+	sources := make([][]*Candidate, 3)
+	for i := range sources {
+		candidate := candidateWithPrice(t, float64(i+1))
 		candidate.NodePool = &v1.NodePool{ObjectMeta: metav1.ObjectMeta{Name: strconv.Itoa(i)}}
-		moveSets[i] = moveSet{Nodes: []*Candidate{candidate}}
+		sources[i] = []*Candidate{candidate}
 	}
 
-	compute := func(ctx context.Context, candidates ...*Candidate) (Command, error) {
-		idx, err := strconv.Atoi(candidates[0].NodePool.Name)
-		if err != nil {
-			t.Fatalf("unexpected move set index: %v", err)
-		}
-		delay := time.Millisecond
-		if idx > 0 {
-			delay = time.Second
-		}
-		select {
-		case <-time.After(delay):
-		case <-ctx.Done():
-			return Command{}, ctx.Err()
+	compute := func(_ context.Context, candidates ...*Candidate) (Command, error) {
+		if fakeClock.Now().Before(deadline) {
+			fakeClock.Step(200 * time.Millisecond)
 		}
 		return Command{Candidates: candidates}, nil
 	}
 
-	evals, evaluated, err := evaluateMoveSetsPar(ctx, moveSets, time.Now().Add(100*time.Millisecond), compute)
-	if err != nil {
-		t.Fatalf("evaluateMoveSetsPar() error = %v", err)
+	moves, stats := searchMoves(ctx, sources, deadline, compute, rand.New(rand.NewSource(1)), fakeClock) //nolint:gosec
+	if !stats.TimedOut {
+		t.Fatal("expected stats.TimedOut")
 	}
-	if len(evals) != 1 {
-		t.Fatalf("evaluations = %d, want 1", len(evals))
+	if stats.Evaluated == 0 || stats.Evaluated >= len(sources) {
+		t.Fatalf("evaluated = %d, want partial progress on %d moves", stats.Evaluated, len(sources))
 	}
-	if evals[0].Command.Candidates[0].NodePool.Name != "0" {
-		t.Fatalf("evaluation index = %q, want %q", evals[0].Command.Candidates[0].NodePool.Name, "0")
-	}
-	if evaluated != 1 {
-		t.Fatalf("evaluated = %d, want 1", evaluated)
+	if len(moves) == 0 {
+		t.Fatal("expected at least one kept evaluation")
 	}
 }
 
-func TestSelectFirstValidatedCommand_validationFallback(t *testing.T) {
+func TestSelectBestRescoredCommand_prefersHigherRescoredSavings(t *testing.T) {
+	ctx := context.Background()
+	recorder := events.NewRecorder(record.NewFakeRecorder(10))
+	highSearch := candidateWithPrice(t, 10)
+	highSearch.Node.Name = "high-search"
+	lowSearch := candidateWithPrice(t, 5)
+	lowSearch.Node.Name = "low-search"
+	moves := []*move{
+		{
+			Command: Command{
+				Candidates: []*Candidate{highSearch},
+				Results:    pscheduling.Results{ExistingNodes: standbyReactivationResults("standby-expensive", 1)},
+			},
+			SearchScore: moveScore{Savings: 9},
+		},
+		{
+			Command:     Command{Candidates: []*Candidate{lowSearch}},
+			SearchScore: moveScore{Savings: 5},
+		},
+	}
+	validator := rescoreTestValidator{
+		byCandidate: map[string]pscheduling.Results{
+			"high-search": {ExistingNodes: standbyReactivationResults("standby-costly", 6)},
+			"low-search":  {ExistingNodes: standbyReactivationResults("standby-cheap", 0.01)},
+		},
+	}
+
+	cmd, err := selectBestRescoredCommand(ctx, validator, recorder, moves)
+	if err != nil {
+		t.Fatalf("selectBestRescoredCommand() error = %v", err)
+	}
+	if cmd.Candidates[0].Name() != "low-search" {
+		t.Fatalf("chosen candidate = %q, want low-search", cmd.Candidates[0].Name())
+	}
+	if got := cmd.Results.ExistingNodes[0].Name(); got != "standby-cheap" {
+		t.Fatalf("executed standby = %q, want standby-cheap", got)
+	}
+	if moves[0].Selected || !moves[1].Selected {
+		t.Fatal("expected only low-search move to be selected after rescoring")
+	}
+	if moves[1].ValidationScore.Savings <= moves[0].ValidationScore.Savings {
+		t.Fatalf("low-search rescored score = %v, want greater than high-search score %v", moves[1].ValidationScore.Savings, moves[0].ValidationScore.Savings)
+	}
+}
+
+func TestSelectBestRescoredCommand_rejectsNonPositiveRescoredSavings(t *testing.T) {
+	ctx := context.Background()
+	recorder := events.NewRecorder(record.NewFakeRecorder(10))
+	candidate := candidateWithPrice(t, 0.10)
+	candidate.Node.Name = "source"
+	moves := []*move{{
+		Command: Command{
+			Candidates: []*Candidate{candidate},
+			Results:    pscheduling.Results{ExistingNodes: standbyReactivationResults("standby-a", 0.10)},
+		},
+		SearchScore: moveScore{Savings: 0.10},
+	}}
+	validator := rescoreTestValidator{byCandidate: map[string]pscheduling.Results{"source": moves[0].Command.Results}}
+
+	cmd, err := selectBestRescoredCommand(ctx, validator, recorder, moves)
+	if err != nil {
+		t.Fatalf("selectBestRescoredCommand() error = %v", err)
+	}
+	if len(cmd.Candidates) != 0 {
+		t.Fatalf("command candidates = %d, want 0", len(cmd.Candidates))
+	}
+	if moves[0].Validation != validationNoSavings {
+		t.Fatalf("validation = %q, want failed: no_savings", moves[0].validationText())
+	}
+}
+
+type rescoreTestValidator struct {
+	byCandidate map[string]pscheduling.Results
+}
+
+func (v rescoreTestValidator) Validate(_ context.Context, cmd Command, _ time.Duration) (Command, error) {
+	if len(cmd.Candidates) == 0 {
+		return Command{}, nil
+	}
+	name := cmd.Candidates[0].Name()
+	results, ok := v.byCandidate[name]
+	if !ok {
+		return cmd, nil
+	}
+	cmd.Results = results
+	return cmd, nil
+}
+
+func TestSelectBestRescoredCommand_validationFallback(t *testing.T) {
 	ctx := context.Background()
 	fakeRecorder := record.NewFakeRecorder(10)
 	recorder := events.NewRecorder(fakeRecorder)
@@ -322,15 +357,15 @@ func TestSelectFirstValidatedCommand_validationFallback(t *testing.T) {
 	lowScoreCandidate := candidateWithPrice(t, 0.10)
 	lowScoreCandidate.Node.Name = "low-score"
 	lowScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "low-score"}}
-	evals := []*moveSetEvaluation{
-		{Command: Command{Candidates: []*Candidate{highScoreCandidate}}, Score: 0.50},
-		{Command: Command{Candidates: []*Candidate{lowScoreCandidate}}, Score: 0.10},
+	moves := []*move{
+		{Command: Command{Candidates: []*Candidate{highScoreCandidate}}, SearchScore: moveScore{Savings: 0.50}},
+		{Command: Command{Candidates: []*Candidate{lowScoreCandidate}}, SearchScore: moveScore{Savings: 0.10}},
 	}
 	validator := rejectFirstCommandValidator{}
 
-	cmd, err := selectFirstStillValidCommand(ctx, validator, recorder, evals)
+	cmd, err := selectBestRescoredCommand(ctx, validator, recorder, moves)
 	if err != nil {
-		t.Fatalf("selectFirstValidatedCommand() error = %v", err)
+		t.Fatalf("selectBestRescoredCommand() error = %v", err)
 	}
 	if len(cmd.Candidates) != 1 {
 		t.Fatalf("command candidates = %d, want 1", len(cmd.Candidates))
@@ -343,7 +378,7 @@ func TestSelectFirstValidatedCommand_validationFallback(t *testing.T) {
 	}
 }
 
-func TestSelectFirstValidatedCommand_emitsRejectedEventOnlyForFirstEvalWhenAllFail(t *testing.T) {
+func TestSelectBestRescoredCommand_emitsRejectedEventOnlyForFirstEvalWhenAllFail(t *testing.T) {
 	ctx := context.Background()
 	fakeRecorder := record.NewFakeRecorder(10)
 	recorder := events.NewRecorder(fakeRecorder)
@@ -353,14 +388,14 @@ func TestSelectFirstValidatedCommand_emitsRejectedEventOnlyForFirstEvalWhenAllFa
 	lowScoreCandidate := candidateWithPrice(t, 0.10)
 	lowScoreCandidate.Node.Name = "low-score"
 	lowScoreCandidate.NodeClaim = &v1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "low-score"}}
-	evals := []*moveSetEvaluation{
-		{Command: Command{Candidates: []*Candidate{highScoreCandidate}}, Score: 0.50},
-		{Command: Command{Candidates: []*Candidate{lowScoreCandidate}}, Score: 0.10},
+	moves := []*move{
+		{Command: Command{Candidates: []*Candidate{highScoreCandidate}}, SearchScore: moveScore{Savings: 0.50}},
+		{Command: Command{Candidates: []*Candidate{lowScoreCandidate}}, SearchScore: moveScore{Savings: 0.10}},
 	}
 
-	cmd, err := selectFirstStillValidCommand(ctx, rejectAllCommandValidator{}, recorder, evals)
+	cmd, err := selectBestRescoredCommand(ctx, rejectAllCommandValidator{}, recorder, moves)
 	if err != nil {
-		t.Fatalf("selectFirstValidatedCommand() error = %v", err)
+		t.Fatalf("selectBestRescoredCommand() error = %v", err)
 	}
 	if len(cmd.Candidates) != 0 {
 		t.Fatalf("command candidates = %d, want 0", len(cmd.Candidates))
@@ -368,10 +403,10 @@ func TestSelectFirstValidatedCommand_emitsRejectedEventOnlyForFirstEvalWhenAllFa
 
 	rejectedEvents := collectFakeRecorderEvents(fakeRecorder)
 	if eventsMentioningNode(rejectedEvents, "low-score") {
-		t.Fatal("did not expect rejected events for fallback eval")
+		t.Fatal("did not expect rejected events for fallback move")
 	}
 	if !eventsMentioningNode(rejectedEvents, "high-score") {
-		t.Fatal("expected rejected events for the first eval when all validations fail")
+		t.Fatal("expected rejected events for the first move when all validations fail")
 	}
 }
 

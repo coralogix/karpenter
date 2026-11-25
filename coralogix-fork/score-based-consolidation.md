@@ -1,10 +1,8 @@
 # Score-based consolidation
 
-This fork adds an alternate consolidation disruption method for NodePools that opt in via annotation. It works like single-node consolidation except instead of sorting nodes by DisruptionCost it sorts them by `nodePriorityScore`, a search-guidance heuristic that ranks expensive, underused nodes higher (price divided by non-daemon pod CPU/memory requests).
+This fork adds an alternate consolidation disruption method for NodePools that opt in via annotation. It simulates single-node moves and ranks them by estimated hourly dollar savings. Empty nodes are not deleted right away; they go on **standby** and are reclaimed later.
 
 ## NodePool configuration
-
-You configure standby and score-based consolidation with **NodePool metadata annotations**. Set only the keys in this table; do not copy controller-written marks from a live node onto a NodePool.
 
 ```yaml
 apiVersion: karpenter.sh/v1
@@ -21,65 +19,40 @@ spec:
 
 | Annotation | Meaning |
 |------------|---------|
-| `karpenter.coralogix.net/score-based-consolidation` | Opt the NodePool into score-based consolidation (presence of the key is sufficient; value is ignored) |
-| `karpenter.coralogix.net/reclamation-delay` | Go duration a node must stay in standby before reclamation may delete it. Absent or invalid values default to **15s**. `0s` means no minimum age and no mandatory extra pass. Empty, malformed, or negative values raise an event on the NodePool. |
-| `karpenter.coralogix.net/evacuation-timeout` | Go duration an evacuation may run, counted from when the command starts (including any wait for a replacement), before it is abandoned. Absent or invalid values default to **5m**. `0s` means an immediate timeout. Empty, malformed, or negative values raise an event on the NodePool. |
+| `karpenter.coralogix.net/score-based-consolidation` | Opts the NodePool in (presence is enough; value is ignored). |
+| `karpenter.coralogix.net/reclamation-delay` | How long a node stays on standby before it may be deleted. Default **15s**. |
+| `karpenter.coralogix.net/evacuation-timeout` | How long an evacuation may run before it is abandoned. Default **5m**. |
 
-Both duration annotations accept zero literally and use their defaults for empty, malformed, or negative values. Choose a positive evacuation timeout to allow draining; `0s` causes every evacuation to be abandoned immediately.
+Both durations are Go durations. `0s` is taken literally; empty, malformed, or negative values fall back to the default and raise an event on the NodePool.
 
-## Standby and reclamation
+Optional [disruption pacing](disruption-pacing.md) annotations apply as well.
 
-On opted-in dynamic NodePools, empty nodes are marked **standby** instead of being deleted immediately. Standby marking and reclamation require `spec.disruption.consolidateAfter` to be set; if it is unset, they are disabled entirely even when the score-based annotation is present. **Reclamation** deletes a standby node after the reclamation delay if it is still standby and still empty. Reclamation uses the `Empty` disruption reason and `Empty` budgets; it is not disruption-paced. Standby marking evicts nothing and does not consume disruption budget.
+## How it works
 
-### Standby marks (set by Karpenter)
+Annotated NodePools are handled by the score-based method instead of standard emptiness, single-node and multi-node consolidation. Drift is unchanged and still uses the standard drift methods and `Drifted` budgets.
 
-When a node enters standby, Karpenter writes the marks below. **Do not set or edit these in manifests**; they are observability and control state on live Nodes. Reactivation and disruption repair clear them when the node leaves standby.
+### Standby and reclamation
 
-| Mark | Object | Set by | Meaning |
-|------|--------|--------|---------|
-| `karpenter.coralogix.net/standby:NoSchedule` | Node (taint) | Disruption | Ordinary pods cannot bind while the node is standby. |
-| `karpenter.coralogix.net/standby` | Node (annotation) | Disruption | Standby start time in **RFC3339Nano UTC** (for example `2026-10-27T11:00:00.123456789Z`). Reclamation compares this timestamp to the pool’s `reclamation-delay`. The value survives a Karpenter restart so time already spent in standby still counts. If the taint is present but the annotation is missing or not an RFC3339Nano timestamp, disruption backfills the timestamp with now. A positive delay starts from that timestamp. With zero delay, same-pass reclamation is permitted if the timestamp is visible in the cache, but is not guaranteed. |
+Empty nodes are tainted `karpenter.coralogix.net/standby:NoSchedule` and annotated with the time they entered standby, rather than deleted. Standby requires `spec.disruption.consolidateAfter` to be set. Karpenter manages these marks; do not set them in manifests. Marking evicts nothing and uses no disruption budget.
 
-Entering standby writes the taint (with no value) and timestamp together in one Node update; reactivation and repair clear both together. The taint determines whether a node is standby. Repair clears an annotation without a taint; it cannot make the node reclaimable. Later standby entry writes a fresh timestamp. Repair also clears standby when a reschedulable pod appears or the NodePool stops qualifying.
-
-To inspect standby state: `kubectl describe node <name>` for the taint, and `kubectl get node <name> -o jsonpath='{.metadata.annotations.karpenter\.coralogix\.net/standby}'` for the timestamp.
+**Reclamation** deletes a node that is still empty and has been on standby for `reclamation-delay`. It uses the `Empty` reason and budgets and is not paced.
 
 ### Reactivation
 
-Provisioning and disruption treat a standby node as existing capacity. When choosing where pods fit, the scheduling simulation ignores the standby taint and keeps every other taint, resource, affinity, and topology constraint. When Karpenter acts on a result that places pods on a standby node, it clears the taint and the timestamp so the pods can bind there, and does not launch a new node for them. This applies to provisioning, capacity-buffer pods, and every disruption method that moves pods (consolidation and drift included). A simulation that is not acted on leaves standby unchanged.
-
-- Disruption clears standby on its destinations before it taints the source nodes. If clearing fails, the command does not start and a later pass retries.
-- Nothing is reserved: once standby is cleared, any pod may bind. A node reactivated for a real pod is nominated for the usual nomination window, so standby marking does not hide it again before the pods arrive. Capacity-buffer pods do not nominate the node; buffer accounting keeps it from being marked standby again.
-- A restart during the nomination window may mark the node standby again; a later scheduling pass reactivates it.
+A standby node counts as existing capacity for provisioning and disruption. If a scheduling result places pods on it, Karpenter clears the standby marks so the pods can bind, instead of launching a new node.
 
 ### Evacuation
 
-On `WhenEmptyOrUnderutilized` and `Balanced` score-based pools, each evacuation moves workloads off one source node and leaves that node standby with its NodeClaim intact. The source receives the temporary disruption `NoSchedule` taint as soon as the command starts. If replacement capacity is needed, eviction waits until the replacement is initialized. Karpenter requests workload pod evictions about once a second until the node is empty, respecting PodDisruptionBudgets; daemon and mirror pods remain on the running node. Blocked evictions emit `FailedDraining` events on the source node.
+On `WhenEmptyOrUnderutilized` pools, the method picks the single-node move with the highest savings and evacuates that node: it is tainted, its workloads are evicted (respecting PodDisruptionBudgets, after any replacement is ready), and it is left on standby with its NodeClaim intact until it is reactivated or reclaimed. Evacuation uses `Underutilized` budgets and pacing. If the node is not empty within `evacuation-timeout`, the evacuation is abandoned and the node takes pods again.
 
-Once draining finishes, Karpenter writes the standby taint and timestamp before removing the temporary disruption taint. Both the source and any replacement remain until the source is reactivated or reclaimed. Evacuation continues to use `Underutilized` budgets and disruption pacing. `WhenEmpty` score-based pools only mark/reclaim empty nodes (no evacuation of nodes that still have pods).
-
-If the source is not empty within the NodePool's `evacuation-timeout`, the evacuation is abandoned: Karpenter stops evicting, removes the temporary disruption taint so the source takes pods again, and keeps any replacement. A later pass may select the node again.
-
-Nodes running a workload pod that tolerates `karpenter.sh/disrupted:NoSchedule` are not evacuated, because such a pod can be scheduled back onto the source during the drain.
-
-After a controller restart, the existing repair pass clears the temporary disruption taint for commands lost from memory. An already-empty source becomes standby on a later pass; a source still running workloads can be evacuated again.
-
-## Behavior
-
-- NodePools with the annotation are handled by the score-based consolidation method, which runs after multi-node consolidation and before single-node consolidation.
-- Annotated NodePools are excluded from emptiness, single-node consolidation, and multi-node consolidation.
-- Dynamic and static drift continue to use the standard drift methods and `Drifted` disruption budgets. Optional disruption pacing also limits drift candidates and shares the per-NodePool or group cooldown with consolidation.
-- The method reports `Underutilized` as its disruption reason for budget accounting. Empty nodes are handled by standby marking and reclamation instead of score-based consolidation or standard emptiness.
-- Candidates are sorted by `nodePriorityScore` descending (`price / workloadSize`, or `price` when the node is empty), then evaluated in priority order with up to `runtime.GOMAXPROCS` move sets in parallel. `workloadSize` is `cpu_cores + 0.125 × memory_gib` from non-daemon pod requests. Up to 10 valid commands with positive estimated savings are collected (or fewer on timeout), sorted by score, then the controller waits for any remaining consolidation TTL time since the pass started. The first command that still passes validation is executed. Each pass has a 20-second timeout (single-node consolidation keeps the upstream 3-minute timeout).
-- Optional disruption pacing annotations (`karpenter.coralogix.net/disruption-pacing-per-minute` and `karpenter.coralogix.net/disruption-pacing-per-batch`) apply to non-empty score-based, single-node, and multi-node consolidation, plus dynamic and static drift. NodePools can share a limit with `karpenter.coralogix.net/disruption-pacing-group`; empty-node removals are not paced. See [Disruption pacing](disruption-pacing.md) for configuration and behavior.
+Savings account for the price of any new node and of standby nodes that would be reactivated. Moves needing more than one new node are rejected. Each searched pass logs its decision, including why no move was chosen.
 
 ## Rollback to upstream
 
-Rolling back the controller to upstream Karpenter is safe:
+Rolling back to upstream Karpenter is safe and needs no manifest or CRD changes. Upstream ignores the annotations, and the NodePools resume standard emptiness and consolidation. Nodes may keep the standby taint; remove it manually so scheduling is not blocked:
 
-- The annotation remains valid Kubernetes metadata.
-- Upstream ignores the annotation and does not run score-based consolidation.
-- Annotated NodePools resume standard emptiness and underutilized consolidation behavior.
-- No manifest or CRD changes are required to roll back.
+```sh
+kubectl taint nodes <node> karpenter.coralogix.net/standby:NoSchedule-
+```
 
-After rollback, nodes may still carry the standby **taint** until you remove it manually (`kubectl taint nodes <node> karpenter.coralogix.net/standby:NoSchedule-`), so scheduling is not blocked with no controller managing standby. Leftover **Node** `karpenter.coralogix.net/standby` annotations are inert for upstream; they disappear when the Node is deleted.
+Leftover standby annotations are inert and disappear with the Node.
