@@ -33,6 +33,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/events"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 	"sigs.k8s.io/karpenter/pkg/test"
@@ -57,6 +58,7 @@ var _ = Describe("Standby reactivation", func() {
 		Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
 		expectNotStandby(node)
 		Expect(cluster.IsNodeNominated(node.Spec.ProviderID)).To(BeTrue())
+		ExpectMetricCounterValue(provisioning.StandbyReactivatedTotal, 1, map[string]string{metrics.NodePoolLabel: nodePool.Name, "source": "provisioning"})
 	})
 
 	It("places a buffer pod on a standby node and clears standby without nominating the node", func() {

@@ -27,18 +27,21 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
 
 var _ = Describe("Standby reactivation", func() {
 	It("clears standby on an evacuation destination and leaves the source standby", func() {
-		_, destinationNode, source := givenStandbyDestinationAndSource()
+		nodePool, destinationNode, source := givenStandbyDestinationAndSource()
 
 		reconcileThroughValidationDelay(disruptionController)
 
 		Expect(queue.GetCommands()).To(HaveLen(1))
 		expectNotStandby(destinationNode)
+		ExpectMetricCounterValue(provisioning.StandbyReactivatedTotal, 1, map[string]string{metrics.NodePoolLabel: nodePool.Name, "source": "disruption"})
 		queueSourceNode := queuedSourceNode()
 		ExpectObjectReconciled(ctx, env.Client, queue, source)
 		finishEvacuation(source)

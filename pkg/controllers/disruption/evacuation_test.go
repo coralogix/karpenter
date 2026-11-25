@@ -29,6 +29,7 @@ import (
 
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/test"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -36,6 +37,10 @@ import (
 )
 
 var _ = Describe("Evacuation", func() {
+	BeforeEach(func() {
+		disruption.EvacuationDurationSeconds.Reset()
+	})
+
 	DescribeTable("blocks new pods while evacuating and leaves the source NodeClaim in standby", func(policy v1.ConsolidationPolicy) {
 		pool, destination, source := givenStandbyDestinationAndSource()
 		pool.Spec.Disruption.ConsolidationPolicy = policy
@@ -62,6 +67,14 @@ var _ = Describe("Evacuation", func() {
 		expectMarkedStandby(node)
 		Expect(node.Spec.Taints).NotTo(ContainElement(v1.DisruptedNoScheduleTaint))
 		Expect(queue.IsEmpty()).To(BeTrue())
+		ExpectMetricCounterValue(disruption.NodeClaimsEvacuatedTotal, 1, map[string]string{
+			metrics.NodePoolLabel: pool.Name, metrics.CapacityTypeLabel: source.Labels[v1.CapacityTypeLabelKey],
+		})
+		ExpectMetricHistogramSampleCountValue("karpenter_voluntary_disruption_evacuation_duration_seconds", 1, map[string]string{"outcome": "succeeded"})
+
+		refreshStandbyStates([]*corev1.Node{node, destination}, ExpectNodeClaims(ctx, env.Client))
+		reconcileDisruption()
+		ExpectMetricGaugeValue(disruption.NodePoolStandbyNodes, 1, map[string]string{metrics.NodePoolLabel: pool.Name})
 	},
 		Entry("WhenEmptyOrUnderutilized", v1.ConsolidationPolicyWhenEmptyOrUnderutilized),
 		Entry("Balanced", v1.ConsolidationPolicyBalanced),

@@ -110,7 +110,7 @@ func logScoreDecision(ctx context.Context, choice moveChoice, stats searchStats,
 				alternatives = append(alternatives, moveLog(other))
 			}
 		}
-		fields = append(fields, "move", chosenMoveLog(choice.Chosen), "rank", slices.Index(choice.Kept, choice.Chosen.Move)+1, "searchScore", choice.Chosen.Move.SearchScore.Total, "rescoredScore", choice.Chosen.Score.Total, "failedValidation", failedValidation, "alternatives", alternatives, "validationAttempts", len(choice.Kept))
+		fields = append(fields, "move", chosenMoveLog(choice.Chosen), "rank", choice.rank(), "searchScore", choice.Chosen.Move.SearchScore.Total, "rescoredScore", choice.Chosen.Score.Total, "failedValidation", failedValidation, "alternatives", alternatives, "validationAttempts", len(choice.Kept))
 		if choice.Chosen.Kind == moveKindBatch {
 			fields = append(fields, "batchSimulations", choice.BatchMoves.JointSimulations, "batchesGrown", len(choice.BatchMoves.Moves))
 		}

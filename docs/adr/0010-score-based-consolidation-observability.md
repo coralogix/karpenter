@@ -23,7 +23,7 @@ Metrics reuse upstream disruption metrics with `consolidation_type="score-based"
 - `karpenter_nodes_standby_reactivated_total{nodepool, source}`, where the caller that clears standby supplies `source`, so nothing is stored on the node (ADR-0001);
 - `karpenter_nodepools_standby_nodes{nodepool}`.
 
-Tracing has one span per disruption controller pass, with a child span for each method and its outcome. The score-based method's span contains the search phases, the validation wait, and validation.
+Tracing has one span per disruption controller pass, with a child span for each method and its outcome. The score-based method's span contains the search phases, the validation wait, validation, and batch growth.
 
 ## Considered Options
 

@@ -29,8 +29,12 @@ import (
 
 	"github.com/destel/rill"
 	"github.com/samber/lo"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"sigs.k8s.io/karpenter/pkg/cxtracing"
 )
 
 var scoreBasedSearchParallelism = runtime.GOMAXPROCS(0)
@@ -115,12 +119,24 @@ func (s moveSearch) run(ctx context.Context, candidates []*Candidate) ([]*move, 
 	for i, c := range candidates {
 		singles[i] = []*Candidate{c}
 	}
-	moves, stats := s.simulate(ctx, singles)
+	singleCtx, endSingle := startSearchPhaseSpan(ctx, "single", len(candidates))
+	moves, stats := s.simulate(singleCtx, singles)
+	endSingle(stats)
 	if len(moves) > 0 || stats.TimedOut {
 		return moves, stats
 	}
-	pairs, pairStats := s.simulate(ctx, s.choosePairs(candidates))
+	pairCtx, endPair := startSearchPhaseSpan(ctx, "pair", len(candidates))
+	pairs, pairStats := s.simulate(pairCtx, s.choosePairs(candidates))
+	endPair(pairStats)
 	return pairs, stats.addPairPhase(pairStats)
+}
+
+func startSearchPhaseSpan(ctx context.Context, phase string, candidates int) (context.Context, func(searchStats)) {
+	ctx, endSpan := cxtracing.Start(ctx, scoreBasedSpanName+".search."+phase, attribute.Int("candidates", candidates))
+	return ctx, func(stats searchStats) {
+		trace.SpanFromContext(ctx).SetAttributes(attribute.Int("evaluated_moves", stats.Evaluated), attribute.Bool("deadline_hit", stats.TimedOut))
+		endSpan()
+	}
 }
 
 // simulate simulates every move and returns the feasible ones, highest search score first.
