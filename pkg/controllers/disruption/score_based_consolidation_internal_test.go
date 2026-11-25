@@ -332,13 +332,22 @@ func TestSelectBestRescoredCommand_rejectsMoveByWholeCommandPacing(t *testing.T)
 	}
 	moves := []*move{{Command: Command{Candidates: []*Candidate{a, b}}, SearchScore: moveScore{Savings: 2}}}
 
-	cmd := expectRescore(t, checks.wrap(resimulatedTo(map[string]pscheduling.Results{"a": {}})), moves)
+	computed := false
+	compute := func(ctx context.Context, candidates ...*Candidate) (Command, error) {
+		computed = true
+		return resimulatedTo(map[string]pscheduling.Results{"a": {}})(ctx, candidates...)
+	}
+
+	cmd := expectRescore(t, checks.wrap(compute), moves)
 
 	if len(cmd.Candidates) != 0 {
 		t.Fatalf("command candidates = %d, want 0", len(cmd.Candidates))
 	}
 	if moves[0].validationText() != "failed: pacing" {
 		t.Fatalf("validation = %q, want failed: pacing", moves[0].validationText())
+	}
+	if computed {
+		t.Fatal("compute was called for a move rejected by pacing")
 	}
 }
 
