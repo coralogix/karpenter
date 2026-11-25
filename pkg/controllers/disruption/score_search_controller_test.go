@@ -45,7 +45,7 @@ var _ = Describe("Score-based savings selection", func() {
 func givenTwoEvacuationSources() (*v1.NodeClaim, *corev1.Node, *corev1.Node) {
 	GinkgoHelper()
 	source, node, _ := givenEvacuationSource()
-	// The expensive source also holds a large workload, so the removed price-per-workload ranking preferred the cheaper source.
+	// The expensive source also holds a large workload, so a price-per-workload ranking would pick the cheaper source.
 	largeRS := test.ReplicaSet()
 	ExpectApplied(ctx, env.Client, largeRS)
 	Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(largeRS), largeRS)).To(Succeed())

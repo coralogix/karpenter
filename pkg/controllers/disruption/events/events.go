@@ -125,6 +125,28 @@ func NodePoolBlockedForDisruptionReason(nodePool *v1.NodePool, reason v1.Disrupt
 	}
 }
 
+func NodePoolBudgetUsedByDisruptionsInProgress(nodePool *v1.NodePool, reason v1.DisruptionReason, inProgress int) events.Event {
+	return events.Event{
+		InvolvedObject: nodePool,
+		Type:           corev1.EventTypeNormal,
+		Reason:         events.DisruptionBlocked,
+		Message:        fmt.Sprintf("Disruption budget for disruption reason %s is used up by %d disruptions in progress", reason, inProgress),
+		DedupeValues:   []string{string(nodePool.UID), string(reason), "in-progress"},
+		DedupeTimeout:  1 * time.Minute,
+	}
+}
+
+func NodePoolHeldBackByPacing(nodePool *v1.NodePool, reason v1.DisruptionReason) events.Event {
+	return events.Event{
+		InvolvedObject: nodePool,
+		Type:           corev1.EventTypeNormal,
+		Reason:         events.DisruptionBlocked,
+		Message:        fmt.Sprintf("Disruption pacing holds back all candidates for disruption reason %s", reason),
+		DedupeValues:   []string{string(nodePool.UID), string(reason), "pacing"},
+		DedupeTimeout:  1 * time.Minute,
+	}
+}
+
 func InvalidDuration(nodePool *v1.NodePool, annotation, raw string, fallback time.Duration, reason string) events.Event {
 	return events.Event{
 		InvolvedObject: nodePool,

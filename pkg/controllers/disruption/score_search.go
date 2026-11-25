@@ -41,9 +41,8 @@ type move struct {
 	SearchScore     moveScore
 	ValidationScore moveScore
 	Validation      validationStatus
-	// FailureReason explains a failed validation.
-	FailureReason string
-	Selected      bool
+	FailureReason   string
+	Selected        bool
 }
 
 type validationStatus int
@@ -52,9 +51,7 @@ const (
 	validationPassed validationStatus = iota
 	// validationFailed means validation errored, so there is no rescored score.
 	validationFailed
-	// validationNoSavings means validation re-simulated the move but it no longer saves money.
 	validationNoSavings
-	// validationNonPositiveScore means validation re-simulated the move and it still saves money, but its score is not positive.
 	validationNonPositiveScore
 )
 
@@ -62,33 +59,47 @@ func (m *move) validationRejected() bool {
 	return m.Validation != validationPassed
 }
 
-// validationText is the log form of the validation outcome.
 func (m *move) validationText() string {
-	switch m.Validation {
-	case validationFailed:
-		return "failed: " + m.FailureReason
-	case validationNoSavings:
-		return "failed: no_savings"
-	case validationNonPositiveScore:
-		return "failed: non_positive_score"
+	if m.validationRejected() {
+		return "failed: " + m.validationFailureReason()
 	}
 	return "passed"
 }
 
+// failedValidation is a rejection by validation itself, not an error while simulating during it.
+func (m *move) failedValidation() bool {
+	return m.validationRejected() && m.FailureReason != validationErrorReason
+}
+
+func (m *move) validationFailureReason() string {
+	switch m.Validation {
+	case validationNoSavings:
+		return moveEvaluationNoSavings
+	case validationNonPositiveScore:
+		return moveEvaluationNonPositiveScore
+	}
+	return m.FailureReason
+}
+
 type consolidationComputer func(ctx context.Context, candidates ...*Candidate) (Command, error)
 
+// moveEvaluator scores moves with the inputs taken from the same snapshot as the computer simulating them.
+type moveEvaluator struct {
+	compute consolidationComputer
+	inputs  scoreInputs
+}
+
 type searchStats struct {
-	Evaluated int
-	Errors    int
-	NoOp      int
-	NoSavings int
-	// NonPositiveScore counts moves that save money but score zero or less.
+	Evaluated        int
+	Errors           int
+	NoOp             int
+	NoSavings        int
 	NonPositiveScore int
 	TimedOut         bool
 }
 
 // searchMoves simulates every move and keeps the highest-scoring ones.
-func searchMoves(ctx context.Context, sources [][]*Candidate, deadline time.Time, compute consolidationComputer, inputs scoreInputs, random *rand.Rand, clk clock.Clock) ([]*move, searchStats) {
+func searchMoves(ctx context.Context, sources [][]*Candidate, deadline time.Time, evaluator moveEvaluator, random *rand.Rand, clk clock.Clock) ([]*move, searchStats) {
 	sources = slices.Clone(sources)
 	random.Shuffle(len(sources), func(i, j int) { sources[i], sources[j] = sources[j], sources[i] })
 	var stats searchStats
@@ -108,22 +119,28 @@ func searchMoves(ctx context.Context, sources [][]*Candidate, deadline time.Time
 		}
 	})
 	valid := rill.FilterMap(pending, scoreBasedSearchParallelism, func(nodes []*Candidate) (*move, bool, error) {
-		s, err := evaluateMove(ctx, compute, inputs, nodes)
+		s, err := evaluator.evaluate(ctx, nodes)
 		mu.Lock()
 		defer mu.Unlock()
 		stats.Evaluated++
 		switch {
 		case err != nil:
 			stats.Errors++
+			countMoveEvaluation(moveEvaluationError)
 			log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
 			return nil, false, nil
 		case s == nil:
 			stats.NoOp++
+			countMoveEvaluation(moveEvaluationNoOp)
 			return nil, false, nil
-		case s.Score.Savings <= 0:
+		}
+		result := s.Score.evaluationResult()
+		countMoveEvaluation(result)
+		switch result {
+		case moveEvaluationNoSavings:
 			stats.NoSavings++
 			return nil, false, nil
-		case s.Score.Total <= 0:
+		case moveEvaluationNonPositiveScore:
 			stats.NonPositiveScore++
 			return nil, false, nil
 		}
@@ -139,17 +156,29 @@ type scoredCommand struct {
 	Score   moveScore
 }
 
-// evaluateMove is the per-move step shared by the search and the rescore: compute the command and score it.
+// evaluate is the per-move step shared by the search and the rescore: compute the command and score it.
 // It returns nil when the move is a no-op or needs more than one new node.
-func evaluateMove(ctx context.Context, compute consolidationComputer, inputs scoreInputs, nodes []*Candidate) (*scoredCommand, error) {
-	cmd, err := compute(ctx, nodes...)
+func (e moveEvaluator) evaluate(ctx context.Context, nodes []*Candidate) (*scoredCommand, error) {
+	cmd, err := e.compute(ctx, nodes...)
 	if err != nil {
 		return nil, err
 	}
 	if cmd.Decision() == NoOpDecision || len(cmd.Replacements) > 1 {
 		return nil, nil
 	}
-	return &scoredCommand{Command: cmd, Score: scoreMove(cmd, inputs)}, nil
+	return &scoredCommand{Command: cmd, Score: scoreMove(cmd, e.inputs)}, nil
+}
+
+// evaluationResult is the rule for keeping a move, shared by the search and the rescore: a move is feasible only if it
+// saves money and scores above zero.
+func (s moveScore) evaluationResult() string {
+	switch {
+	case s.Savings <= 0:
+		return moveEvaluationNoSavings
+	case s.Total <= 0:
+		return moveEvaluationNonPositiveScore
+	}
+	return moveEvaluationFeasible
 }
 
 func topMovesByScore(valid <-chan rill.Try[*move], limit int) []*move {

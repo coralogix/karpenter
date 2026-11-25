@@ -32,6 +32,8 @@ import (
 
 var errWholeCommandPacing = errors.New("whole-command pacing")
 
+const validationErrorReason = "error"
+
 // rescoreKeptMoves repeats the search on a fresh snapshot of the kept moves' sources and returns the move with the
 // highest positive rescored score, exactly as re-simulated.
 func (s *ScoreBasedConsolidation) rescoreKeptMoves(ctx context.Context, moves []*move) (Command, error) {
@@ -55,7 +57,7 @@ func (s *ScoreBasedConsolidation) rescoreKeptMoves(ctx context.Context, moves []
 		cluster:                    s.cluster,
 		pacing:                     s.disruptionPacing,
 	}
-	return selectBestRescoredCommand(ctx, checks.wrap(compute), snapshot.scoreInputs, s.recorder, moves), nil
+	return selectBestRescoredCommand(ctx, moveEvaluator{compute: checks.wrap(compute), inputs: snapshot.scoreInputs}, s.recorder, moves), nil
 }
 
 type rescoreChecks struct {
@@ -123,42 +125,53 @@ func (r rescoreChecks) checkNotNominated(candidates []*Candidate) error {
 	return nil
 }
 
-func selectBestRescoredCommand(ctx context.Context, compute consolidationComputer, inputs scoreInputs, recorder events.Recorder, moves []*move) Command {
+func selectBestRescoredCommand(ctx context.Context, evaluator moveEvaluator, recorder events.Recorder, moves []*move) Command {
 	for _, m := range moves {
-		rescore(ctx, compute, inputs, m)
+		rescore(ctx, evaluator, m)
 	}
 	passed := lo.Filter(moves, func(e *move, _ int) bool { return e.Validation == validationPassed })
-	if len(passed) == 0 {
-		if moves[0].Validation == validationFailed {
-			moves[0].Command.EmitRejectedEvents(recorder, moves[0].FailureReason)
+	best := lo.MaxBy(passed, func(a, b *move) bool { return a.ValidationScore.Total > b.ValidationScore.Total })
+	rankedAboveBest := true
+	for _, m := range moves {
+		if m == best {
+			rankedAboveBest = false
 		}
+		if !m.failedValidation() {
+			continue
+		}
+		FailedValidationsTotal.Inc(map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
+		if rankedAboveBest {
+			m.Command.EmitRejectedEvents(recorder, m.validationFailureReason())
+		}
+	}
+	if best == nil {
 		return Command{}
 	}
-	best := lo.MaxBy(passed, func(a, b *move) bool { return a.ValidationScore.Total > b.ValidationScore.Total })
 	best.Selected = true
+	best.Command.EmitCandidateEvents(recorder)
+	ScoreBasedMovesSelectedTotal.Inc(map[string]string{moveKindLabel: moveKindSingle})
 	return best.Command
 }
 
-func rescore(ctx context.Context, compute consolidationComputer, inputs scoreInputs, m *move) {
-	fresh, err := evaluateMove(ctx, compute, inputs, m.Command.Candidates)
+func rescore(ctx context.Context, evaluator moveEvaluator, m *move) {
+	fresh, err := evaluator.evaluate(ctx, m.Command.Candidates)
 	if err == nil && fresh == nil {
 		err = NewSchedulingValidationError(errors.New("move no longer consolidates"))
 	}
 	if err != nil {
 		if !IsValidationError(err) {
 			log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
-			m.Validation, m.FailureReason = validationFailed, "error"
+			m.Validation, m.FailureReason = validationFailed, validationErrorReason
 			return
 		}
-		FailedValidationsTotal.Inc(map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
 		m.Validation, m.FailureReason = validationFailed, scoreBasedValidationFailureReason(err)
 		return
 	}
 	m.Command, m.ValidationScore = fresh.Command, fresh.Score
-	switch {
-	case fresh.Score.Savings <= 0:
+	switch fresh.Score.evaluationResult() {
+	case moveEvaluationNoSavings:
 		m.Validation = validationNoSavings
-	case fresh.Score.Total <= 0:
+	case moveEvaluationNonPositiveScore:
 		m.Validation = validationNonPositiveScore
 	default:
 		m.Validation = validationPassed

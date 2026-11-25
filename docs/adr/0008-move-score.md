@@ -2,7 +2,7 @@
 
 Status: accepted
 
-Score-based consolidation ranks moves by a score with four terms: normalized cost, CPU slack, memory balance, and instance-type concentration. The formulas are those of the earlier implementation (branch `CX-54658-compaction-reclamation-1.14`) and are kept unchanged. That implementation is rewritten with simpler edge-case handling. On score-based pools the score replaces upstream's `Balanced` approval rule, so `Balanced` and `WhenEmptyOrUnderutilized` behave the same there.
+Score-based consolidation ranks moves by a score with four terms: normalized cost, utilization, memory balance, and instance-type concentration. The formulas are those of the earlier implementation (branch `CX-54658-compaction-reclamation-1.14`) and are kept unchanged. That implementation is rewritten with simpler edge-case handling. On score-based pools the score replaces upstream's `Balanced` approval rule, so `Balanced` and `WhenEmptyOrUnderutilized` behave the same there.
 
 A move can be chosen only if it saves real dollars and its total score is positive. **Savings** are the sum of source prices minus the estimated price of the new node, if any, minus the price of every standby node the move reactivates. A reactivated standby node is not free: left alone, reclamation would delete it, so reactivating it means paying for it.
 
