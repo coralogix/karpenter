@@ -157,6 +157,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 		Complete(singleton.AsReconciler(c))
 }
 
+//nolint:gocyclo
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
 	ctx, endSpan := cxtracing.Start(ctx, disruptionLoopSpanName)
@@ -204,6 +205,11 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		return reconciler.Result{}, fmt.Errorf("building node pool map for standby repair, %w", err)
 	}
 	recordStandbyNodes(c.cluster, nodePoolMap)
+	for _, m := range c.methods {
+		if observer, ok := m.(PassObserver); ok {
+			observer.ObservePass(nodePoolMap)
+		}
+	}
 	if err := repairStandbyState(ctx, c.kubeClient, c.cluster, c.recorder, c.clock, nodePoolMap); err != nil {
 		if errors.IsConflict(err) {
 			return reconciler.Result{Requeue: true}, nil

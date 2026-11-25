@@ -20,6 +20,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/samber/lo"
 	"k8s.io/utils/clock"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -33,11 +34,13 @@ const ReclamationConsolidationType = "reclamation"
 
 const defaultReclamationDelay = 15 * time.Second
 
-// Reclamation deletes standby score-based nodes after the pool reclamation delay, using Empty disruption budgets.
+// Reclamation deletes standby score-based nodes after the pool reclamation delay, or beyond the pool's kept capacity when
+// capacity decay is on, using Empty disruption budgets.
 type Reclamation struct {
-	cluster  *state.Cluster
-	recorder events.Recorder
-	clock    clock.Clock
+	cluster            *state.Cluster
+	recorder           events.Recorder
+	clock              clock.Clock
+	keptCapacityByPool map[string]keptCapacity
 }
 
 func NewReclamation(cluster *state.Cluster, recorder events.Recorder, clk clock.Clock) *Reclamation {
@@ -45,12 +48,20 @@ func NewReclamation(cluster *state.Cluster, recorder events.Recorder, clk clock.
 }
 
 func (r *Reclamation) ShouldDisrupt(_ context.Context, c *Candidate) bool {
-	return candidateReadyForReclamation(r.cluster, r.recorder, r.clock, c)
+	if c == nil || c.Node == nil || c.NodeClaim == nil {
+		return false
+	}
+	if !candidateEmptyForStandbyWork(r.cluster, c) || !standby.HasStandbyTaint(c.Node) {
+		return false
+	}
+	ts, ok := standby.Timestamp(c.Node)
+	_, capacityDecay := r.keptCapacityByPool[c.NodePool.Name]
+	return ok && (capacityDecay || !r.clock.Now().Before(ts.Add(reclamationDelay(c.NodePool, r.recorder))))
 }
 
 func (r *Reclamation) ComputeCommands(_ context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
 	reclaimable := make([]*Candidate, 0, len(candidates))
-	for _, candidate := range candidates {
+	for _, candidate := range r.dropKeptStandby(candidates) {
 		if disruptionBudgetMapping[candidate.NodePool.Name] == 0 {
 			continue
 		}
@@ -78,20 +89,9 @@ func (r *Reclamation) ConsolidationType() string {
 	return ReclamationConsolidationType
 }
 
-func candidateReadyForReclamation(cluster *state.Cluster, recorder events.Recorder, clk clock.Clock, c *Candidate) bool {
-	if c == nil || c.Node == nil || c.NodeClaim == nil {
-		return false
-	}
-	if !candidateEmptyForStandbyWork(cluster, c) || !standby.HasStandbyTaint(c.Node) {
-		return false
-	}
-	ts, ok := standby.Timestamp(c.Node)
-	return ok && !clk.Now().Before(ts.Add(reclamationDelay(c.NodePool, recorder)))
-}
-
 // reclamationDelay returns how long a node must stay in standby before reclamation may delete it.
 func reclamationDelay(np *v1.NodePool, recorder events.Recorder) time.Duration {
-	return readDurationAnnotation(np, recorder, v1.ReclamationDelayAnnotationKey, defaultReclamationDelay, events.InvalidReclamationDelay)
+	return lo.FromPtrOr(readDurationAnnotation(np, recorder, v1.ReclamationDelayAnnotationKey, events.InvalidReclamationDelay, defaultReclamationDelay.String()), defaultReclamationDelay)
 }
 
 // observeReclaimedStandby records, once a reclamation command has succeeded, the standby duration of every node it

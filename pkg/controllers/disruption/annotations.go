@@ -24,15 +24,17 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 )
 
-func readDurationAnnotation(np *v1.NodePool, recorder events.Recorder, key string, fallback time.Duration, reason string) time.Duration {
+// readDurationAnnotation returns the annotation's duration, or nil when the annotation is absent or invalid. An invalid
+// value raises an event naming fallbackDescription as what is used instead.
+func readDurationAnnotation(np *v1.NodePool, recorder events.Recorder, key, reason, fallbackDescription string) *time.Duration {
 	raw, ok := np.Annotations[key]
 	if !ok {
-		return fallback
+		return nil
 	}
 	duration, err := time.ParseDuration(raw)
 	if err != nil || duration < 0 {
-		recorder.Publish(disruptionevents.InvalidDuration(np, key, raw, fallback, reason))
-		return fallback
+		recorder.Publish(disruptionevents.InvalidDuration(np, key, raw, fallbackDescription, reason))
+		return nil
 	}
-	return duration
+	return &duration
 }
