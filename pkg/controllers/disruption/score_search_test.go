@@ -137,8 +137,8 @@ func TestInvalidUtilizationWeightWarnsOnce(t *testing.T) {
 		moves, _ := newTestSearch(moveEvaluator{compute: func(_ context.Context, c ...*Candidate) (Command, error) {
 			return Command{Candidates: c}, nil
 		}, inputs: inputs}).simulate(context.Background(), sources)
-		if len(moves) != 1 || moves[0].SearchScore.Total != 2 {
-			t.Fatalf("evaluations = %+v, want score 2 using default weight", moves)
+		if len(moves) != 1 || moves[0].SearchScore.Total != 1+defaultUtilizationWeight {
+			t.Fatalf("evaluations = %+v, want score %g using default weight", moves, 1+defaultUtilizationWeight)
 		}
 	}
 
@@ -281,8 +281,8 @@ func TestChooseMove_pairRescoredOntoTwoNewNodesFailsWithScheduling(t *testing.T)
 
 	chosen := chooseMove(moveEvaluator{compute: pairsOnto(2), inputs: testScoreInputs(sourcesOf([]*move{pair}))}, events.NewRecorder(record.NewFakeRecorder(10)), []*move{pair}, nil)
 
-	if chosen.Move != nil || pair.validationText() != "failed: scheduling" {
-		t.Fatalf("chose %+v, validation %q, want no move and failed: scheduling", chosen, pair.validationText())
+	if chosen.Move != nil || pair.validationFailureReason() != "scheduling" {
+		t.Fatalf("chose %+v, validation failure %q, want no move and scheduling", chosen, pair.validationFailureReason())
 	}
 }
 

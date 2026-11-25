@@ -316,8 +316,8 @@ func TestChooseMove_noOpFailsWithSchedulingAndNextMoveRuns(t *testing.T) {
 	if len(cmd.Candidates) != 1 || cmd.Candidates[0] != low {
 		t.Fatalf("command candidates = %v, want low-score", cmd.Candidates)
 	}
-	if moves[0].validationText() != "failed: scheduling" {
-		t.Fatalf("validation = %q, want failed: scheduling", moves[0].validationText())
+	if moves[0].validationFailureReason() != "scheduling" {
+		t.Fatalf("validation failure = %q, want scheduling", moves[0].validationFailureReason())
 	}
 }
 
@@ -399,8 +399,8 @@ func TestChooseMove_rejectsMoveByWholeCommandPacing(t *testing.T) {
 	if len(cmd.Candidates) != 0 {
 		t.Fatalf("command candidates = %d, want 0", len(cmd.Candidates))
 	}
-	if moves[0].validationText() != "failed: pacing" {
-		t.Fatalf("validation = %q, want failed: pacing", moves[0].validationText())
+	if moves[0].validationFailureReason() != "pacing" {
+		t.Fatalf("validation failure = %q, want pacing", moves[0].validationFailureReason())
 	}
 	if computed {
 		t.Fatal("compute was called for a move rejected by pacing")

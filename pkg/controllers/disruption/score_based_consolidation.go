@@ -86,20 +86,19 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, _ map[str
 	if err != nil {
 		return []Command{}, err
 	}
-	validCandidates, budgetBlockedPools, pacingBlockedPools := s.filterCandidates(snapshot)
+	filtered := s.filterCandidates(snapshot)
 	var choice moveChoice
 	var stats searchStats
-	eligible := len(validCandidates)
 	var searchDuration time.Duration
 	defer func() {
 		// A failed pass writes no decision log; the controller reports the error.
 		if err == nil {
-			logScoreDecision(ctx, choice, stats, len(snapshot.candidates), eligible, budgetBlockedPools, pacingBlockedPools, searchDuration)
+			logScoreDecision(ctx, choice, stats, filtered, searchDuration)
 		}
 	}()
 
 	var feasible []*move
-	feasible, stats, err = s.searchForMoves(ctx, validCandidates, snapshot, deadline)
+	feasible, stats, err = s.searchForMoves(ctx, filtered.Eligible, snapshot, deadline)
 	searchDuration = s.clock.Since(start)
 	if err != nil {
 		return []Command{}, err
@@ -108,7 +107,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, _ map[str
 		ConsolidationTimeoutsTotal.Inc(map[string]string{ConsolidationTypeLabel: ScoreBasedConsolidationType})
 	}
 	if len(feasible) == 0 {
-		if stats.canMarkConsolidated(eligible, len(budgetBlockedPools) > 0 || len(pacingBlockedPools) > 0) {
+		if stats.canMarkConsolidated(len(filtered.Eligible), filtered.blocked()) {
 			s.markConsolidated()
 		}
 		return []Command{}, nil
@@ -132,8 +131,23 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, _ map[str
 	return []Command{choice.Chosen.Command}, nil
 }
 
-func (s *ScoreBasedConsolidation) filterCandidates(snapshot clusterSnapshot) ([]*Candidate, []string, []string) {
-	var validCandidates []*Candidate
+// filteredCandidates are the candidates a pass searches, and how many of the rest budgets and pacing removed.
+// PacingBlockedPools also lists paced pools whose candidates were all empty and so stayed eligible.
+type filteredCandidates struct {
+	Eligible           []*Candidate
+	BudgetBlocked      int
+	PacingHeld         int
+	BudgetBlockedPools []string
+	PacingBlockedPools []string
+}
+
+// blocked says whether budgets or pacing held back any pool, so a later pass may find a move without the cluster changing.
+func (f filteredCandidates) blocked() bool {
+	return len(f.BudgetBlockedPools) > 0 || len(f.PacingBlockedPools) > 0
+}
+
+func (s *ScoreBasedConsolidation) filterCandidates(snapshot clusterSnapshot) filteredCandidates {
+	var filtered filteredCandidates
 	nodePools := map[string]*v1.NodePool{}
 	budgetBlockedPools := sets.New[string]()
 	pacingBlockedPools := sets.New[string]()
@@ -143,16 +157,18 @@ func (s *ScoreBasedConsolidation) filterCandidates(snapshot clusterSnapshot) ([]
 		nodePools[pool] = candidate.NodePool
 		if snapshot.disruptionBudgetByNodePool[pool] == 0 {
 			budgetBlockedPools.Insert(pool)
+			filtered.BudgetBlocked++
 			continue
 		}
 		if !s.disruptionPacing.CandidateAllowed(candidate.NodePool, 0) {
 			pacingBlockedPools.Insert(pool)
 			if len(candidate.reschedulablePods) > 0 {
+				filtered.PacingHeld++
 				continue
 			}
 		}
 		poolsWithValidCandidates.Insert(pool)
-		validCandidates = append(validCandidates, candidate)
+		filtered.Eligible = append(filtered.Eligible, candidate)
 	}
 	for pool := range budgetBlockedPools {
 		if inProgress := snapshot.budgetUsedUpByDisruptionsInProgress[pool]; inProgress > 0 {
@@ -162,7 +178,8 @@ func (s *ScoreBasedConsolidation) filterCandidates(snapshot clusterSnapshot) ([]
 	for pool := range pacingBlockedPools.Difference(poolsWithValidCandidates) {
 		s.recorder.Publish(disruptionevents.NodePoolHeldBackByPacing(nodePools[pool], s.Reason()))
 	}
-	return validCandidates, sets.List(budgetBlockedPools), sets.List(pacingBlockedPools)
+	filtered.BudgetBlockedPools, filtered.PacingBlockedPools = sets.List(budgetBlockedPools), sets.List(pacingBlockedPools)
+	return filtered
 }
 
 func (s *ScoreBasedConsolidation) waitForValidation(ctx context.Context, start time.Time) error {

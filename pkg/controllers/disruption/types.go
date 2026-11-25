@@ -213,6 +213,7 @@ type Command struct {
 
 	staticNodeCountReservationHandedOff bool
 	evacuationProgressByProviderID      map[string]evacuationProgress
+	scoreSavings                        *float64
 
 	CreationTimestamp time.Time
 	ID                uuid.UUID
@@ -319,9 +320,9 @@ func (c Command) String() string {
 		if len(c.Replacements) == 1 {
 			plural = "replacement"
 		}
-		return fmt.Sprintf("%s/%s: %s: nodepools=[%s]: [%s] -> [%d %s] (savings: $%.2f)", c.Reason(), c.ID, c.Decision(), nodePools, sources, len(c.Replacements), plural, c.EstimatedSavings())
+		return fmt.Sprintf("%s/%s: %s: nodepools=[%s]: [%s] -> [%d %s]%s", c.Reason(), c.ID, c.Decision(), nodePools, sources, len(c.Replacements), plural, c.savingsSuffix())
 	}
-	return fmt.Sprintf("%s/%s: %s: nodepools=[%s]: [%s] (savings: $%.2f)", c.Reason(), c.ID, c.Decision(), nodePools, sources, c.EstimatedSavings())
+	return fmt.Sprintf("%s/%s: %s: nodepools=[%s]: [%s]%s", c.Reason(), c.ID, c.Decision(), nodePools, sources, c.savingsSuffix())
 }
 
 // StringForNode returns a string representation of the command from the perspective of a single source candidate node.
@@ -379,14 +380,14 @@ func (c Command) ReplacementCost() float64 {
 // EmitCandidateEvents emits ConsolidationCandidate events for all candidates in this command
 func (c Command) EmitCandidateEvents(recorder events.Recorder) {
 	for _, candidate := range c.Candidates {
-		recorder.Publish(disruptionevents.ConsolidationCandidate(candidate.Node, candidate.NodeClaim, c.StringForNode(candidate), c.EstimatedSavings())...)
+		recorder.Publish(disruptionevents.ConsolidationCandidate(candidate.Node, candidate.NodeClaim, c.StringForNode(candidate), c.reportedSavings())...)
 	}
 }
 
 // EmitRejectedEvents emits ConsolidationRejected events for all candidates in this command
 func (c Command) EmitRejectedEvents(recorder events.Recorder, reason string) {
 	for _, candidate := range c.Candidates {
-		recorder.Publish(disruptionevents.ConsolidationRejected(candidate.Node, candidate.NodeClaim, c.StringForNode(candidate), reason, c.EstimatedSavings())...)
+		recorder.Publish(disruptionevents.ConsolidationRejected(candidate.Node, candidate.NodeClaim, c.StringForNode(candidate), reason, c.reportedSavings())...)
 	}
 }
 

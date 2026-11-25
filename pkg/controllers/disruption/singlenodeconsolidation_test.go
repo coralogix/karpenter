@@ -95,7 +95,7 @@ var _ = Describe("SingleNodeConsolidation", func() {
 	})
 
 	AfterEach(func() {
-		disruption.SingleNodeConsolidationTimeoutDuration = 3 * time.Minute
+		disruption.SingleNodeConsolidationTimeoutDuration = time.Minute
 		env.Clock.SetTime(time.Now())
 		ExpectCleanedUp(ctx, env.Client)
 	})

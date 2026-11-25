@@ -20,7 +20,7 @@ spec:
 | Annotation | Meaning |
 |------------|---------|
 | `karpenter.coralogix.net/score-based-consolidation` | Opts the NodePool in (presence is enough; value is ignored). |
-| `karpenter.coralogix.net/utilization-weight` | How much unused CPU counts in the score. Default **1**; anything other than a positive number falls back to the default and raises an event on the NodePool. |
+| `karpenter.coralogix.net/utilization-weight` | How much unused CPU counts in the score. Default **0.25**; anything other than a positive number falls back to the default and raises an event on the NodePool. |
 | `karpenter.coralogix.net/reclamation-delay` | How long a node stays on standby before it may be deleted. Default **15s**. |
 | `karpenter.coralogix.net/evacuation-timeout` | How long an evacuation may run before it is abandoned. Default **5m**. A move whose sources span NodePools uses the shortest. |
 
@@ -31,6 +31,8 @@ Optional [disruption pacing](disruption-pacing.md) annotations apply as well.
 ## How it works
 
 Annotated NodePools are handled by the score-based method instead of standard emptiness, single-node and multi-node consolidation. Drift is unchanged and still uses the standard drift methods and `Drifted` budgets.
+
+The fork limits single-node consolidation of other NodePools to one minute per search (upstream: three), because it runs in the same disruption loop and delays the score-based method, standby marking and reclamation while it runs.
 
 ### Standby and reclamation
 
@@ -46,7 +48,7 @@ A standby node counts as existing capacity for provisioning and disruption. If a
 
 On `WhenEmptyOrUnderutilized` pools, the method picks the move with the highest score and evacuates its source nodes: they are tainted, their workloads are evicted (respecting PodDisruptionBudgets, after any replacement is ready), and each is left on standby with its NodeClaim intact until it is reactivated or reclaimed. All sources of a move drain at the same time, and each goes on standby as soon as it is empty. Evacuation uses `Underutilized` budgets and pacing, which counts one node per source. If the sources are not all empty within `evacuation-timeout`, the evacuation is abandoned: sources already on standby stay there, and the rest take pods again.
 
-Moves needing more than one new node are rejected. Each searched pass logs its decision, including why no move was chosen and how the chosen move's score was computed.
+Moves needing more than one new node are rejected. Each searched pass logs its decision, including why no move was chosen and how the chosen move's score was computed. The log counts kept moves rejected by validation by reason (`validationFailures`) and shows up to three kept moves besides the chosen one (`alternatives`, or `rejectedMoves` when none was chosen), each with its validation result and the validation error, such as which source node is no longer a candidate. It also counts the candidates that `Underutilized` budgets and pacing removed before the search (`budgetBlockedCandidates`, `pacingHeldCandidates`). When the search finishes without error, timeout or kept move after either removed a candidate, the reason is `blocked_by_budget` or, if no budget removed one, `held_by_pacing`.
 
 When no single-node move saves money and scores above zero, and the search's 15-second deadline has not passed, the method tries **pair moves**: two source nodes whose pods fit together on at most one new node, such as two half-full nodes that cannot move anywhere cheaper alone. A pair is tried only if it fits each source pool's `Underutilized` budget and [disruption pacing](disruption-pacing.md). When more than 256 pairs qualify, 256 are sampled, favouring nodes with low CPU use, so each pass tries a different sample. Half of the 256 go to pairs from one NodePool, because pods already running on a pool are likelier to fit on one replacement together than pods split across pools for a reason; when either kind has fewer pairs than its half, the other kind gets the rest. A pair moves like any other move: any new node launches first, then both sources drain and go on standby.
 
@@ -71,6 +73,8 @@ Each move's **savings** are the source nodes' hourly prices minus the estimated 
 
 `DisruptionBlocked` events are deduplicated for one minute.
 
+The savings in `ConsolidationCandidate` and `ConsolidationRejected` messages and in the `disrupting node(s)` log are the move's savings as defined above, including reactivated standby nodes. The `disrupting node(s)` log of standby marking shows no savings, since marking removes no node.
+
 ## Metrics
 
 Upstream disruption metrics are filled with `consolidation_type="score-based"`:
@@ -87,6 +91,7 @@ The fork adds:
 - `karpenter_nodeclaims_evacuated_total{nodepool, capacity_type}`: sources put on standby by an evacuation, once each. Evacuations delete nothing, so they never appear in `karpenter_nodeclaims_disrupted_total`.
 - `karpenter_voluntary_disruption_evacuation_duration_seconds{outcome}`: time from the start of an evacuation until it ends. `outcome` is `succeeded` when every source is on standby, or `failed` on timeout or another failure, even if some sources already reached standby.
 - `karpenter_nodes_standby_reactivated_total{nodepool, source}`: standby nodes reactivated. `source` is `provisioning` or `disruption`, whichever decision placed pods on the node.
+- `karpenter_nodes_standby_duration_seconds{nodepool, outcome}`: how long a node stayed on standby, recorded once when standby ends. `outcome` is `reactivated` when pods were placed on the node, `reclaimed` when a reclamation deletes it (measured up to when the reclamation started; a reclamation that fails records none of its nodes, and any it left on standby are recorded when they later leave it), or `repaired` when Karpenter cleared standby for another reason, such as a pod reaching the node without a scheduling result, or the NodePool no longer allowing standby nodes. Standby nodes deleted for other reasons, such as drift or expiration, are not recorded.
 - `karpenter_nodepools_standby_nodes{nodepool}`: standby nodes per NodePool, set on every disruption pass. A NodePool's series disappears when the pool is deleted, stops using score-based consolidation, or can no longer hold standby nodes (`consolidateAfter: Never`).
 
 ## Spans

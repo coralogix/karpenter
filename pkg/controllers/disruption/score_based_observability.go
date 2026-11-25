@@ -18,6 +18,7 @@ package disruption
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"slices"
 	"time"
@@ -43,6 +44,8 @@ const (
 	moveEvaluationError            = "error"
 
 	moveKindLabel = "kind"
+
+	loggedMovesLimit = 3
 )
 
 type moveKind string
@@ -89,40 +92,50 @@ func countMoveEvaluation(result string) {
 	ScoreBasedMoveEvaluationsTotal.Inc(map[string]string{moveEvaluationResultLabel: result})
 }
 
-func logScoreDecision(ctx context.Context, choice moveChoice, stats searchStats, candidates, eligible int, budgetBlockedPools, pacingBlockedPools []string, duration time.Duration) {
+func logScoreDecision(ctx context.Context, choice moveChoice, stats searchStats, filtered filteredCandidates, duration time.Duration) {
 	fields := []interface{}{
-		"eligibleCandidates", eligible, "evaluatedMoves", stats.Evaluated, "keptMoves", len(choice.Kept),
+		"eligibleCandidates", len(filtered.Eligible), "pacingHeldCandidates", filtered.PacingHeld, "budgetBlockedCandidates", filtered.BudgetBlocked,
+		"evaluatedMoves", stats.Evaluated, "keptMoves", len(choice.Kept),
 		"simulationErrors", stats.Errors, "noOp", stats.NoOp, "noSavings", stats.NoSavings, "nonPositiveScore", stats.NonPositiveScore,
 		"pairsEvaluated", stats.PairsEvaluated, "deadlineHit", stats.TimedOut, "duration", duration,
-		"budgetBlockedNodePools", budgetBlockedPools, "pacingBlockedNodePools", pacingBlockedPools,
+		"budgetBlockedNodePools", filtered.BudgetBlockedPools, "pacingBlockedNodePools", filtered.PacingBlockedPools,
 	}
-	failedValidation := 0
+	validationFailures := map[string]int{}
 	for _, m := range choice.Kept {
 		if m.validationRejected() {
-			failedValidation++
+			validationFailures[m.validationFailureReason()]++
 		}
 	}
+	fields = append(fields, "validationAttempts", len(choice.Kept), "validationFailures", validationFailures)
 	if choice.Chosen.Move != nil {
 		alternatives := []map[string]interface{}{}
 		for _, other := range choice.Kept {
 			// The kept move a chosen batch move was built from is an alternative.
-			if (other != choice.Chosen.Move || choice.Chosen.Kind == moveKindBatch) && len(alternatives) < 3 {
+			if (other != choice.Chosen.Move || choice.Chosen.Kind == moveKindBatch) && len(alternatives) < loggedMovesLimit {
 				alternatives = append(alternatives, moveLog(other))
 			}
 		}
-		fields = append(fields, "move", chosenMoveLog(choice.Chosen), "rank", choice.rank(), "searchScore", choice.Chosen.Move.SearchScore.Total, "rescoredScore", choice.Chosen.Score.Total, "failedValidation", failedValidation, "alternatives", alternatives, "validationAttempts", len(choice.Kept))
+		fields = append(fields, "move", chosenMoveLog(choice.Chosen), "rank", choice.rank(), "searchScore", choice.Chosen.Move.SearchScore.Total, "rescoredScore", choice.Chosen.Score.Total, "alternatives", alternatives)
 		if choice.Chosen.Kind == moveKindBatch {
 			fields = append(fields, "batchSimulations", choice.BatchMoves.JointSimulations, "batchesGrown", len(choice.BatchMoves.Moves))
 		}
 		log.FromContext(ctx).Info("score-based consolidation move selected", fields...)
 		return
 	}
-	fields = append(fields, "reason", noMoveReason(len(choice.Kept), stats, candidates, eligible), "validationAttempts", len(choice.Kept))
+	// With no move chosen, every kept move was rejected by validation.
+	rejected := []map[string]interface{}{}
+	for _, m := range choice.Kept[:min(len(choice.Kept), loggedMovesLimit)] {
+		rejected = append(rejected, moveLog(m))
+	}
+	fields = append(fields, "reason", noMoveReason(len(choice.Kept), stats, filtered), "rejectedMoves", rejected)
 	log.FromContext(ctx).Info("score-based consolidation found no move", fields...)
 }
 
 // noMoveReason assumes kept moves were all validated, since a pass that errors before validating them logs nothing.
-func noMoveReason(kept int, stats searchStats, candidates, eligible int) string {
+// Budgets and pacing explain a pass only when its search finished cleanly and found nothing among the candidates they
+// left; errors, validation rejections and timeouts are more direct causes. Budgets go first because they are applied
+// first and are the hard limit.
+func noMoveReason(kept int, stats searchStats, filtered filteredCandidates) string {
 	switch {
 	case stats.Errors > 0:
 		return "simulation_error"
@@ -130,10 +143,12 @@ func noMoveReason(kept int, stats searchStats, candidates, eligible int) string 
 		return "all_rejected_by_validation"
 	case stats.TimedOut:
 		return "timed_out"
-	case candidates == 0:
+	case filtered.BudgetBlocked > 0:
+		return "blocked_by_budget"
+	case filtered.PacingHeld > 0:
+		return "held_by_pacing"
+	case len(filtered.Eligible) == 0:
 		return "no_candidates"
-	case eligible == 0:
-		return "blocked_by_budget_or_pacing"
 	case stats.NonPositiveScore > 0:
 		return "no_positive_score_move"
 	}
@@ -172,4 +187,20 @@ func commandLog(kind moveKind, cmd Command, score moveScore, validation string) 
 		}
 	}
 	return map[string]interface{}{"kind": kind, "sources": sources, "newNode": newNode, "reactivatedStandbyNodes": destinations, "score": score, "validation": validation}
+}
+
+func (c Command) savingsSuffix() string {
+	if c.Decision() == StandbyDecision {
+		return ""
+	}
+	return fmt.Sprintf(" (savings: $%.2f)", c.reportedSavings())
+}
+
+// reportedSavings is the savings a command reports in its string and events: a score-based move's score savings, which
+// include reactivated standby nodes, otherwise upstream's EstimatedSavings.
+func (c Command) reportedSavings() float64 {
+	if c.scoreSavings != nil {
+		return *c.scoreSavings
+	}
+	return c.EstimatedSavings()
 }

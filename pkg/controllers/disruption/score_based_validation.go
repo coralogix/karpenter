@@ -128,7 +128,7 @@ func (r rescoreChecks) freshSources(sources []*Candidate) ([]*Candidate, error) 
 	for _, source := range sources {
 		c, ok := r.candidates[source.Name()]
 		if !ok {
-			return nil, NewChurnValidationError(fmt.Errorf("candidate %s is no longer valid", source.Name()))
+			return nil, NewChurnValidationError(fmt.Errorf("node %s is no longer a candidate", source.Name()))
 		}
 		perPool[c.NodePool.Name]++
 		if perPool[c.NodePool.Name] > r.disruptionBudgetByNodePool[c.NodePool.Name] {
@@ -176,7 +176,7 @@ func rescore(ctx context.Context, evaluator moveEvaluator, m *move) {
 			m.Validation, m.FailureReason = validationFailed, validationErrorReason
 			return
 		}
-		m.Validation, m.FailureReason = validationFailed, scoreBasedValidationFailureReason(err)
+		m.Validation, m.FailureReason, m.FailureMessage = validationFailed, scoreBasedValidationFailureReason(err), err.Error()
 		return
 	}
 	m.Command, m.ValidationScore = fresh.Command, fresh.Score
