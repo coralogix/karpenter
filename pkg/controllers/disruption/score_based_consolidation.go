@@ -91,7 +91,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, _ map[str
 	}()
 
 	var feasible []*move
-	feasible, stats, err = s.searchForMoves(ctx, validCandidates, snapshot.scoreInputs, deadline)
+	feasible, stats, err = s.searchForMoves(ctx, validCandidates, snapshot, deadline)
 	searchDuration = s.clock.Since(start)
 	if err != nil {
 		return []Command{}, err
@@ -109,7 +109,7 @@ func (s *ScoreBasedConsolidation) ComputeCommands(ctx context.Context, _ map[str
 	if err := s.waitForValidation(ctx, start); err != nil {
 		return []Command{}, err
 	}
-	batchable := batchableMoves(feasible)
+	batchable := filterBatchable(feasible)
 	evaluator, err := s.validationEvaluator(ctx, feasible, batchable)
 	if err != nil {
 		return []Command{}, err
@@ -168,7 +168,7 @@ func (s *ScoreBasedConsolidation) waitForValidation(ctx context.Context, start t
 	return nil
 }
 
-func (s *ScoreBasedConsolidation) searchForMoves(ctx context.Context, candidates []*Candidate, inputs scoreInputs, deadline time.Time) ([]*move, searchStats, error) {
+func (s *ScoreBasedConsolidation) searchForMoves(ctx context.Context, candidates []*Candidate, snapshot clusterSnapshot, deadline time.Time) ([]*move, searchStats, error) {
 	if len(candidates) == 0 {
 		return nil, searchStats{}, nil
 	}
@@ -176,12 +176,15 @@ func (s *ScoreBasedConsolidation) searchForMoves(ctx context.Context, candidates
 	if err != nil {
 		return nil, searchStats{}, err
 	}
-	sources := make([][]*Candidate, len(candidates))
-	for i, c := range candidates {
-		sources[i] = []*Candidate{c}
+	search := moveSearch{
+		evaluator: moveEvaluator{compute: compute, inputs: snapshot.scoreInputs},
+		budgets:   snapshot.disruptionBudgetByNodePool,
+		pacing:    s.disruptionPacing,
+		deadline:  deadline,
+		random:    rand.New(rand.NewSource(time.Now().UnixNano())), //nolint:gosec
+		clk:       s.clock,
 	}
-	rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec
-	moves, stats := searchMoves(ctx, sources, deadline, moveEvaluator{compute: compute, inputs: inputs}, rng, s.clock)
+	moves, stats := search.run(ctx, candidates)
 	return moves, stats, nil
 }
 
@@ -239,7 +242,11 @@ type validatedMove struct {
 }
 
 func (m *move) validated() validatedMove {
-	return validatedMove{Move: m, Kind: moveKindSingle, Command: m.Command, Score: m.ValidationScore}
+	return validatedMove{Move: m, Kind: m.kind(), Command: m.Command, Score: m.ValidationScore}
+}
+
+func (m *move) kind() moveKind {
+	return lo.Ternary(len(m.Command.Candidates) == 2, moveKindPair, moveKindSingle)
 }
 
 func (s *ScoreBasedConsolidation) Reason() v1.DisruptionReason {

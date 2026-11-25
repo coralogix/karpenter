@@ -45,7 +45,7 @@ A move of several source nodes whose pods all fit on existing or standby nodes, 
 _Avoid_: batch
 
 **Pair move**:
-A move of exactly two source nodes whose pods fit on exactly one new node.
+A move of exactly two source nodes whose pods fit on at most one new node.
 _Avoid_: pair, 2→1 move
 
 **Score**:

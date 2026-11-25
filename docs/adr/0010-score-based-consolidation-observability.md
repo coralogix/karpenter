@@ -7,7 +7,7 @@ The per-decision log is the record of why score-based consolidation acted or did
 - the new node and any reactivated standby nodes;
 - the savings (from the rescored simulation when a move is chosen);
 - each term's contribution with its inputs and baselines, plus a short reason when a term that is on contributed 0;
-- search counts and duration;
+- search counts and duration, including pairs simulated (`pairsEvaluated`);
 - the chosen move's rank by search score, its search and rescored scores, and how many kept moves failed validation; a batch move ranks as the move it grew from, with that move's search score, and adds the joint simulations of batch growth and the number of batches grown;
 - up to three alternatives.
 
@@ -16,7 +16,7 @@ A pass that fails with an error writes no decision log, because the controller r
 Events describe only decisions that were made. Upstream simulation emits `ConsolidationCandidate` for every move it simulates, so score-based consolidation suppresses those during the search. It emits `ConsolidationCandidate` for the chosen move's sources only, and `ConsolidationRejected` for each kept move that failed validation. Upstream `Unconsolidatable` events are unchanged. A deduplicated `DisruptionBlocked` event on the NodePool covers the two cases upstream leaves silent: an `Underutilized` budget used up by disruptions already in progress, and pacing holding back all of a pool's candidates.
 
 Metrics reuse upstream disruption metrics with `consolidation_type="score-based"`. `consolidation_timeouts_total` counts every search the deadline cut short, not only searches that found nothing. The fork adds:
-- `karpenter_voluntary_disruption_score_based_move_evaluations_total{result}`, for what the search rejects;
+- `karpenter_voluntary_disruption_score_based_move_evaluations_total{result}`, for what the search rejects; `no_op` means nothing to do, or needs more than one new node, such as a pair on two new nodes;
 - `karpenter_voluntary_disruption_score_based_moves_selected_total{kind}`, for whether batch and pair moves are used;
 - `karpenter_nodeclaims_evacuated_total{nodepool, capacity_type}`, because evacuations delete nothing and so never appear in `nodeclaims_disrupted_total`;
 - `karpenter_voluntary_disruption_evacuation_duration_seconds{outcome}`;

@@ -32,7 +32,7 @@ import (
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
 
-const batchSourceLabel = "batch-move-source"
+const moveSourceLabel = "move-source"
 
 var _ = Describe("Batch move evacuation", func() {
 	It("drains both sources together and marks each standby as soon as it is empty", func() {
@@ -47,7 +47,7 @@ var _ = Describe("Batch move evacuation", func() {
 		held, other := commands[0].Candidates[0], commands[0].Candidates[1]
 		heldPod, otherPod := podOnNode(held.Node), podOnNode(other.Node)
 		pdb := test.PodDisruptionBudget(test.PDBOptions{
-			Labels: map[string]string{batchSourceLabel: held.Node.Name}, MaxUnavailable: lo.ToPtr(intstr.FromInt(0)),
+			Labels: map[string]string{moveSourceLabel: held.Node.Name}, MaxUnavailable: lo.ToPtr(intstr.FromInt(0)),
 		})
 		ExpectApplied(ctx, env.Client, pdb)
 
@@ -108,7 +108,7 @@ func givenBatchMoveSourcesAndStandbyDestination() {
 	}
 	for i, pod := range paceReplicaSetPods(rs, 2) {
 		source := nodes[i+1]
-		pod.Labels[batchSourceLabel] = source.Name
+		pod.Labels[moveSourceLabel] = source.Name
 		ExpectApplied(ctx, env.Client, pod)
 		ExpectManualBinding(ctx, env.Client, pod, source)
 	}
@@ -121,7 +121,7 @@ func givenBatchMoveSourcesAndStandbyDestination() {
 func podOnNode(node *corev1.Node) *corev1.Pod {
 	GinkgoHelper()
 	pods := &corev1.PodList{}
-	Expect(env.Client.List(ctx, pods, client.MatchingLabels{batchSourceLabel: node.Name})).To(Succeed())
+	Expect(env.Client.List(ctx, pods, client.MatchingLabels{moveSourceLabel: node.Name})).To(Succeed())
 	Expect(pods.Items).To(HaveLen(1))
 	return &pods.Items[0]
 }

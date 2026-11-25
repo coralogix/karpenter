@@ -35,6 +35,8 @@ import (
 
 var scoreBasedSearchParallelism = runtime.GOMAXPROCS(0)
 
+const scoreBasedPairLimit = 256
+
 type move struct {
 	Command         Command
 	SearchScore     moveScore
@@ -96,12 +98,35 @@ type searchStats struct {
 	NoSavings        int
 	NonPositiveScore int
 	TimedOut         bool
+	PairsEvaluated   int
 }
 
-// searchMoves simulates every move and returns the feasible ones, highest search score first.
-func searchMoves(ctx context.Context, sources [][]*Candidate, deadline time.Time, evaluator moveEvaluator, random *rand.Rand, clk clock.Clock) ([]*move, searchStats) {
+type moveSearch struct {
+	evaluator moveEvaluator
+	budgets   map[string]int
+	pacing    *DisruptionPacing
+	deadline  time.Time
+	random    *rand.Rand
+	clk       clock.Clock
+}
+
+func (s moveSearch) run(ctx context.Context, candidates []*Candidate) ([]*move, searchStats) {
+	singles := make([][]*Candidate, len(candidates))
+	for i, c := range candidates {
+		singles[i] = []*Candidate{c}
+	}
+	moves, stats := s.simulate(ctx, singles)
+	if len(moves) > 0 || stats.TimedOut {
+		return moves, stats
+	}
+	pairs, pairStats := s.simulate(ctx, s.choosePairs(candidates))
+	return pairs, stats.addPairPhase(pairStats)
+}
+
+// simulate simulates every move and returns the feasible ones, highest search score first.
+func (s moveSearch) simulate(ctx context.Context, sources [][]*Candidate) ([]*move, searchStats) {
 	sources = slices.Clone(sources)
-	random.Shuffle(len(sources), func(i, j int) { sources[i], sources[j] = sources[j], sources[i] })
+	s.random.Shuffle(len(sources), func(i, j int) { sources[i], sources[j] = sources[j], sources[i] })
 	var stats searchStats
 	var mu sync.Mutex
 	pending := rill.Generate(func(send func([]*Candidate), _ func(error)) {
@@ -109,7 +134,7 @@ func searchMoves(ctx context.Context, sources [][]*Candidate, deadline time.Time
 			if ctx.Err() != nil {
 				return
 			}
-			if clk.Now().After(deadline) {
+			if s.clk.Now().After(s.deadline) {
 				mu.Lock()
 				stats.TimedOut = true
 				mu.Unlock()
@@ -119,11 +144,11 @@ func searchMoves(ctx context.Context, sources [][]*Candidate, deadline time.Time
 		}
 	})
 	valid := rill.FilterMap(pending, scoreBasedSearchParallelism, func(nodes []*Candidate) (*move, bool, error) {
-		s, err := evaluator.evaluate(ctx, nodes)
+		scored, err := s.evaluator.evaluate(ctx, nodes)
 		mu.Lock()
 		defer mu.Unlock()
 		stats.Evaluated++
-		result := moveEvaluationResult(s, err)
+		result := classifyEvaluation(scored, err)
 		countMoveEvaluation(result)
 		switch result {
 		case moveEvaluationError:
@@ -136,11 +161,11 @@ func searchMoves(ctx context.Context, sources [][]*Candidate, deadline time.Time
 		case moveEvaluationNonPositiveScore:
 			stats.NonPositiveScore++
 		default:
-			return &move{Command: s.Command, SearchScore: s.Score}, true, nil
+			return &move{Command: scored.Command, SearchScore: scored.Score}, true, nil
 		}
 		return nil, false, nil
 	})
-	return movesByScore(valid), stats
+	return collectMovesByScore(valid), stats
 }
 
 // scoredCommand is scored on whichever snapshot the evaluator simulates on, so each caller names the score by phase.
@@ -162,7 +187,7 @@ func (e moveEvaluator) evaluate(ctx context.Context, nodes []*Candidate) (*score
 	return &scoredCommand{Command: cmd, Score: scoreMove(cmd, e.inputs)}, nil
 }
 
-func moveEvaluationResult(s *scoredCommand, err error) string {
+func classifyEvaluation(s *scoredCommand, err error) string {
 	switch {
 	case err != nil:
 		return moveEvaluationError
@@ -184,7 +209,7 @@ func (s moveScore) evaluationResult() string {
 	return moveEvaluationFeasible
 }
 
-func movesByScore(valid <-chan rill.Try[*move]) []*move {
+func collectMovesByScore(valid <-chan rill.Try[*move]) []*move {
 	moves := []*move{}
 	for a := range valid {
 		moves = append(moves, a.Value)
@@ -193,10 +218,23 @@ func movesByScore(valid <-chan rill.Try[*move]) []*move {
 	return moves
 }
 
-func batchableMoves(feasible []*move) []*move {
-	return lo.Filter(feasible, func(e *move, _ int) bool { return len(e.Command.Replacements) == 0 })
+func (s searchStats) addPairPhase(pairs searchStats) searchStats {
+	s.Evaluated += pairs.Evaluated
+	s.Errors += pairs.Errors
+	s.NoOp += pairs.NoOp
+	s.NoSavings += pairs.NoSavings
+	s.NonPositiveScore += pairs.NonPositiveScore
+	s.TimedOut = pairs.TimedOut
+	s.PairsEvaluated = pairs.Evaluated
+	return s
 }
 
+// A pair phase that sampled does not prevent marking.
 func (s searchStats) canMarkConsolidated(eligible int, blocked bool) bool {
-	return s.Evaluated == eligible && s.Errors == 0 && !blocked
+	return s.Evaluated-s.PairsEvaluated == eligible && !s.TimedOut && s.Errors == 0 && !blocked
+}
+
+// Pairs share nodes, so only single-node moves join a batch.
+func filterBatchable(feasible []*move) []*move {
+	return lo.Filter(feasible, func(e *move, _ int) bool { return e.kind() == moveKindSingle && len(e.Command.Replacements) == 0 })
 }

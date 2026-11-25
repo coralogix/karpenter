@@ -50,6 +50,7 @@ type moveKind string
 const (
 	moveKindSingle moveKind = "single"
 	moveKindBatch  moveKind = "batch"
+	moveKindPair   moveKind = "pair"
 )
 
 var (
@@ -79,7 +80,7 @@ func init() {
 	for _, result := range []string{moveEvaluationFeasible, moveEvaluationNoOp, moveEvaluationNoSavings, moveEvaluationNonPositiveScore, moveEvaluationError} {
 		ScoreBasedMoveEvaluationsTotal.Add(0, map[string]string{moveEvaluationResultLabel: result})
 	}
-	for _, kind := range []moveKind{moveKindSingle, moveKindBatch} {
+	for _, kind := range []moveKind{moveKindSingle, moveKindBatch, moveKindPair} {
 		ScoreBasedMovesSelectedTotal.Add(0, map[string]string{moveKindLabel: string(kind)})
 	}
 }
@@ -92,7 +93,7 @@ func logScoreDecision(ctx context.Context, choice moveChoice, stats searchStats,
 	fields := []interface{}{
 		"eligibleCandidates", eligible, "evaluatedMoves", stats.Evaluated, "keptMoves", len(choice.Kept),
 		"simulationErrors", stats.Errors, "noOp", stats.NoOp, "noSavings", stats.NoSavings, "nonPositiveScore", stats.NonPositiveScore,
-		"deadlineHit", stats.TimedOut, "duration", duration,
+		"pairsEvaluated", stats.PairsEvaluated, "deadlineHit", stats.TimedOut, "duration", duration,
 		"budgetBlockedNodePools", budgetBlockedPools, "pacingBlockedNodePools", pacingBlockedPools,
 	}
 	failedValidation := 0
@@ -140,7 +141,7 @@ func noMoveReason(kept int, stats searchStats, candidates, eligible int) string 
 }
 
 func chosenMoveLog(chosen validatedMove) map[string]interface{} {
-	if chosen.Kind == moveKindSingle {
+	if chosen.Kind != moveKindBatch {
 		return moveLog(chosen.Move)
 	}
 	return commandLog(chosen.Kind, chosen.Command, chosen.Score, "passed")
@@ -148,7 +149,7 @@ func chosenMoveLog(chosen validatedMove) map[string]interface{} {
 
 func moveLog(m *move) map[string]interface{} {
 	rescored := m.Validation != validationFailed
-	entry := commandLog(moveKindSingle, m.Command, lo.Ternary(rescored, m.ValidationScore, m.SearchScore), m.validationText())
+	entry := commandLog(m.kind(), m.Command, lo.Ternary(rescored, m.ValidationScore, m.SearchScore), m.validationText())
 	if rescored && m.SearchScore.Total != m.ValidationScore.Total {
 		entry["searchScore"] = m.SearchScore.Total
 	}
