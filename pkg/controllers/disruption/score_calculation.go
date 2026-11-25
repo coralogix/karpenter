@@ -17,10 +17,7 @@ limitations under the License.
 package disruption
 
 import (
-	"fmt"
 	"math"
-	"strconv"
-	"time"
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
@@ -49,6 +46,7 @@ type moveScore struct {
 	Cost            float64            `json:"cost"`
 	CostReason      string             `json:"costReason,omitempty"`
 	Utilization     float64            `json:"utilization"`
+	MemoryBalance   memoryBalanceScore `json:"memoryBalance"`
 	Sources         []sourceScore      `json:"sources"`
 }
 
@@ -77,15 +75,18 @@ type instanceTypesByNodePool map[string]map[string]*cloudprovider.InstanceType
 type scoreInputs struct {
 	pricePerCPUByCapacityKey    map[capacityKey]float64
 	utilizationWeightByNodePool map[string]float64
+	memoryByNodePool            map[string]memoryBalancePool
 }
 
 func newScoreInputs(nodes state.StateNodes, instanceTypes instanceTypesByNodePool, candidates []*Candidate, recorder events.Recorder) scoreInputs {
 	priceByKey := map[capacityKey]float64{}
 	cpuByKey := map[capacityKey]float64{}
+	var baseline state.StateNodes
 	for _, n := range nodes {
 		if !n.Managed() || !n.Initialized() || n.MarkedForDeletion() || !n.Node.DeletionTimestamp.IsZero() || standby.HasStandbyTaint(n.Node) {
 			continue
 		}
+		baseline = append(baseline, n)
 		key := capacityKeyOf(n)
 		priceByKey[key] += pscheduling.NodePrice(n, instanceTypes.instanceTypeOf(n))
 		cpuByKey[key] += cpuCores(n.Allocatable())
@@ -93,6 +94,7 @@ func newScoreInputs(nodes state.StateNodes, instanceTypes instanceTypesByNodePoo
 	inputs := scoreInputs{
 		pricePerCPUByCapacityKey:    map[capacityKey]float64{},
 		utilizationWeightByNodePool: map[string]float64{},
+		memoryByNodePool:            newMemoryBalancePools(baseline, candidates, recorder),
 	}
 	for key, cpu := range cpuByKey {
 		if cpu > 0 {
@@ -112,30 +114,25 @@ func (m instanceTypesByNodePool) instanceTypeOf(n *state.StateNode) *cloudprovid
 }
 
 func utilizationWeight(np *v1.NodePool, recorder events.Recorder) float64 {
-	raw, ok := np.Annotations[v1.UtilizationWeightAnnotationKey]
-	if !ok {
-		return defaultUtilizationWeight
-	}
-	weight, err := strconv.ParseFloat(raw, 64)
-	if err != nil || math.IsNaN(weight) || math.IsInf(weight, 0) || weight <= 0 {
-		recorder.Publish(events.Event{InvolvedObject: np, Type: corev1.EventTypeWarning, Reason: events.InvalidUtilizationWeight, Message: fmt.Sprintf("Invalid value %q for annotation %q; using %g", raw, v1.UtilizationWeightAnnotationKey, defaultUtilizationWeight), DedupeValues: []string{string(np.UID), v1.UtilizationWeightAnnotationKey, raw}, DedupeTimeout: 15 * time.Minute})
-		return defaultUtilizationWeight
-	}
-	return weight
+	return readFloatAnnotation(np, recorder, v1.UtilizationWeightAnnotationKey, defaultUtilizationWeight, events.InvalidUtilizationWeight, func(w float64) bool { return w > 0 })
 }
 
-// scoreMove reads the move's inputs from the command and computeScore derives the terms from them, so the formulas can be
-// tested with plain numbers.
+// scoreMove reads the move's inputs from the command, and computeScore and scoreMemoryBalance derive the terms from them,
+// so the formulas can be tested with plain numbers.
 func scoreMove(cmd Command, inputs scoreInputs) moveScore {
 	standbyPrices := map[string]float64{}
+	addedShapes := newNodeShapes(cmd)
 	for _, n := range cmd.Results.ExistingNodes {
 		if len(n.Pods) > 0 && standby.HasStandbyTaint(n.Node) {
 			standbyPrices[n.Name()] = n.Price
+			addedShapes = append(addedShapes, shapeOf(n.Labels()[v1.NodePoolLabelKey], n.Allocatable(), n.DaemonSetRequests()))
 		}
 	}
 	var sources []sourceScore
+	var removedShapes []nodeShape
 	for _, c := range cmd.Candidates {
 		key := capacityKeyOf(c.StateNode)
+		removedShapes = append(removedShapes, shapeOf(key.nodePool, c.Allocatable(), c.DaemonSetRequests()))
 		sources = append(sources, sourceScore{
 			Node:              c.Name(),
 			NodePool:          key.nodePool,
@@ -147,7 +144,10 @@ func scoreMove(cmd Command, inputs scoreInputs) moveScore {
 			UtilizationWeight: inputs.utilizationWeightByNodePool[c.NodePool.Name],
 		})
 	}
-	return computeScore(cmd.ReplacementCost(), standbyPrices, sources)
+	score := computeScore(cmd.ReplacementCost(), standbyPrices, sources)
+	score.MemoryBalance = scoreMemoryBalance(inputs.memoryByNodePool, removedShapes, addedShapes)
+	score.Total += score.MemoryBalance.Contribution
+	return score
 }
 
 func computeScore(newNodePrice float64, standbyPrices map[string]float64, sources []sourceScore) moveScore {

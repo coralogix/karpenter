@@ -61,6 +61,8 @@ const (
 	DisruptionPacingPerMinuteAnnotationKey = "karpenter.coralogix.net/disruption-pacing-per-minute"
 	DisruptionPacingPerBatchAnnotationKey  = "karpenter.coralogix.net/disruption-pacing-per-batch"
 	UtilizationWeightAnnotationKey         = "karpenter.coralogix.net/utilization-weight"
+	MemoryBalanceWeightAnnotationKey       = "karpenter.coralogix.net/memory-balance-weight"
+	MemorySurplusAnnotationKey             = "karpenter.coralogix.net/memory-surplus"
 	ScoreBasedConsolidationAnnotationKey   = "karpenter.coralogix.net/score-based-consolidation"
 	EvacuationTimeoutAnnotationKey         = "karpenter.coralogix.net/evacuation-timeout"
 	ReclamationDelayAnnotationKey          = "karpenter.coralogix.net/reclamation-delay"

@@ -17,7 +17,12 @@ limitations under the License.
 package disruption
 
 import (
+	"fmt"
+	"math"
+	"strconv"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	disruptionevents "sigs.k8s.io/karpenter/pkg/controllers/disruption/events"
@@ -37,4 +42,19 @@ func readDurationAnnotation(np *v1.NodePool, recorder events.Recorder, key, reas
 		return nil
 	}
 	return &duration
+}
+
+// readFloatAnnotation accepts finite values that pass valid; anything else uses fallback and raises a deduplicated
+// Warning event on the NodePool.
+func readFloatAnnotation(np *v1.NodePool, recorder events.Recorder, key string, fallback float64, reason string, valid func(float64) bool) float64 {
+	raw, ok := np.Annotations[key]
+	if !ok {
+		return fallback
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || !valid(value) {
+		recorder.Publish(events.Event{InvolvedObject: np, Type: corev1.EventTypeWarning, Reason: reason, Message: fmt.Sprintf("Invalid value %q for annotation %q; using %g", raw, key, fallback), DedupeValues: []string{string(np.UID), key, raw}, DedupeTimeout: 15 * time.Minute})
+		return fallback
+	}
+	return value
 }

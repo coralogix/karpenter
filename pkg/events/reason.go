@@ -29,6 +29,8 @@ const (
 	ConsolidationApproved      = "ConsolidationApproved"
 	InvalidEvacuationTimeout   = "InvalidEvacuationTimeout"
 	InvalidUtilizationWeight   = "InvalidUtilizationWeight"
+	InvalidMemoryBalanceWeight = "InvalidMemoryBalanceWeight"
+	InvalidMemorySurplus       = "InvalidMemorySurplus"
 	InvalidReclamationDelay    = "InvalidReclamationDelay"
 
 	// provisioning/scheduling

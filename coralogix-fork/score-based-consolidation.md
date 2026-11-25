@@ -1,6 +1,6 @@
 # Score-based consolidation
 
-This fork adds an alternate consolidation disruption method for NodePools that opt in via annotation. It simulates single-node moves, merges pairs of nodes onto one new node when no single-node move helps, grows batch moves that empty several nodes at once, and ranks moves by a score combining normalized cost savings and unused CPU. Empty nodes are not deleted right away; they go on **standby** and are reclaimed later.
+This fork adds an alternate consolidation disruption method for NodePools that opt in via annotation. It simulates single-node moves, merges pairs of nodes onto one new node when no single-node move helps, grows batch moves that empty several nodes at once, and ranks moves by a score combining normalized cost savings, unused CPU and, optionally, memory balance. Empty nodes are not deleted right away; they go on **standby** and are reclaimed later.
 
 ## NodePool configuration
 
@@ -21,6 +21,8 @@ spec:
 |------------|---------|
 | `karpenter.coralogix.net/score-based-consolidation` | Opts the NodePool in (presence is enough; value is ignored). |
 | `karpenter.coralogix.net/utilization-weight` | How much unused CPU counts in the score. Default **0.25**; anything other than a positive number falls back to the default and raises an event on the NodePool. |
+| `karpenter.coralogix.net/memory-balance-weight` | How much moving the pool's memory per CPU toward its target counts in the score. Default **0** (off); anything other than a number ≥ 0 falls back to the default and raises an event on the NodePool. |
+| `karpenter.coralogix.net/memory-surplus` | Spare memory per CPU the pool should keep beyond what workloads request, as a fraction. Default **0.2**; anything other than a number ≥ 0 falls back to the default and raises an event on the NodePool. |
 | `karpenter.coralogix.net/reclamation-delay` | How long a node stays on standby before it may be deleted, with or without capacity decay. Default **15s**. |
 | `karpenter.coralogix.net/evacuation-timeout` | How long an evacuation may run before it is abandoned. Default **5m**. A move whose sources span NodePools uses the shortest. |
 | `karpenter.coralogix.net/reclamation-capacity-decay-half-life` | Turns on [capacity decay](#capacity-decay). How long the kept capacity takes to lose half its excess over active capacity. No default: without a valid value the pool reclaims every standby node after `reclamation-delay`. |
@@ -80,10 +82,13 @@ After the 15-second validation delay, the method re-simulates its ten best moves
 
 ### Score
 
-Each move's **savings** are the source nodes' hourly prices minus the estimated price of any new node and of standby nodes that would be reactivated. A move is chosen only if both its savings and its score are positive. The score is the sum of two terms:
+Each move's **savings** are the source nodes' hourly prices minus the estimated price of any new node and of standby nodes that would be reactivated. A move is chosen only if both its savings and its score are positive. The score is the sum of these terms:
 
 - **Cost**: each source's price per CPU, relative to the average of its NodePool and capacity type, scaled by the fraction of the sources' price the move saves. Comparing within a capacity type stops cheap Spot nodes from always losing to on-demand ones.
 - **Utilization**: each source's unused CPU fraction, multiplied by `utilization-weight`.
+- **Memory balance** (only on pools with a positive `memory-balance-weight`): rewards moves that bring the pool's memory per CPU toward its target, and penalizes moves that take it further away. The pool's memory per CPU is that of its nodes' allocatable resources; the target is the memory per CPU its workloads request, plus `memory-surplus`. Both leave out DaemonSet requests and count only nodes that Karpenter manages and that are initialized, not deleting and not on standby. Within 5% of the target, the term is 0. For each affected pool, the term weighs the memory the move removes against the memory per CPU the pool already has, counting removed sources against any new node or reactivated standby node in that pool, and scales by the number of sources. A pool whose memory per CPU or target is unknown, for example because its pods request no CPU, contributes 0.
+
+The decision log shows each term's contribution and inputs; for memory balance, each affected pool's memory per CPU (`q`), target (`t`), pressure, shape delta, weight and contribution.
 
 ## Events
 
@@ -94,6 +99,7 @@ Each move's **savings** are the source nodes' hourly prices minus the estimated 
 | `Unconsolidatable` | Nodes and NodeClaims | Unchanged from upstream: simulation found the node cannot be consolidated. |
 | `DisruptionBlocked` | NodePool | The pool's `Underutilized` budget is used up by disruptions already in progress, such as running evacuations. A budget that allows no disruptions at all raises upstream's budget event instead. |
 | `DisruptionBlocked` | NodePool | [Disruption pacing](disruption-pacing.md) holds back all of the pool's candidates. |
+| `InvalidUtilizationWeight`, `InvalidMemoryBalanceWeight`, `InvalidMemorySurplus` | NodePool | The matching scoring annotation has an invalid value; the default is used instead. Deduplicated for 15 minutes per value. |
 
 `DisruptionBlocked` events are deduplicated for one minute.
 
