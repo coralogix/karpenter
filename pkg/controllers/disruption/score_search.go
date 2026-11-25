@@ -40,10 +40,8 @@ var scoreBasedValidEvaluationsTarget = 10
 var scoreBasedSearchParallelism = runtime.GOMAXPROCS(0)
 
 type move struct {
-	Command Command
-	// SearchScore is the score from the search simulation.
-	SearchScore moveScore
-	// ValidationScore is the score after validation re-simulation.
+	Command         Command
+	SearchScore     moveScore
 	ValidationScore moveScore
 	Validation      validationStatus
 	// FailureReason explains a failed validation.
@@ -86,12 +84,11 @@ type searchStats struct {
 	TimedOut  bool
 }
 
-// moveScore is a move's savings and the prices it was computed from.
 type moveScore struct {
 	Savings       float64
-	SourcePrice   float64            // sum of the source nodes' prices
-	NewNodePrice  float64            // 0 when the move launches no node
-	StandbyPrices map[string]float64 // reactivated standby nodes by name
+	SourcePrice   float64
+	NewNodePrice  float64
+	StandbyPrices map[string]float64
 }
 
 // searchMoves simulates every move and keeps the most profitable ones.
@@ -115,32 +112,47 @@ func searchMoves(ctx context.Context, sources [][]*Candidate, deadline time.Time
 		}
 	})
 	valid := rill.FilterMap(pending, scoreBasedSearchParallelism, func(nodes []*Candidate) (*move, bool, error) {
-		cmd, err := compute(ctx, nodes...)
+		s, err := evaluateMove(ctx, compute, nodes)
 		mu.Lock()
 		defer mu.Unlock()
 		stats.Evaluated++
-		if err != nil {
+		switch {
+		case err != nil:
 			stats.Errors++
 			log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
 			return nil, false, nil
-		}
-		if cmd.Decision() == NoOpDecision || len(cmd.Replacements) > 1 {
+		case s == nil:
 			stats.NoOp++
 			return nil, false, nil
-		}
-		score := scoreMove(cmd)
-		if score.Savings <= 0 {
+		case s.Score.Savings <= 0:
 			stats.NoSavings++
 			return nil, false, nil
 		}
-		return &move{Command: cmd, SearchScore: score}, true, nil
+		return &move{Command: s.Command, SearchScore: s.Score}, true, nil
 	})
 	moves := topMovesBySavings(valid, scoreBasedValidEvaluationsTarget)
 	return moves, stats
 }
 
-// A validated command keeps the replacement launch options the search priced (see ConsolidationValidator.Validate), so
-// it scores the same way.
+// scoredCommand is scored on whichever snapshot the evaluator simulates on, so each caller names the score by phase.
+type scoredCommand struct {
+	Command Command
+	Score   moveScore
+}
+
+// evaluateMove is the per-move step shared by the search and the rescore: compute the command and score it.
+// It returns nil when the move is a no-op or needs more than one new node.
+func evaluateMove(ctx context.Context, compute consolidationComputer, nodes []*Candidate) (*scoredCommand, error) {
+	cmd, err := compute(ctx, nodes...)
+	if err != nil {
+		return nil, err
+	}
+	if cmd.Decision() == NoOpDecision || len(cmd.Replacements) > 1 {
+		return nil, nil
+	}
+	return &scoredCommand{Command: cmd, Score: scoreMove(cmd)}, nil
+}
+
 func scoreMove(cmd Command) moveScore {
 	standbyPrices := map[string]float64{}
 	for _, n := range cmd.Results.ExistingNodes {

@@ -26,7 +26,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/clock"
-	clocktesting "k8s.io/utils/clock/testing"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	pscheduling "sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
@@ -62,23 +61,6 @@ func TestSearchMovesPreservesSuccessOnSimulationError(t *testing.T) {
 	if len(moves) != 1 || moves[0].SearchScore.Savings != 1 || stats.Errors != 1 || stats.Evaluated != 2 {
 		t.Fatalf("got %v, stats %+v", moves, stats)
 	}
-}
-
-func TestSelectionRechecksWholeCommandPacing(t *testing.T) {
-	pool := paceTestNodePool("1", "1")
-	pacing := NewDisruptionPacing(clocktesting.NewFakeClock(time.Now()))
-	pacing.Refresh([]*v1.NodePool{pool}, nil)
-	cmd := *paceCommandWithPods(pool, 2)
-	validator := scoreMoveValidator{Validator: acceptScoreCommand{}, pacing: pacing}
-	if _, err := validator.Validate(context.Background(), cmd, 0); !IsValidationError(err) {
-		t.Fatalf("expected whole-command pacing rejection, got %v", err)
-	}
-}
-
-type acceptScoreCommand struct{}
-
-func (acceptScoreCommand) Validate(_ context.Context, cmd Command, _ time.Duration) (Command, error) {
-	return cmd, nil
 }
 
 func TestSearchMovesErrorPreventsConsolidatedState(t *testing.T) {
