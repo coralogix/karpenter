@@ -55,7 +55,7 @@ func (s *ScoreBasedConsolidation) rescoreKeptMoves(ctx context.Context, moves []
 		cluster:                    s.cluster,
 		pacing:                     s.disruptionPacing,
 	}
-	return selectBestRescoredCommand(ctx, checks.wrap(compute), s.recorder, moves), nil
+	return selectBestRescoredCommand(ctx, checks.wrap(compute), snapshot.scoreInputs, s.recorder, moves), nil
 }
 
 type rescoreChecks struct {
@@ -123,9 +123,9 @@ func (r rescoreChecks) checkNotNominated(candidates []*Candidate) error {
 	return nil
 }
 
-func selectBestRescoredCommand(ctx context.Context, compute consolidationComputer, recorder events.Recorder, moves []*move) Command {
+func selectBestRescoredCommand(ctx context.Context, compute consolidationComputer, inputs scoreInputs, recorder events.Recorder, moves []*move) Command {
 	for _, m := range moves {
-		rescore(ctx, compute, m)
+		rescore(ctx, compute, inputs, m)
 	}
 	passed := lo.Filter(moves, func(e *move, _ int) bool { return e.Validation == validationPassed })
 	if len(passed) == 0 {
@@ -134,13 +134,13 @@ func selectBestRescoredCommand(ctx context.Context, compute consolidationCompute
 		}
 		return Command{}
 	}
-	best := lo.MaxBy(passed, func(a, b *move) bool { return a.ValidationScore.Savings > b.ValidationScore.Savings })
+	best := lo.MaxBy(passed, func(a, b *move) bool { return a.ValidationScore.Total > b.ValidationScore.Total })
 	best.Selected = true
 	return best.Command
 }
 
-func rescore(ctx context.Context, compute consolidationComputer, m *move) {
-	fresh, err := evaluateMove(ctx, compute, m.Command.Candidates)
+func rescore(ctx context.Context, compute consolidationComputer, inputs scoreInputs, m *move) {
+	fresh, err := evaluateMove(ctx, compute, inputs, m.Command.Candidates)
 	if err == nil && fresh == nil {
 		err = NewSchedulingValidationError(errors.New("move no longer consolidates"))
 	}
@@ -155,7 +155,14 @@ func rescore(ctx context.Context, compute consolidationComputer, m *move) {
 		return
 	}
 	m.Command, m.ValidationScore = fresh.Command, fresh.Score
-	m.Validation = lo.Ternary(fresh.Score.Savings > 0, validationPassed, validationNoSavings)
+	switch {
+	case fresh.Score.Savings <= 0:
+		m.Validation = validationNoSavings
+	case fresh.Score.Total <= 0:
+		m.Validation = validationNonPositiveScore
+	default:
+		m.Validation = validationPassed
+	}
 }
 
 func scoreBasedValidationFailureReason(err error) string {
