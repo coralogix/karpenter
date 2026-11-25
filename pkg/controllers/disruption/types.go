@@ -212,6 +212,7 @@ type Command struct {
 	Succeeded bool
 
 	staticNodeCountReservationHandedOff bool
+	evacuationProgressByProviderID      map[string]evacuationProgress
 
 	CreationTimestamp time.Time
 	ID                uuid.UUID

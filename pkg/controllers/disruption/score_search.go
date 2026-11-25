@@ -28,11 +28,10 @@ import (
 	"k8s.io/utils/clock"
 
 	"github.com/destel/rill"
+	"github.com/samber/lo"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
-
-var scoreBasedValidEvaluationsTarget = 10
 
 var scoreBasedSearchParallelism = runtime.GOMAXPROCS(0)
 
@@ -42,13 +41,14 @@ type move struct {
 	ValidationScore moveScore
 	Validation      validationStatus
 	FailureReason   string
-	Selected        bool
 }
 
 type validationStatus int
 
 const (
-	validationPassed validationStatus = iota
+	// validationNotRun is for moves outside the kept moves, which only batch moves use.
+	validationNotRun validationStatus = iota
+	validationPassed
 	// validationFailed means validation errored, so there is no rescored score.
 	validationFailed
 	validationNoSavings
@@ -56,7 +56,7 @@ const (
 )
 
 func (m *move) validationRejected() bool {
-	return m.Validation != validationPassed
+	return m.Validation != validationNotRun && m.Validation != validationPassed
 }
 
 func (m *move) validationText() string {
@@ -98,7 +98,7 @@ type searchStats struct {
 	TimedOut         bool
 }
 
-// searchMoves simulates every move and keeps the highest-scoring ones.
+// searchMoves simulates every move and returns the feasible ones, highest search score first.
 func searchMoves(ctx context.Context, sources [][]*Candidate, deadline time.Time, evaluator moveEvaluator, random *rand.Rand, clk clock.Clock) ([]*move, searchStats) {
 	sources = slices.Clone(sources)
 	random.Shuffle(len(sources), func(i, j int) { sources[i], sources[j] = sources[j], sources[i] })
@@ -123,31 +123,24 @@ func searchMoves(ctx context.Context, sources [][]*Candidate, deadline time.Time
 		mu.Lock()
 		defer mu.Unlock()
 		stats.Evaluated++
-		switch {
-		case err != nil:
-			stats.Errors++
-			countMoveEvaluation(moveEvaluationError)
-			log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
-			return nil, false, nil
-		case s == nil:
-			stats.NoOp++
-			countMoveEvaluation(moveEvaluationNoOp)
-			return nil, false, nil
-		}
-		result := s.Score.evaluationResult()
+		result := moveEvaluationResult(s, err)
 		countMoveEvaluation(result)
 		switch result {
+		case moveEvaluationError:
+			stats.Errors++
+			log.FromContext(ctx).Error(err, "failed computing score-based consolidation")
+		case moveEvaluationNoOp:
+			stats.NoOp++
 		case moveEvaluationNoSavings:
 			stats.NoSavings++
-			return nil, false, nil
 		case moveEvaluationNonPositiveScore:
 			stats.NonPositiveScore++
-			return nil, false, nil
+		default:
+			return &move{Command: s.Command, SearchScore: s.Score}, true, nil
 		}
-		return &move{Command: s.Command, SearchScore: s.Score}, true, nil
+		return nil, false, nil
 	})
-	moves := topMovesByScore(valid, scoreBasedValidEvaluationsTarget)
-	return moves, stats
+	return movesByScore(valid), stats
 }
 
 // scoredCommand is scored on whichever snapshot the evaluator simulates on, so each caller names the score by phase.
@@ -169,6 +162,16 @@ func (e moveEvaluator) evaluate(ctx context.Context, nodes []*Candidate) (*score
 	return &scoredCommand{Command: cmd, Score: scoreMove(cmd, e.inputs)}, nil
 }
 
+func moveEvaluationResult(s *scoredCommand, err error) string {
+	switch {
+	case err != nil:
+		return moveEvaluationError
+	case s == nil:
+		return moveEvaluationNoOp
+	}
+	return s.Score.evaluationResult()
+}
+
 // evaluationResult is the rule for keeping a move, shared by the search and the rescore: a move is feasible only if it
 // saves money and scores above zero.
 func (s moveScore) evaluationResult() string {
@@ -181,16 +184,17 @@ func (s moveScore) evaluationResult() string {
 	return moveEvaluationFeasible
 }
 
-func topMovesByScore(valid <-chan rill.Try[*move], limit int) []*move {
+func movesByScore(valid <-chan rill.Try[*move]) []*move {
 	moves := []*move{}
 	for a := range valid {
 		moves = append(moves, a.Value)
 	}
 	sort.SliceStable(moves, func(i, j int) bool { return moves[i].SearchScore.Total > moves[j].SearchScore.Total })
-	if len(moves) > limit {
-		moves = moves[:limit]
-	}
 	return moves
+}
+
+func batchableMoves(feasible []*move) []*move {
+	return lo.Filter(feasible, func(e *move, _ int) bool { return len(e.Command.Replacements) == 0 })
 }
 
 func (s searchStats) canMarkConsolidated(eligible int, blocked bool) bool {
