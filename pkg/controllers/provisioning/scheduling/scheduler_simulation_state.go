@@ -202,7 +202,7 @@ func NodePrice(node *state.StateNode, instanceType *cloudprovider.InstanceType) 
 
 func sortPreparedExistingNodes(nodes []*preparedExistingNode) {
 	sort.SliceStable(nodes, func(i, j int) bool {
-		return existingNodeLess(nodes[i].stateNode, nodes[j].stateNode)
+		return existingNodeLess(nodes[i].stateNode, nodes[i].price, nodes[j].stateNode, nodes[j].price)
 	})
 }
 
