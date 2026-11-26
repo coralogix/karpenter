@@ -24,6 +24,17 @@ _Avoid_: emptiness, empty consolidation
 The time a node must stay in standby before reclamation may delete it.
 _Avoid_: consolidateAfter
 
+**Kept capacity**:
+The CPU a NodePool holds, its active and standby nodes together.
+
+**Active capacity**:
+The CPU of nodes that are not standby, whether or not pods use all of it. For capacity decay it includes the NodePool's own nodes and those of the NodePools whose work it should be ready to take over.
+_Avoid_: in-use capacity, requested CPU
+
+**Capacity decay**:
+How a NodePool's kept capacity falls from a recent peak of active capacity back toward the current active capacity, faster or slower depending on whether new capacity was recently hard to get. Standby nodes beyond the kept capacity are reclaimed.
+_Avoid_: standby decay, exponential reclamation
+
 **Reactivation**:
 The decision to let a standby node take pods again. Provisioning and evacuation make this decision in the same way.
 _Avoid_: activation

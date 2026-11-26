@@ -21,10 +21,14 @@ spec:
 |------------|---------|
 | `karpenter.coralogix.net/score-based-consolidation` | Opts the NodePool in (presence is enough; value is ignored). |
 | `karpenter.coralogix.net/utilization-weight` | How much unused CPU counts in the score. Default **0.25**; anything other than a positive number falls back to the default and raises an event on the NodePool. |
-| `karpenter.coralogix.net/reclamation-delay` | How long a node stays on standby before it may be deleted. Default **15s**. |
+| `karpenter.coralogix.net/reclamation-delay` | How long a node stays on standby before it may be deleted, with or without capacity decay. Default **15s**. |
 | `karpenter.coralogix.net/evacuation-timeout` | How long an evacuation may run before it is abandoned. Default **5m**. A move whose sources span NodePools uses the shortest. |
+| `karpenter.coralogix.net/reclamation-capacity-decay-half-life` | Turns on [capacity decay](#capacity-decay). How long the kept capacity takes to lose half its excess over active capacity. No default: without a valid value the pool reclaims every standby node after `reclamation-delay`. |
+| `karpenter.coralogix.net/reclamation-capacity-decay-insufficient-capacity-half-life` | The half-life while the pool's own NodeClaims have failed to launch for insufficient capacity within the insufficient-capacity window. Defaults to `reclamation-capacity-decay-half-life`. |
+| `karpenter.coralogix.net/reclamation-capacity-decay-insufficient-capacity-window` | How long after the pool's last insufficient-capacity launch failure the insufficient-capacity half-life applies. Default **1h**. |
+| `karpenter.coralogix.net/reclamation-capacity-decay-pools` | Comma-separated NodePool names whose active capacity counts toward this pool's kept capacity, such as an on-demand fallback pool. Ignored without a valid half-life. |
 
-Both durations are Go durations. `0s` is taken literally; empty, malformed, or negative values fall back to the default and raise an event on the NodePool.
+The durations are Go durations. `0s` is taken literally; empty, malformed, or negative values fall back to the default and raise a Warning event on the NodePool. An invalid half-life turns capacity decay off, and an invalid insufficient-capacity half-life falls back to the normal half-life.
 
 Optional [disruption pacing](disruption-pacing.md) annotations apply as well.
 
@@ -38,7 +42,27 @@ The fork limits single-node consolidation of other NodePools to one minute per s
 
 Empty nodes are tainted `karpenter.coralogix.net/standby:NoSchedule` and annotated with the time they entered standby, rather than deleted. Standby requires `spec.disruption.consolidateAfter` to be set. Karpenter manages these marks; do not set them in manifests. Marking evicts nothing and uses no disruption budget.
 
-**Reclamation** deletes a node that is still empty and has been on standby for `reclamation-delay`. It uses the `Empty` reason and budgets and is not paced.
+**Reclamation** deletes a node that is still empty and has been on standby for `reclamation-delay`. On a pool with capacity decay, it deletes only such nodes beyond the pool's kept capacity. The delay gives the scheduler time to see the standby taint, so a node is not deleted while a pod is being scheduled onto it. It uses the `Empty` reason and budgets and is not paced.
+
+#### Capacity decay
+
+```yaml
+metadata:
+  annotations:
+    karpenter.coralogix.net/reclamation-capacity-decay-half-life: "2m"
+    karpenter.coralogix.net/reclamation-capacity-decay-insufficient-capacity-half-life: "10m"
+    karpenter.coralogix.net/reclamation-capacity-decay-pools: "ondemand-fallback-node-pool"
+```
+
+On every disruption pass, a pool with capacity decay measures its **active capacity**: the allocatable CPU of initialized nodes that are neither standby nor being deleted, in the pool itself and in the pools it lists. Its **kept capacity** rises at once to any higher active capacity. Otherwise it falls toward the current active capacity, and the excess halves every half-life.
+
+The pool may keep standby nodes up to its kept capacity minus its own active capacity. Standby nodes that reclamation may not delete, such as nodes with `karpenter.sh/do-not-disrupt`, nominated nodes, nodes with buffer pods or nodes on standby for less than `reclamation-delay`, use up this allowance first. Then the newest standby nodes are kept while the remaining allowance covers at least half of each node's cores. The others are reclaimed, oldest first, within the `Empty` budget. A lone freed node therefore stays on standby for about one half-life, and never less than `reclamation-delay`.
+
+The insufficient-capacity half-life applies while the pool's own NodeClaims have failed to launch for insufficient capacity within the insufficient-capacity window (default 1h); failures in listed pools do not count. Core sees only launches that fail as a whole, not instance types the provider refuses within a launch that succeeds.
+
+Both the kept capacity and the failure record are in memory. After a restart, the kept capacity starts at the larger of the active capacity and the pool's own active and standby capacity, so a restart can only delay reclamation, and the normal half-life applies until the next failure.
+
+Capacity decay applies only to the pool that sets the half-life. Listed pools keep their own reclamation.
 
 ### Reactivation
 
@@ -93,6 +117,7 @@ The fork adds:
 - `karpenter_nodes_standby_reactivated_total{nodepool, source}`: standby nodes reactivated. `source` is `provisioning` or `disruption`, whichever decision placed pods on the node.
 - `karpenter_nodes_standby_duration_seconds{nodepool, outcome}`: how long a node stayed on standby, recorded once when standby ends. `outcome` is `reactivated` when pods were placed on the node, `reclaimed` when a reclamation deletes it (measured up to when the reclamation started; a reclamation that fails records none of its nodes, and any it left on standby are recorded when they later leave it), or `repaired` when Karpenter cleared standby for another reason, such as a pod reaching the node without a scheduling result, or the NodePool no longer allowing standby nodes. Standby nodes deleted for other reasons, such as drift or expiration, are not recorded.
 - `karpenter_nodepools_standby_nodes{nodepool}`: standby nodes per NodePool, set on every disruption pass. A NodePool's series disappears when the pool is deleted, stops using score-based consolidation, or can no longer hold standby nodes (`consolidateAfter: Never`).
+- `karpenter_nodepools_reclamation_kept_cpu{nodepool}`: the kept capacity in CPU cores of each NodePool with [capacity decay](#capacity-decay), set on every disruption pass. A NodePool's series disappears when the pool is deleted or capacity decay turns off.
 
 ## Spans
 

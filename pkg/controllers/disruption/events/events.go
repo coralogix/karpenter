@@ -147,7 +147,7 @@ func NodePoolHeldBackByPacing(nodePool *v1.NodePool, reason v1.DisruptionReason)
 	}
 }
 
-func InvalidDuration(nodePool *v1.NodePool, annotation, raw string, fallback time.Duration, reason string) events.Event {
+func InvalidDuration(nodePool *v1.NodePool, annotation, raw, fallback, reason string) events.Event {
 	return events.Event{
 		InvolvedObject: nodePool,
 		Type:           corev1.EventTypeWarning,

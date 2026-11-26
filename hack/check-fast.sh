@@ -32,6 +32,13 @@ Failure summaries are limited to 16 KiB, 10 failures, 40 context lines per
 failure, and 1 KiB per line. Truncated details remain in the full log.
 Progress is printed every 15 seconds while tests run.
 
+The last line of every run is the result; read it instead of the full log:
+  check-fast: RESULT pass (22 Passed | 0 Failed | 2 Pending | 341 Skipped)
+  check-fast: RESULT fail (3 Passed | 1 Failed | ...): <failed spec or test>; ...
+  check-fast: RESULT build-failed
+  check-fast: RESULT no-tests
+A fail lists up to 10 failed Ginkgo specs, or failed top-level Go tests.
+
 Envtest defaults to installed Kubernetes 1.36.2 assets. Install missing assets
 separately with: go tool -modfile=go.tools.mod setup-envtest use -p path 1.36.2
 EOF
@@ -176,6 +183,34 @@ summarize_failure() {
     printf 'check-fast: full log: %s\n' "$test_output" | LC_ALL=C cut -b 1-1023
 }
 
+# print_result prints the run's last line: pass, fail with Ginkgo counts and failed names, build-failed or no-tests.
+print_result() {
+    local log counts failed
+    log="$(sed $'s/\033\\[[0-9;]*m//g' "$test_output")"
+    if [[ "$1" == fail ]] && grep -Eq '\[(build|setup) failed\]' <<<"$log"; then
+        echo 'check-fast: RESULT build-failed'
+        return
+    fi
+    if [[ "$1" == no-tests ]]; then
+        echo 'check-fast: RESULT no-tests'
+        return
+    fi
+    counts="$(sed -nE 's/^(SUCCESS!|FAIL!) -- //p' <<<"$log" | tail -1)"
+    if [[ -z "$counts" ]]; then
+        counts="$(grep -Ec '^--- PASS: ' <<<"$log" || true) Go tests passed"
+    fi
+    if [[ "$1" == pass ]]; then
+        echo "check-fast: RESULT pass ($counts)"
+        return
+    fi
+    failed="$(sed -nE 's/^[[:space:]]*\[(FAIL|PANICKED!|TIMEDOUT|INTERRUPTED)\] (.* \[[A-Za-z]+\] .*)$/\2/p' <<<"$log")"
+    if [[ -z "$failed" ]]; then
+        failed="$(sed -nE 's/^--- FAIL: ([^ ]+).*/\1/p' <<<"$log")"
+    fi
+    failed="$(sort -u <<<"$failed" | sed '/^$/d' | head -10 | paste -sd ';' - | sed 's/;/; /g')"
+    printf 'check-fast: RESULT fail (%s): %s\n' "$counts" "${failed:-see summary above}" | LC_ALL=C cut -b 1-2047
+}
+
 cd "$(dirname "$0")/.."
 run=''
 focus=''
@@ -290,6 +325,7 @@ trap - EXIT
 
 if ((test_status != 0)); then
     summarize_failure "tests failed (exit status $test_status)"
+    print_result fail
     exit "$test_status"
 fi
 test_elapsed=$((SECONDS - test_start))
@@ -301,13 +337,16 @@ sed $'s/\033\\[[0-9;]*m//g' "$test_output" > "$parse_output"
 if ! grep -q '^=== RUN ' "$parse_output"; then
     if $full && grep -Eq '^\?[[:space:]]+[^[:space:]]+[[:space:]]+\[no test files\]$' "$parse_output"; then
         echo "check-fast: $pkg — compiled; no test files (${test_elapsed}s)"
+        print_result no-tests
         exit 0
     fi
     summarize_failure 'No tests ran; correct the test filter'
+    print_result no-tests
     exit 1
 fi
 if [[ -n "$focus" ]] && ! grep -Eq '^Ran [1-9][0-9]* of [0-9]+ Specs' "$parse_output"; then
     summarize_failure 'No Ginkgo specs ran; ensure --run selects the suite entry point'
+    print_result no-tests
     exit 1
 fi
 ginkgo_summary="$(grep -E '^Ran [0-9]+ of [0-9]+ Specs' "$parse_output" | tail -1 || true)"
@@ -321,3 +360,4 @@ awk '
     /^(ok[[:space:]]|Ran |SUCCESS!)/ { print }
     END { printf "Go tests started: %d (+ %d subtests)\n", tests, subtests }
 ' "$parse_output"
+print_result pass

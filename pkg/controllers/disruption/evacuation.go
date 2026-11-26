@@ -74,6 +74,8 @@ var (
 
 const evacuationOutcomeLabel = "outcome"
 
+const defaultEvacuationTimeout = 5 * time.Minute
+
 type evacuationProgress int
 
 const (
@@ -193,5 +195,5 @@ func commandEvacuationTimeout(cmd *Command, recorder events.Recorder) time.Durat
 }
 
 func evacuationTimeout(np *v1.NodePool, recorder events.Recorder) time.Duration {
-	return readDurationAnnotation(np, recorder, v1.EvacuationTimeoutAnnotationKey, 5*time.Minute, events.InvalidEvacuationTimeout)
+	return lo.FromPtrOr(readDurationAnnotation(np, recorder, v1.EvacuationTimeoutAnnotationKey, events.InvalidEvacuationTimeout, defaultEvacuationTimeout.String()), defaultEvacuationTimeout)
 }

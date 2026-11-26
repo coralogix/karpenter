@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
+	"sigs.k8s.io/karpenter/pkg/utils/insufficientcapacity"
 )
 
 type Launch struct {
@@ -84,6 +85,7 @@ func (l *Launch) launchNodeClaim(ctx context.Context, nodeClaim *v1.NodeClaim) (
 		switch {
 		case cloudprovider.IsInsufficientCapacityError(err):
 			l.recorder.Publish(InsufficientCapacityErrorEvent(nodeClaim, err))
+			insufficientcapacity.Record(nodeClaim.Labels[v1.NodePoolLabelKey], l.clock.Now())
 			log.FromContext(ctx).Error(err, "failed launching nodeclaim")
 
 			if err = l.kubeClient.Delete(ctx, nodeClaim); err != nil {
