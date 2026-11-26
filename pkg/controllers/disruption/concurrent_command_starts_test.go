@@ -46,13 +46,8 @@ var _ = Describe("Concurrent command starts", func() {
 	})
 
 	It("keeps the standby timestamp of an evacuation source that went standby after the snapshot", func() {
-		_, _, source := givenStandbyDestinationAndSource()
-		reconcileThroughValidationDelay(disruptionController)
-		sourceNode := queuedSourceNode()
-		markedAt := markStandbyAfterSnapshot(sourceNode)
-		env.Clock.Step(time.Minute)
+		source, sourceNode, markedAt := givenEvictionStartedAfterSourceWentStandby()
 
-		ExpectObjectReconciled(ctx, env.Client, queue, source)
 		finishEvacuation(source)
 
 		expectMarkedStandby(sourceNode)
@@ -62,50 +57,14 @@ var _ = Describe("Concurrent command starts", func() {
 	It("lets only one command hold a node", func() {
 		nodePool, nodeClaim, node := givenStandbyNode(v1.ConsolidationPolicyWhenEmptyOrUnderutilized, nil)
 
-		errs := startConcurrently(driftCommand(nodePool, node), driftCommand(nodePool, node))
+		errs := startConcurrentlyAndFinish(nodeClaim, driftCommand(nodePool, node), driftCommand(nodePool, node))
 
 		Expect(errs).To(ConsistOf(Succeed(), HaveOccurred()))
-		expectOnlyCommandCompletes(nodeClaim)
+		ExpectNotFound(ctx, env.Client, nodeClaim)
+		Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(1))
+		Expect(queue.IsEmpty()).To(BeTrue())
 	})
 })
-
-func driftCommand(nodePool *v1.NodePool, node *corev1.Node) *disruption.Command {
-	GinkgoHelper()
-	nct := scheduling.NewNodeClaimTemplate(nodePool)
-	nct.InstanceTypeOptions = cloudProvider.InstanceTypes
-	return &disruption.Command{
-		Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
-		CreationTimestamp: env.Clock.Now(),
-		ID:                uuid.New(),
-		Candidates:        []*disruption.Candidate{{StateNode: ExpectStateNodeExists(cluster, node), NodePool: nodePool}},
-		Replacements:      []*disruption.Replacement{{NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct}}},
-	}
-}
-
-func startConcurrently(cmds ...*disruption.Command) []error {
-	errs := make([]error, len(cmds))
-	ExpectParallelized(lo.Map(cmds, func(cmd *disruption.Command, i int) func() {
-		return func() { errs[i] = queue.StartCommand(ctx, cmd) }
-	})...)
-	return errs
-}
-
-// expectOnlyCommandCompletes checks that a single command holds the node, launched one replacement and, once the
-// replacement is ready, deletes the node's NodeClaim.
-func expectOnlyCommandCompletes(nodeClaim *v1.NodeClaim) {
-	GinkgoHelper()
-	cmds := queue.GetCommands()
-	Expect(cmds).To(HaveLen(1))
-	Expect(ExpectNodeClaims(ctx, env.Client)).To(HaveLen(2))
-	replacement := &v1.NodeClaim{}
-	Expect(env.Client.Get(ctx, client.ObjectKey{Name: cmds[0].Replacements[0].Name}, replacement)).To(Succeed())
-	replacement, replacementNode := ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, replacement)
-	refreshStandbyState(replacementNode, replacement)
-	ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
-	ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
-	ExpectNotFound(ctx, env.Client, nodeClaim)
-	Expect(queue.IsEmpty()).To(BeTrue())
-}
 
 // givenActiveDestinationAndSource sets up a source a move would empty onto a destination that is not standby, and
 // returns the destination. The destination runs a pod, so standby marking leaves it alone.
@@ -132,4 +91,50 @@ func markStandbyAfterSnapshot(node *corev1.Node) string {
 	stored := &corev1.Node{}
 	Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(node), stored)).To(Succeed())
 	return stored.Annotations[v1.StandbyNodeAnnotationKey]
+}
+
+// givenEvictionStartedAfterSourceWentStandby queues an evacuation, marks its source standby after the snapshot, steps
+// the clock a minute so a fresh mark would differ, and starts the eviction. It returns the source's NodeClaim and Node
+// and the source's standby timestamp.
+func givenEvictionStartedAfterSourceWentStandby() (*v1.NodeClaim, *corev1.Node, string) {
+	GinkgoHelper()
+	_, _, source := givenStandbyDestinationAndSource()
+	reconcileThroughValidationDelay(disruptionController)
+	sourceNode := queuedSourceNode()
+	markedAt := markStandbyAfterSnapshot(sourceNode)
+	env.Clock.Step(time.Minute)
+	ExpectObjectReconciled(ctx, env.Client, queue, source)
+	return source, sourceNode, markedAt
+}
+
+func driftCommand(nodePool *v1.NodePool, node *corev1.Node) *disruption.Command {
+	GinkgoHelper()
+	nct := scheduling.NewNodeClaimTemplate(nodePool)
+	nct.InstanceTypeOptions = cloudProvider.InstanceTypes
+	return &disruption.Command{
+		Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+		CreationTimestamp: env.Clock.Now(),
+		ID:                uuid.New(),
+		Candidates:        []*disruption.Candidate{{StateNode: ExpectStateNodeExists(cluster, node), NodePool: nodePool}},
+		Replacements:      []*disruption.Replacement{{NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct}}},
+	}
+}
+
+// startConcurrentlyAndFinish starts the commands at once, readies the replacements of the queued commands and lets the
+// queue delete the node's NodeClaim. It returns each start's error.
+func startConcurrentlyAndFinish(nodeClaim *v1.NodeClaim, cmds ...*disruption.Command) []error {
+	GinkgoHelper()
+	errs := make([]error, len(cmds))
+	ExpectParallelized(lo.Map(cmds, func(cmd *disruption.Command, i int) func() {
+		return func() { errs[i] = queue.StartCommand(ctx, cmd) }
+	})...)
+	for _, cmd := range queue.GetCommands() {
+		replacement := &v1.NodeClaim{}
+		Expect(env.Client.Get(ctx, client.ObjectKey{Name: cmd.Replacements[0].Name}, replacement)).To(Succeed())
+		replacement, replacementNode := ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, replacement)
+		refreshStandbyState(replacementNode, replacement)
+	}
+	ExpectObjectReconciled(ctx, env.Client, queue, nodeClaim)
+	ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim)
+	return errs
 }

@@ -329,6 +329,15 @@ func (q *Queue) createReplacementNodeClaims(ctx context.Context, cmd *Command) e
 // 3. Spin up replacement nodes
 // 4. Add Command to the queue to wait to delete the candidates.
 func (q *Queue) StartCommand(ctx context.Context, cmd *Command) (err error) {
+	log.FromContext(ctx).WithValues(append([]any{
+		"command", cmd.String(),
+	}, cmd.LogValues()...)...).Info("disrupting node(s)")
+
+	// Standby marking does not hold its nodes.
+	if cmd.Method != nil && cmd.ConsolidationType() == StandbyMarkingConsolidationType {
+		return q.executeStandbyMarking(ctx, cmd)
+	}
+
 	// Checking and recording the candidates is one step, so two commands cannot both take a node (ADR-0012).
 	providerIDs := cmd.providerIDs()
 	if !q.hold(cmd, providerIDs) {
@@ -339,16 +348,6 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) (err error) {
 			q.release(cmd, providerIDs...)
 		}
 	}()
-
-	log.FromContext(ctx).WithValues(append([]any{
-		"command", cmd.String(),
-	}, cmd.LogValues()...)...).Info("disrupting node(s)")
-
-	if cmd.Method != nil && cmd.ConsolidationType() == StandbyMarkingConsolidationType {
-		// Standby marking does not hold its nodes.
-		q.release(cmd, providerIDs...)
-		return q.executeStandbyMarking(ctx, cmd)
-	}
 
 	// Cordon the old nodes before we launch the replacements to prevent new pods from scheduling to the old nodes
 	markedCandidates, markDisruptedErr := q.markDisrupted(ctx, cmd)
@@ -402,34 +401,6 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) (err error) {
 	return nil
 }
 
-func (c *Command) providerIDs() []string {
-	return lo.Map(c.Candidates, func(candidate *Candidate, _ int) string { return candidate.ProviderID() })
-}
-
-// hold records the command for the given nodes, unless a command already holds any of them.
-func (q *Queue) hold(cmd *Command, providerIDs []string) bool {
-	q.Lock()
-	defer q.Unlock()
-	if lo.SomeBy(providerIDs, func(id string) bool { return lo.HasKey(q.ProviderIDToCommand, id) }) {
-		return false
-	}
-	for _, id := range providerIDs {
-		q.ProviderIDToCommand[id] = cmd
-	}
-	return true
-}
-
-// release removes the command from the given nodes, leaving nodes that another command holds.
-func (q *Queue) release(cmd *Command, providerIDs ...string) {
-	q.Lock()
-	defer q.Unlock()
-	for _, id := range providerIDs {
-		if q.ProviderIDToCommand[id] == cmd {
-			delete(q.ProviderIDToCommand, id)
-		}
-	}
-}
-
 func (q *Queue) executeStandbyMarking(ctx context.Context, cmd *Command) error {
 	errs := make([]error, len(cmd.Candidates))
 	workqueue.ParallelizeUntil(ctx, len(cmd.Candidates), len(cmd.Candidates), func(i int) {
@@ -459,6 +430,34 @@ func (q *Queue) recordCommandPerformed(cmd *Command) {
 		metrics.ReasonLabel:    strings.ToLower(string(cmd.Reason())),
 		ConsolidationTypeLabel: cmd.ConsolidationType(),
 	})
+}
+
+func (c *Command) providerIDs() []string {
+	return lo.Map(c.Candidates, func(candidate *Candidate, _ int) string { return candidate.ProviderID() })
+}
+
+// hold records the command for the given nodes, unless a command already holds any of them.
+func (q *Queue) hold(cmd *Command, providerIDs []string) bool {
+	q.Lock()
+	defer q.Unlock()
+	if lo.SomeBy(providerIDs, func(id string) bool { return lo.HasKey(q.ProviderIDToCommand, id) }) {
+		return false
+	}
+	for _, id := range providerIDs {
+		q.ProviderIDToCommand[id] = cmd
+	}
+	return true
+}
+
+// release removes the command from the given nodes, leaving nodes that another command holds.
+func (q *Queue) release(cmd *Command, providerIDs ...string) {
+	q.Lock()
+	defer q.Unlock()
+	for _, id := range providerIDs {
+		if q.ProviderIDToCommand[id] == cmd {
+			delete(q.ProviderIDToCommand, id)
+		}
+	}
 }
 
 // HasAny checks to see if the candidate is part of an currently executing command.

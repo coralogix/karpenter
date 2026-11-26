@@ -108,6 +108,7 @@ func NewControllers(
 		p, evictionQueue, disruptionQueue,
 		disruption.NewController(clock, kubeClient, p, cloudProvider, recorder, cluster, disruptionQueue, clusterCost,
 			disruption.WithNodePoolReader(mgr.GetAPIReader())),
+		disruption.NewStandbyLoop(clock, kubeClient, cloudProvider, recorder, cluster, disruptionQueue),
 		provisioning.NewPodController(kubeClient, p, cluster),
 		provisioning.NewNodeController(kubeClient, p),
 		nodepoolhash.NewController(kubeClient, cloudProvider),

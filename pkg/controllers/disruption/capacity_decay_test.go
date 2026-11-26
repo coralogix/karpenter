@@ -40,7 +40,7 @@ var _ = Describe("Capacity decay", func() {
 		_, nodeClaims, nodes := givenStandbyNodesOldestFirst(4, map[string]string{
 			disruption.CapacityDecayHalfLifeAnnotationKey: "2m",
 		})
-		reconcileDisruption()
+		reconcileStandby()
 
 		reconcileAfterAll(2*time.Minute, nodes, nodeClaims)
 
@@ -53,7 +53,7 @@ var _ = Describe("Capacity decay", func() {
 			disruption.CapacityDecayInsufficientCapacityHalfLifeAnnotationKey: "10m",
 		})
 		insufficientcapacity.Record(nodePool.Name, env.Clock.Now())
-		reconcileDisruption()
+		reconcileStandby()
 
 		reconcileAfterAll(2*time.Minute, nodes, nodeClaims)
 
@@ -68,7 +68,7 @@ var _ = Describe("Capacity decay", func() {
 			disruption.CapacityDecayHalfLifeAnnotationKey: "2m",
 			disruption.CapacityDecayPoolsAnnotationKey:    " , " + fallbackPool.Name + " ,",
 		})
-		reconcileDisruption()
+		reconcileStandby()
 
 		reconcileAfterAll(20*time.Minute, nodes, nodeClaims)
 
@@ -81,7 +81,7 @@ var _ = Describe("Capacity decay", func() {
 			v1.ReclamationDelayAnnotationKey:              "0s",
 		})
 
-		reconcileDisruption()
+		reconcileStandby()
 
 		expectReclaimedInOrder(nodes[0])
 		expectWarning(nodePool, disruption.InvalidCapacityDecayHalfLife)

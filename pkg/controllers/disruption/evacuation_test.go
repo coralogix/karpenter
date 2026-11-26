@@ -73,7 +73,7 @@ var _ = Describe("Evacuation", func() {
 		ExpectMetricHistogramSampleCountValue("karpenter_voluntary_disruption_evacuation_duration_seconds", 1, map[string]string{"outcome": "succeeded"})
 
 		refreshStandbyStates([]*corev1.Node{node, destination}, ExpectNodeClaims(ctx, env.Client))
-		reconcileDisruption()
+		reconcileStandby()
 		ExpectMetricGaugeValue(disruption.NodePoolStandbyNodes, 1, map[string]string{metrics.NodePoolLabel: pool.Name})
 	},
 		Entry("WhenEmptyOrUnderutilized", v1.ConsolidationPolicyWhenEmptyOrUnderutilized),
@@ -164,19 +164,17 @@ var _ = Describe("Evacuation", func() {
 		sourceNode := queuedSourceNode()
 		restartDuringEvacuation(empty, sourceNode, destination)
 
-		reconcileDisruption()
-
-		expectNoDisruptedTaint(sourceNode)
 		if empty {
-			expectMarkedStandby(sourceNode)
+			reconcileDisruption()
+			reconcileStandby()
 		} else {
-			refreshStandbyStates([]*corev1.Node{sourceNode, destination}, ExpectNodeClaims(ctx, env.Client))
 			reconcileThroughValidationDelay(disruptionController)
 			Expect(queue.GetCommands()).To(HaveLen(1))
 			ExpectObjectReconciled(ctx, env.Client, queue, source)
 			finishEvacuation(source)
-			expectMarkedStandby(sourceNode)
 		}
+		expectNoDisruptedTaint(sourceNode)
+		expectMarkedStandby(sourceNode)
 		expectNodeClaimRetained(source)
 	}, Entry("already empty", true), Entry("still running pods", false))
 })
