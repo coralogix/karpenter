@@ -21,14 +21,14 @@ spec:
 |------------|---------|
 | `karpenter.coralogix.net/score-based-consolidation` | Opts the NodePool in (presence is enough; value is ignored). |
 | `karpenter.coralogix.net/utilization-weight` | How much unused CPU counts in the score. Default **0.25**; anything other than a positive number falls back to the default and raises an event on the NodePool. |
-| `karpenter.coralogix.net/reclamation-delay` | How long a node stays on standby before it may be deleted. Default **15s**. |
+| `karpenter.coralogix.net/reclamation-delay` | How long a node stays on standby before it may be deleted, with or without capacity decay. Default **15s**. |
 | `karpenter.coralogix.net/evacuation-timeout` | How long an evacuation may run before it is abandoned. Default **5m**. A move whose sources span NodePools uses the shortest. |
-| `karpenter.coralogix.net/reclamation-capacity-decay-half-life` | Turns on [capacity decay](#capacity-decay), which replaces `reclamation-delay`. How long the kept capacity takes to lose half its excess over active capacity. No default: without a valid value the pool uses `reclamation-delay`. |
+| `karpenter.coralogix.net/reclamation-capacity-decay-half-life` | Turns on [capacity decay](#capacity-decay). How long the kept capacity takes to lose half its excess over active capacity. No default: without a valid value the pool reclaims every standby node after `reclamation-delay`. |
 | `karpenter.coralogix.net/reclamation-capacity-decay-insufficient-capacity-half-life` | The half-life while the pool's own NodeClaims have failed to launch for insufficient capacity within the insufficient-capacity window. Defaults to `reclamation-capacity-decay-half-life`. |
 | `karpenter.coralogix.net/reclamation-capacity-decay-insufficient-capacity-window` | How long after the pool's last insufficient-capacity launch failure the insufficient-capacity half-life applies. Default **1h**. |
 | `karpenter.coralogix.net/reclamation-capacity-decay-pools` | Comma-separated NodePool names whose active capacity counts toward this pool's kept capacity, such as an on-demand fallback pool. Ignored without a valid half-life. |
 
-The durations are Go durations. `0s` is taken literally; empty, malformed, or negative values fall back to the default and raise a Warning event on the NodePool. An invalid half-life leaves the pool on `reclamation-delay`, and an invalid insufficient-capacity half-life falls back to the normal half-life.
+The durations are Go durations. `0s` is taken literally; empty, malformed, or negative values fall back to the default and raise a Warning event on the NodePool. An invalid half-life turns capacity decay off, and an invalid insufficient-capacity half-life falls back to the normal half-life.
 
 Optional [disruption pacing](disruption-pacing.md) annotations apply as well.
 
@@ -42,7 +42,7 @@ The fork limits single-node consolidation of other NodePools to one minute per s
 
 Empty nodes are tainted `karpenter.coralogix.net/standby:NoSchedule` and annotated with the time they entered standby, rather than deleted. Standby requires `spec.disruption.consolidateAfter` to be set. Karpenter manages these marks; do not set them in manifests. Marking evicts nothing and uses no disruption budget.
 
-**Reclamation** deletes a node that is still empty and has been on standby for `reclamation-delay`, or, on a pool with capacity decay, a standby node beyond the pool's kept capacity. It uses the `Empty` reason and budgets and is not paced.
+**Reclamation** deletes a node that is still empty and has been on standby for `reclamation-delay`. On a pool with capacity decay, it deletes only such nodes beyond the pool's kept capacity. The delay gives the scheduler time to see the standby taint, so a node is not deleted while a pod is being scheduled onto it. It uses the `Empty` reason and budgets and is not paced.
 
 #### Capacity decay
 
@@ -56,7 +56,7 @@ metadata:
 
 On every disruption pass, a pool with capacity decay measures its **active capacity**: the allocatable CPU of initialized nodes that are neither standby nor being deleted, in the pool itself and in the pools it lists. Its **kept capacity** rises at once to any higher active capacity. Otherwise it falls toward the current active capacity, and the excess halves every half-life.
 
-The pool may keep standby nodes up to its kept capacity minus its own active capacity. Standby nodes that reclamation may not delete, such as nodes with `karpenter.sh/do-not-disrupt`, nominated nodes or nodes with buffer pods, use up this allowance first. Then the newest standby nodes are kept while the remaining allowance covers at least half of each node's cores. The others are reclaimed, oldest first, within the `Empty` budget, with no minimum time on standby. A lone freed node therefore stays on standby for about one half-life.
+The pool may keep standby nodes up to its kept capacity minus its own active capacity. Standby nodes that reclamation may not delete, such as nodes with `karpenter.sh/do-not-disrupt`, nominated nodes, nodes with buffer pods or nodes on standby for less than `reclamation-delay`, use up this allowance first. Then the newest standby nodes are kept while the remaining allowance covers at least half of each node's cores. The others are reclaimed, oldest first, within the `Empty` budget. A lone freed node therefore stays on standby for about one half-life, and never less than `reclamation-delay`.
 
 The insufficient-capacity half-life applies while the pool's own NodeClaims have failed to launch for insufficient capacity within the insufficient-capacity window (default 1h); failures in listed pools do not count. Core sees only launches that fail as a whole, not instance types the provider refuses within a launch that succeeds.
 

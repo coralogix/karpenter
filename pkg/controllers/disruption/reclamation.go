@@ -34,8 +34,8 @@ const ReclamationConsolidationType = "reclamation"
 
 const defaultReclamationDelay = 15 * time.Second
 
-// Reclamation deletes standby score-based nodes after the pool reclamation delay, or beyond the pool's kept capacity when
-// capacity decay is on, using Empty disruption budgets.
+// Reclamation deletes standby score-based nodes after the pool reclamation delay, keeping those within the pool's kept
+// capacity when capacity decay is on, using Empty disruption budgets.
 type Reclamation struct {
 	cluster            *state.Cluster
 	recorder           events.Recorder
@@ -55,8 +55,7 @@ func (r *Reclamation) ShouldDisrupt(_ context.Context, c *Candidate) bool {
 		return false
 	}
 	ts, ok := standby.Timestamp(c.Node)
-	_, capacityDecay := r.keptCapacityByPool[c.NodePool.Name]
-	return ok && (capacityDecay || !r.clock.Now().Before(ts.Add(reclamationDelay(c.NodePool, r.recorder))))
+	return ok && !r.clock.Now().Before(ts.Add(reclamationDelay(c.NodePool, r.recorder)))
 }
 
 func (r *Reclamation) ComputeCommands(_ context.Context, disruptionBudgetMapping map[string]int, candidates ...*Candidate) ([]Command, error) {
