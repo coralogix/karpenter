@@ -40,7 +40,7 @@ The fork limits single-node consolidation of other NodePools to one minute per s
 
 ### Standby and reclamation
 
-Empty nodes are tainted `karpenter.coralogix.net/standby:NoSchedule` and annotated with the time they entered standby, rather than deleted. Standby requires `spec.disruption.consolidateAfter` to be set. Karpenter manages these marks; do not set them in manifests. Marking evicts nothing and uses no disruption budget.
+Empty nodes are tainted `karpenter.coralogix.net/standby:NoSchedule` and annotated with the time they entered standby, rather than deleted. Marking a node that is already on standby, such as an evacuation source that emptied earlier, keeps that time. Standby requires `spec.disruption.consolidateAfter` to be set. Karpenter manages these marks; do not set them in manifests. Marking evicts nothing and uses no disruption budget.
 
 **Reclamation** deletes a node that is still empty and has been on standby for `reclamation-delay`. On a pool with capacity decay, it deletes only such nodes beyond the pool's kept capacity. The delay gives the scheduler time to see the standby taint, so a node is not deleted while a pod is being scheduled onto it. It uses the `Empty` reason and budgets and is not paced.
 

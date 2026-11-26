@@ -47,25 +47,26 @@ func Timestamp(node *corev1.Node) (time.Time, bool) {
 	return ts.UTC(), true
 }
 
-// Mark writes the standby timestamp and taint together.
+// Mark writes the standby taint, and the timestamp unless the Node already has a valid one, so a node that is already
+// standby keeps the time it entered standby.
 func Mark(ctx context.Context, kubeClient client.Client, node *corev1.Node, now time.Time) error {
 	_, err := patchNode(ctx, kubeClient, node, func(patch *corev1.Node) {
-		if patch.Annotations == nil {
-			patch.Annotations = map[string]string{}
+		if _, ok := Timestamp(patch); !ok {
+			patch.Annotations = lo.Assign(patch.Annotations, map[string]string{v1.StandbyNodeAnnotationKey: now.UTC().Format(time.RFC3339Nano)})
 		}
-		patch.Annotations[v1.StandbyNodeAnnotationKey] = now.UTC().Format(time.RFC3339Nano)
 		patch.Spec.Taints = append(WithoutStandbyTaint(patch.Spec.Taints), v1.StandbyNoScheduleTaint)
 	})
 	return err
 }
 
 // Clear removes both standby marks in one Node update. It reports whether the stored Node changed, so a caller acting on
-// a stale copy can tell that standby was already cleared.
+// a stale copy can tell that standby was already cleared. A Node that no longer exists is not cleared and not an error.
 func Clear(ctx context.Context, kubeClient client.Client, node *corev1.Node) (bool, error) {
-	return patchNode(ctx, kubeClient, node, func(patch *corev1.Node) {
+	cleared, err := patchNode(ctx, kubeClient, node, func(patch *corev1.Node) {
 		delete(patch.Annotations, v1.StandbyNodeAnnotationKey)
 		patch.Spec.Taints = WithoutStandbyTaint(patch.Spec.Taints)
 	})
+	return cleared, client.IgnoreNotFound(err)
 }
 
 func patchNode(ctx context.Context, kubeClient client.Client, node *corev1.Node, update func(*corev1.Node)) (bool, error) {

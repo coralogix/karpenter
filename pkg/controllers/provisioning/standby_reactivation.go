@@ -82,12 +82,14 @@ func ObserveStandbyDuration(node *corev1.Node, outcome string, now time.Time) {
 	StandbyDurationSeconds.Observe(now.Sub(ts).Seconds(), map[string]string{metrics.NodePoolLabel: node.Labels[v1.NodePoolLabelKey], standbyOutcomeLabel: outcome})
 }
 
-// ReactivateStandby clears standby on every existing node the results place pods on, so those pods can bind.
+// ReactivateStandby clears standby on every existing node the results place pods on, so those pods can bind. It judges
+// standby from the stored Node, not the results' snapshot, because a node may go standby after the snapshot (ADR-0012).
 // Only results that are acted on may be passed; simulations never change standby.
 func (p *Provisioner) ReactivateStandby(ctx context.Context, results scheduler.Results, source string) error {
 	var errs []error
 	for _, n := range results.ExistingNodes {
-		if len(n.Pods) == 0 || !standby.HasStandbyTaint(n.Node) {
+		// A NodeClaim whose Node has not registered yet has no standby marks.
+		if len(n.Pods) == 0 || n.Node == nil {
 			continue
 		}
 		cleared, err := standby.Clear(ctx, p.kubeClient, n.Node)
