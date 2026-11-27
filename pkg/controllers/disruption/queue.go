@@ -235,7 +235,8 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 
 	if cmd.isScoreBasedEvacuation() {
 		if q.clock.Since(cmd.CreationTimestamp) >= retryDuration {
-			return NewUnrecoverableError(fmt.Errorf("command reached timeout"))
+			// The last pass's error says what the evacuation was still waiting on.
+			return NewUnrecoverableError(serrors.Wrap(multierr.Combine(stderrors.New("evacuation did not finish"), cmd.lastEvacuationErr), "timeout", retryDuration))
 		}
 		return q.evacuate(ctx, cmd)
 	}
