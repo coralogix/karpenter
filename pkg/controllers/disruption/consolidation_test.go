@@ -1167,12 +1167,6 @@ var _ = Describe("Consolidation", func() {
 
 			// shouldn't delete the node
 			Expect(ExpectNodes(ctx, env.Client)).To(HaveLen(1))
-
-			// Expect Unconsolidatable events to be fired
-			_, ok := lo.Find(recorder.Events(), func(e events.Event) bool {
-				return strings.Contains(e.Message, "SpotToSpotConsolidation is disabled, can't replace a spot node with a spot node")
-			})
-			Expect(ok).To(BeTrue())
 		})
 		It("cannot replace spot with spot if it is part of the 15 cheapest instance types.", func() {
 			cloudProvider.InstanceTypes = lo.Slice(fake.InstanceTypesAssorted(), 0, 20)

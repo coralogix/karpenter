@@ -14,6 +14,10 @@ Warning: At the moment this documentation is mostly LLM generated (quality may v
 - [Score-based consolidation](score-based-consolidation.md) — alternate consolidation path for opted-in NodePools
 - OpenTelemetry tracing (`pkg/cxtracing`) — spans aligned with fork scheduling/disruption phase metrics; export via standard `OTEL_*` env vars (configured in [eng-karpenter](https://github.com/coralogix/eng-karpenter))
 
+## Other changes
+
+- No `Unconsolidatable` event "SpotToSpotConsolidation is disabled, can't replace a spot node with a spot node". With the feature gate off, single-node consolidation published it for nearly every spot node it evaluated, on each pass. Upstream publishes it again after a rollback.
+
 ## Rollback to upstream
 
 Rolling back the controller to upstream Karpenter is safe:

@@ -268,9 +268,6 @@ func (c *consolidation) computeSpotToSpotConsolidation(ctx context.Context, cand
 
 	// Spot consolidation is turned off.
 	if !options.FromContext(ctx).FeatureGates.SpotToSpotConsolidation {
-		if len(candidates) == 1 {
-			c.recorder.Publish(disruptionevents.Unconsolidatable(candidates[0].Node, candidates[0].NodeClaim, "SpotToSpotConsolidation is disabled, can't replace a spot node with a spot node")...)
-		}
 		return Command{}, nil
 	}
 
