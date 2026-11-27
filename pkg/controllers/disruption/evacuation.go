@@ -102,6 +102,7 @@ func (q *Queue) evacuate(ctx context.Context, cmd *Command) error {
 		}
 		cmd.evacuationProgressByProviderID[candidate.ProviderID()] = evacuationFinished
 	}
+	cmd.lastEvacuationErr = errs
 	return errs
 }
 
@@ -131,7 +132,7 @@ func (q *Queue) evacuateSource(ctx context.Context, cmd *Command, candidate *Can
 					return err
 				}
 			}
-			return serrors.Wrap(fmt.Errorf("waiting for %d evacuation pods", len(waiting)), "Node", klog.KObj(candidate.Node))
+			return serrors.Wrap(fmt.Errorf("waiting for %d evacuation pods", len(waiting)), "Node", klog.KObj(candidate.Node), "Pods", klog.KObjSlice(waiting))
 		}
 		// Persist standby before removing the temporary disruption taint, so the
 		// source never opens to ordinary scheduling between the two states.

@@ -213,6 +213,7 @@ type Command struct {
 
 	staticNodeCountReservationHandedOff bool
 	evacuationProgressByProviderID      map[string]evacuationProgress
+	lastEvacuationErr                   error
 	scoreSavings                        *float64
 
 	CreationTimestamp time.Time
