@@ -30,14 +30,14 @@ import (
 
 const disruptionLoopSpanName = "karpenter.disruption.loop"
 
-// tracedDisrupt runs one disruption method in a child span of the loop span, named after the method's type,
-// and records whether it started a command, did nothing, or failed.
-func (c *Controller) tracedDisrupt(ctx context.Context, m Method) (bool, error) {
+// traceMethod runs one method in a child span of the loop span, named after the method's type, and records whether it
+// started a command, did nothing, or failed.
+func traceMethod(ctx context.Context, loopSpanName string, m Method, run func(context.Context, Method) (bool, error)) (bool, error) {
 	typeName := fmt.Sprintf("%T", m)
 	methodName := typeName[strings.LastIndex(typeName, ".")+1:]
-	ctx, endSpan := cxtracing.Start(ctx, disruptionLoopSpanName+"."+methodName)
+	ctx, endSpan := cxtracing.Start(ctx, loopSpanName+"."+methodName)
 	defer endSpan()
-	success, err := c.disrupt(ctx, m)
+	success, err := run(ctx, m)
 	span := trace.SpanFromContext(ctx)
 	switch {
 	case err != nil:

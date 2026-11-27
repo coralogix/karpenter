@@ -70,6 +70,7 @@ var env *test.Environment
 var clusterCost *cost.ClusterCost
 var cluster *state.Cluster
 var disruptionController *disruption.Controller
+var standbyLoop *disruption.StandbyLoop
 var pricingController *informer.PricingController
 var prov *provisioning.Provisioner
 var draController *deviceallocation.Controller
@@ -131,6 +132,7 @@ var _ = BeforeEach(func() {
 	disruptionPacing = disruption.NewDisruptionPacing(env.Clock)
 	disruptionController = disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
 		disruption.WithMethods(NewMethodsWithNopValidator(disruptionPacing)...), disruption.WithDisruptionPacing(disruptionPacing))
+	standbyLoop = disruption.NewStandbyLoop(env.Clock, env.Client, cloudProvider, recorder, cluster, queue)
 	env.Clock.SetTime(time.Now())
 	cluster.Reset()
 	*queue = lo.FromPtr(disruption.NewQueue(env.Client, recorder, cluster, env.Clock, prov))

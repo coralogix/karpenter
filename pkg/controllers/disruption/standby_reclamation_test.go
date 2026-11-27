@@ -28,7 +28,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -44,7 +43,7 @@ var _ = Describe("Standby and reclamation", func() {
 	DescribeTable("marks an empty score-based node standby instead of deleting it",
 		func(policy v1.ConsolidationPolicy) {
 			_, _, node := givenStandbyNode(policy, nil)
-			reconcileDisruption()
+			reconcileStandby()
 
 			expectMarkedStandby(node)
 			Expect(queue.GetCommands()).To(BeEmpty())
@@ -53,9 +52,10 @@ var _ = Describe("Standby and reclamation", func() {
 		Entry("Balanced", v1.ConsolidationPolicyBalanced),
 	)
 
-	It("reclaims a standby node after the default reclamation delay", func() {
+	It("marks an empty node standby and reclaims it after the default reclamation delay without the main loop", func() {
 		_, nodeClaim, node := givenStandbyNode(v1.ConsolidationPolicyWhenEmpty, nil)
-		reconcileDisruption()
+		reconcileStandby()
+		expectMarkedStandby(node)
 
 		reconcileAfter(standbyBeforeReclamationDelay, node, nodeClaim)
 		Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(1))
@@ -68,7 +68,7 @@ var _ = Describe("Standby and reclamation", func() {
 	It("clears standby when a reschedulable pod is on the node", func() {
 		_, nodeClaim, node := givenStandbyNode(v1.ConsolidationPolicyWhenEmptyOrUnderutilized, nil)
 		pod := test.Pod()
-		reconcileDisruption()
+		reconcileStandby()
 
 		ExpectApplied(ctx, env.Client, pod)
 		ExpectManualBinding(ctx, env.Client, pod, node)
@@ -101,7 +101,7 @@ var _ = Describe("Standby and reclamation", func() {
 		nodePool, nodeClaim, node := givenStandbyNode(v1.ConsolidationPolicyWhenEmpty, map[string]string{
 			v1.ReclamationDelayAnnotationKey: "not-a-duration",
 		})
-		reconcileDisruption()
+		reconcileStandby()
 
 		reconcileAfter(standbyAfterDefaultReclamationDelay, node, nodeClaim)
 
@@ -120,7 +120,7 @@ var _ = Describe("Standby and reclamation", func() {
 		})
 		ExpectApplied(ctx, env.Client, node)
 		refreshStandbyState(node, nodeClaim)
-		reconcileDisruption()
+		reconcileStandby()
 
 		reconcileAfter(standbyBeforeReclamationDelay, node, nodeClaim)
 		Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(1))
@@ -132,7 +132,7 @@ var _ = Describe("Standby and reclamation", func() {
 
 	It("clears standby when the pool stops qualifying", func() {
 		nodePool, nodeClaim, node := givenStandbyNode(v1.ConsolidationPolicyWhenEmpty, nil)
-		reconcileDisruption()
+		reconcileStandby()
 		expectMarkedStandby(node)
 
 		nodePool.Spec.Disruption.ConsolidateAfter = v1.MustParseNillableDuration("Never")
@@ -161,7 +161,7 @@ var _ = Describe("Standby and reclamation", func() {
 		_, nodeClaim, node := givenStandbyNode(v1.ConsolidationPolicyWhenEmpty, map[string]string{
 			v1.ReclamationDelayAnnotationKey: "1m",
 		})
-		reconcileDisruption()
+		reconcileStandby()
 
 		reconcileAfter(standbyAfterDefaultReclamationDelay, node, nodeClaim)
 		Expect(len(ExpectNodeClaims(ctx, env.Client))).To(Equal(1))
@@ -177,7 +177,7 @@ var _ = Describe("Standby and reclamation", func() {
 		ExpectApplied(ctx, env.Client, node)
 		refreshStandbyState(node, nodeClaim)
 
-		reconcileDisruption()
+		reconcileStandby()
 
 		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(node), node)).To(Succeed())
 		Expect(node.Annotations[v1.StandbyNodeAnnotationKey]).To(Equal(env.Clock.Now().UTC().Format(time.RFC3339Nano)))
@@ -186,7 +186,7 @@ var _ = Describe("Standby and reclamation", func() {
 		Expect(queue.GetCommands()).To(BeEmpty())
 	})
 
-	It("clears an orphan timestamp without making the node reclaimable", func() {
+	It("replaces an orphan timestamp without making the node reclaimable", func() {
 		_, nodeClaim, node := givenStandbyNode(v1.ConsolidationPolicyWhenEmpty, map[string]string{
 			v1.ReclamationDelayAnnotationKey: "0s",
 		})
@@ -195,14 +195,11 @@ var _ = Describe("Standby and reclamation", func() {
 		})
 		ExpectApplied(ctx, env.Client, node)
 		refreshStandbyState(node, nodeClaim)
-		controller := disruption.NewController(env.Clock, env.Client, prov, cloudProvider, recorder, cluster, queue, clusterCost,
-			disruption.WithMethods(disruption.NewReclamation(cluster, recorder, env.Clock)))
 
-		ExpectSingletonReconciled(ctx, controller)
+		reconcileStandby()
 
-		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(node), node)).To(Succeed())
-		Expect(node.Annotations).NotTo(HaveKey(v1.StandbyNodeAnnotationKey))
-		expectNodeWithoutStandbyTaint(node)
+		expectMarkedStandby(node)
+		Expect(node.Annotations[v1.StandbyNodeAnnotationKey]).To(Equal(env.Clock.Now().UTC().Format(time.RFC3339Nano)))
 		Expect(queue.GetCommands()).To(BeEmpty())
 		Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nodeClaim), nodeClaim)).To(Succeed())
 	})
@@ -211,7 +208,7 @@ var _ = Describe("Standby and reclamation", func() {
 		_, nodeClaim, node := givenStandbyNode(v1.ConsolidationPolicyWhenEmpty, map[string]string{
 			v1.ReclamationDelayAnnotationKey: "0s",
 		})
-		reconcileDisruption()
+		reconcileStandby()
 		reconcileAfter(0, node, nodeClaim)
 		expectNodeReclaimed()
 	})
@@ -221,7 +218,7 @@ var _ = Describe("Standby and reclamation", func() {
 		nodeClaims, nodes := standbyTestNodeClaims(nodePool, 2)
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaims[0], nodes[0], nodeClaims[1], nodes[1])
 		refreshStandbyStates(nodes, nodeClaims)
-		reconcileDisruption()
+		reconcileStandby()
 
 		reconcileAfterAll(standbyAfterDefaultReclamationDelay, nodes, nodeClaims)
 		cmds := queue.GetCommands()
@@ -235,7 +232,7 @@ var _ = Describe("Standby and reclamation", func() {
 		nodeClaim, node := standbyTestNodeClaim(nodePool)
 		ExpectApplied(ctx, env.Client, nodePool, nodeClaim, node)
 		refreshStandbyState(node, nodeClaim)
-		reconcileDisruption()
+		reconcileStandby()
 
 		expectMarkedStandby(node)
 	})
@@ -245,7 +242,7 @@ var _ = Describe("Standby and reclamation", func() {
 			_, nodeClaim, node := givenStandbyNode(v1.ConsolidationPolicyWhenEmptyOrUnderutilized, nil)
 			mutate(node, nodeClaim)
 			refreshStandbyState(node, nodeClaim)
-			reconcileDisruption()
+			reconcileStandby()
 
 			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(node), node)).To(Succeed())
 			expectNodeWithoutStandbyTaint(node)
@@ -302,12 +299,16 @@ func reconcileDisruption() {
 	ExpectSingletonReconciled(ctx, disruptionController)
 }
 
+func reconcileStandby() {
+	ExpectSingletonReconciled(ctx, standbyLoop)
+}
+
 func reconcileAfter(d time.Duration, node *corev1.Node, nodeClaim *v1.NodeClaim) {
 	if d != 0 {
 		env.Clock.Step(d)
 	}
 	refreshStandbyState(node, nodeClaim)
-	reconcileDisruption()
+	reconcileStandby()
 }
 
 func reconcileAfterAll(d time.Duration, nodes []*corev1.Node, nodeClaims []*v1.NodeClaim) {
@@ -315,7 +316,7 @@ func reconcileAfterAll(d time.Duration, nodes []*corev1.Node, nodeClaims []*v1.N
 		env.Clock.Step(d)
 	}
 	refreshStandbyStates(nodes, nodeClaims)
-	reconcileDisruption()
+	reconcileStandby()
 }
 
 func expectMarkedStandby(node *corev1.Node) {

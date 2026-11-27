@@ -90,7 +90,7 @@ func givenStandbyDestinationAndSource() (nodePool *v1.NodePool, destinationNode 
 	ExpectApplied(ctx, env.Client, pod)
 	ExpectManualBinding(ctx, env.Client, pod, nodes[1])
 	refreshStandbyStates(nodes, nodeClaims)
-	reconcileDisruption()
+	reconcileStandby()
 	expectMarkedStandby(nodes[0])
 	refreshStandbyStates(nodes, nodeClaims)
 	return nodePool, nodes[0], nodeClaims[1]

@@ -35,6 +35,9 @@ _Avoid_: in-use capacity, requested CPU
 How a NodePool's kept capacity falls from a recent peak of active capacity back toward the current active capacity, faster or slower depending on whether new capacity was recently hard to get. Standby nodes beyond the kept capacity are reclaimed.
 _Avoid_: standby decay, exponential reclamation
 
+**Standby loop**:
+The loop that marks nodes as standby and reclaims them, apart from the disruption loop that runs consolidation and the other disruption methods. Each pass also repairs standby state and samples active capacity for capacity decay.
+
 **Reactivation**:
 The decision to let a standby node take pods again. Provisioning and evacuation make this decision in the same way.
 _Avoid_: activation

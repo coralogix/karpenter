@@ -36,13 +36,15 @@ Optional [disruption pacing](disruption-pacing.md) annotations apply as well.
 
 Annotated NodePools are handled by the score-based method instead of standard emptiness, single-node and multi-node consolidation. Drift is unchanged and still uses the standard drift methods and `Drifted` budgets.
 
-The fork limits single-node consolidation of other NodePools to one minute per search (upstream: three), because it runs in the same disruption loop and delays the score-based method, standby marking and reclamation while it runs.
+The fork limits single-node consolidation of other NodePools to one minute per search (upstream: three), because it runs in the same disruption loop and delays the score-based method while it runs.
 
 ### Standby and reclamation
 
-Empty nodes are tainted `karpenter.coralogix.net/standby:NoSchedule` and annotated with the time they entered standby, rather than deleted. Standby requires `spec.disruption.consolidateAfter` to be set. Karpenter manages these marks; do not set them in manifests. Marking evicts nothing and uses no disruption budget.
+Empty nodes are tainted `karpenter.coralogix.net/standby:NoSchedule` and annotated with the time they entered standby, rather than deleted. Marking a node that is already on standby, such as an evacuation source that emptied earlier, keeps that time. Standby requires `spec.disruption.consolidateAfter` to be set. Karpenter manages these marks; do not set them in manifests. Marking evicts nothing and uses no disruption budget. A node running a static pod is never marked, and a node with terminating pods is marked once they are gone.
 
 **Reclamation** deletes a node that is still empty and has been on standby for `reclamation-delay`. On a pool with capacity decay, it deletes only such nodes beyond the pool's kept capacity. The delay gives the scheduler time to see the standby taint, so a node is not deleted while a pod is being scheduled onto it. It uses the `Empty` reason and budgets and is not paced.
+
+Standby marking and reclamation run in their own loop, apart from the disruption loop, so score-based consolidation does not delay them. The loop runs a pass every second, and the next pass at once after it starts a command; a command that fails is retried on the next pass. Each pass also repairs standby marks, such as clearing standby from a node that gained a pod. Both loops compute disruption budgets from their own view of the cluster, so a pool can briefly exceed a budget by the nodes the other loop started in the meantime.
 
 #### Capacity decay
 
@@ -54,7 +56,7 @@ metadata:
     karpenter.coralogix.net/reclamation-capacity-decay-pools: "ondemand-fallback-node-pool"
 ```
 
-On every disruption pass, a pool with capacity decay measures its **active capacity**: the allocatable CPU of initialized nodes that are neither standby nor being deleted, in the pool itself and in the pools it lists. Its **kept capacity** rises at once to any higher active capacity. Otherwise it falls toward the current active capacity, and the excess halves every half-life.
+On every standby loop pass, about once a second, a pool with capacity decay measures its **active capacity**: the allocatable CPU of initialized nodes that are neither standby nor being deleted, in the pool itself and in the pools it lists. Its **kept capacity** rises at once to any higher active capacity. Otherwise it falls toward the current active capacity, and the excess halves every half-life.
 
 The pool may keep standby nodes up to its kept capacity minus its own active capacity. Standby nodes that reclamation may not delete, such as nodes with `karpenter.sh/do-not-disrupt`, nominated nodes, nodes with buffer pods or nodes on standby for less than `reclamation-delay`, use up this allowance first. Then the newest standby nodes are kept while the remaining allowance covers at least half of each node's cores. The others are reclaimed, oldest first, within the `Empty` budget. A lone freed node therefore stays on standby for about one half-life, and never less than `reclamation-delay`.
 
@@ -116,12 +118,14 @@ The fork adds:
 - `karpenter_voluntary_disruption_evacuation_duration_seconds{outcome}`: time from the start of an evacuation until it ends. `outcome` is `succeeded` when every source is on standby, or `failed` on timeout or another failure, even if some sources already reached standby.
 - `karpenter_nodes_standby_reactivated_total{nodepool, source}`: standby nodes reactivated. `source` is `provisioning` or `disruption`, whichever decision placed pods on the node.
 - `karpenter_nodes_standby_duration_seconds{nodepool, outcome}`: how long a node stayed on standby, recorded once when standby ends. `outcome` is `reactivated` when pods were placed on the node, `reclaimed` when a reclamation deletes it (measured up to when the reclamation started; a reclamation that fails records none of its nodes, and any it left on standby are recorded when they later leave it), or `repaired` when Karpenter cleared standby for another reason, such as a pod reaching the node without a scheduling result, or the NodePool no longer allowing standby nodes. Standby nodes deleted for other reasons, such as drift or expiration, are not recorded.
-- `karpenter_nodepools_standby_nodes{nodepool}`: standby nodes per NodePool, set on every disruption pass. A NodePool's series disappears when the pool is deleted, stops using score-based consolidation, or can no longer hold standby nodes (`consolidateAfter: Never`).
-- `karpenter_nodepools_reclamation_kept_cpu{nodepool}`: the kept capacity in CPU cores of each NodePool with [capacity decay](#capacity-decay), set on every disruption pass. A NodePool's series disappears when the pool is deleted or capacity decay turns off.
+- `karpenter_nodepools_standby_nodes{nodepool}`: standby nodes per NodePool, set on every standby loop pass. A NodePool's series disappears when the pool is deleted, stops using score-based consolidation, or can no longer hold standby nodes (`consolidateAfter: Never`).
+- `karpenter_nodepools_reclamation_kept_cpu{nodepool}`: the kept capacity in CPU cores of each NodePool with [capacity decay](#capacity-decay), set on every standby loop pass. A NodePool's series disappears when the pool is deleted or capacity decay turns off.
 
 ## Spans
 
 Each disruption controller pass has one `karpenter.disruption.loop` span. Each method that runs in the pass has a child span named after the method, such as `karpenter.disruption.loop.ScoreBasedConsolidation` or `karpenter.disruption.loop.Emptiness`, with `outcome`: `command` when it started a command; `none` when it started nothing, including when pacing held back every command it computed; or `failed` with the error as the span status, even when some commands started. `command` and `failed` end the pass, so later methods have no span. Upstream methods' `karpenter.disruption.simulate_scheduling` spans nest directly under their method span.
+
+Each standby loop pass has one `karpenter.disruption.standby` span, with a child span per method in the same form: `karpenter.disruption.standby.StandbyMarking` and `karpenter.disruption.standby.Reclamation`, each with `outcome`. A pass that starts a command ends there, so reclamation has no span when marking started one; unlike in the disruption loop, a `failed` method does not end the pass.
 
 Each score-based pass has one `karpenter.disruption.score_based_consolidation` span, nested under `karpenter.disruption.loop.ScoreBasedConsolidation`. It carries the chosen move's `rank` (its position by search score; a batch move ranks as the move it grew from) and `kind`. Its children, prefixed with the pass span's name:
 

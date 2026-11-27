@@ -131,8 +131,6 @@ func NewMethods(clk clock.Clock, cluster *state.Cluster, kubeClient client.Clien
 	return []Method{
 		// Delete empty nodes across all consolidation policies (WhenEmpty, WhenEmptyOrUnderutilized, Balanced).
 		NewEmptiness(c),
-		NewStandbyMarking(cluster),
-		NewReclamation(cluster, recorder, clk),
 		// Terminate and create replacement for drifted NodeClaims in Static NodePool
 		NewStaticDrift(cluster, provisioner, cp, pace),
 		// Terminate any NodeClaims that have drifted from provisioning specifications, allowing the pods to reschedule.
@@ -157,7 +155,6 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 		Complete(singleton.AsReconciler(c))
 }
 
-//nolint:gocyclo
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, c.Name())
 	ctx, endSpan := cxtracing.Start(ctx, disruptionLoopSpanName)
@@ -200,23 +197,6 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		}
 		return reconciler.Result{}, serrors.Wrap(fmt.Errorf("removing condition from nodeclaims, %w", err), "condition", v1.ConditionTypeDisruptionReason)
 	}
-	nodePoolMap, _, err := BuildNodePoolMap(ctx, c.kubeClient, c.cloudProvider)
-	if err != nil {
-		return reconciler.Result{}, fmt.Errorf("building node pool map for standby repair, %w", err)
-	}
-	recordStandbyNodes(c.cluster, nodePoolMap)
-	for _, m := range c.methods {
-		if observer, ok := m.(PassObserver); ok {
-			observer.ObservePass(nodePoolMap)
-		}
-	}
-	if err := repairStandbyState(ctx, c.kubeClient, c.cluster, c.recorder, c.clock, nodePoolMap); err != nil {
-		if errors.IsConflict(err) {
-			return reconciler.Result{Requeue: true}, nil
-		}
-		return reconciler.Result{}, serrors.Wrap(fmt.Errorf("repairing standby state, %w", err), "operation", "standby-repair")
-	}
-
 	return c.reconcileMethods(ctx)
 }
 
@@ -224,7 +204,7 @@ func (c *Controller) reconcileMethods(ctx context.Context) (reconciler.Result, e
 	// Attempt different disruption methods. We'll only let one method perform an action
 	for _, m := range c.methods {
 		c.recordRun(fmt.Sprintf("%T", m))
-		success, err := c.tracedDisrupt(ctx, m)
+		success, err := traceMethod(ctx, disruptionLoopSpanName, m, c.disrupt)
 		if err != nil {
 			if errors.IsConflict(err) {
 				return reconciler.Result{Requeue: true}, nil
@@ -261,12 +241,9 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 	if setter, ok := disruption.(NodePoolTotalsSetter); ok {
 		setter.SetNodePoolTotals(nodePoolTotals)
 	}
-	var disruptionBudgetMapping map[string]int
-	if usesDisruptionBudget(disruption) {
-		disruptionBudgetMapping, err = BuildDisruptionBudgetMapping(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, c.recorder, disruption.Reason())
-		if err != nil {
-			return false, fmt.Errorf("building disruption budgets, %w", err)
-		}
+	disruptionBudgetMapping, err := BuildDisruptionBudgetMapping(ctx, c.cluster, c.clock, c.kubeClient, c.cloudProvider, c.recorder, disruption.Reason())
+	if err != nil {
+		return false, fmt.Errorf("building disruption budgets, %w", err)
 	}
 	// Determine the disruption action
 	cmds, err := disruption.ComputeCommands(ctx, disruptionBudgetMapping, candidates...)
@@ -308,9 +285,6 @@ func (c *Controller) logInvalidBudgets(ctx context.Context) {
 	for _, np := range nps {
 		// Use a dummy value of 100 since we only care if this errors.
 		for _, method := range c.methods {
-			if !usesDisruptionBudget(method) {
-				continue
-			}
 			if _, err := np.GetAllowedDisruptionsByReason(c.clock, 100, method.Reason()); err != nil {
 				fmt.Fprintf(&buf, "invalid disruption budgets in nodepool %s, %s", np.Name, err)
 				break // Prevent duplicate error message

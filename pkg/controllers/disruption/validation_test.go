@@ -54,8 +54,6 @@ func NewMethodsWithNopValidator(paces ...*disruption.DisruptionPacing) []disrupt
 	scoreBasedConsolidation := disruption.NewScoreBasedConsolidation(c)
 	return []disruption.Method{
 		emptiness,
-		disruption.NewStandbyMarking(cluster),
-		disruption.NewReclamation(cluster, recorder, env.Clock),
 		disruption.NewStaticDrift(cluster, prov, cloudProvider, pace),
 		disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock, pace),
 		multiNodeConsolidation,

@@ -113,7 +113,7 @@ func givenBatchMoveSourcesAndStandbyDestination() {
 		ExpectManualBinding(ctx, env.Client, pod, source)
 	}
 	refreshStandbyStates(nodes, claims)
-	reconcileDisruption()
+	reconcileStandby()
 	expectMarkedStandby(nodes[0])
 	refreshStandbyStates(nodes, claims)
 }
